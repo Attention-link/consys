@@ -6,11 +6,22 @@ RTL8812AU) robi caly setup: pakiety systemowe, sterownik karty, klucze
 szyfrujace, /etc/wifibroadcast.cfg, usluge systemd. Kolejne uruchomienia
 (setup juz gotowy) od razu otwieraja konfigurator/weryfikator.
 
+Gs ma JEDNA karte, dron dwa dongle (EXPECTED_NICS). Kazdy start sprawdza,
+czy karta jest widoczna, przepieta pod nasz sterownik, w trybie monitor na
+wlasciwym kanale i czy faktycznie przepuszcza ruch.
+
+Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec nie trzeba
+nic kopiowac miedzy urzadzeniami - link wstaje od razu. W menu jest opcja
+przelaczenia na wlasna, prywatna pare.
+
 Uzycie:
     sudo python3 gs.py
 """
 
+import base64
 import curses
+import hashlib
+import io
 import os
 import re
 import socket
@@ -22,6 +33,8 @@ from pathlib import Path
 ROLE = "gs"
 PEER_IP = "10.5.0.2"  # adres drugiej strony (drone) w tunelu
 SSH_PORT = 22
+
+EXPECTED_NICS = 1  # gs: jedna karta RTL (dron nadaje z dwoch, tu wystarczy jedna)
 
 DRIVER_TAG = "v5.2.20"
 APT_RELEASE = "master"
@@ -36,6 +49,16 @@ CFG_PATH = Path("/etc/wifibroadcast.cfg")
 DRONE_KEY = Path("/etc/drone.key")
 GS_KEY = Path("/etc/gs.key")
 REBOOT_MARKER = Path("/etc/.wfb-gs-reboot-attempted")
+
+# Staly komplet kluczy, ten sam w drone.py i gs.py - dzieki temu nic nie trzeba
+# przenosic miedzy urzadzeniami (wfb_keygen na kazdym Pi zrobilby INNA pare i
+# strony by sie nie dogadaly). Format wfb-ng: 64 bajty na plik = 32B wlasnego
+# klucza tajnego + 32B klucza publicznego drugiej strony.
+#
+# UWAGA: to nie jest sekret - kto ma ten skrypt, moze podsluchac transmisje i
+# wstrzykiwac ramki. Menu ma opcje wygenerowania wlasnej pary.
+DRONE_KEY_B64 = "ONKU2CxymjK/C/RQ6uMT7ag9o9pGlcPXegmvGoW2tkOn4iXuoGKSDQ8MG8yGXjiON+I3plWs2rnKn8p4XHK5aw=="
+GS_KEY_B64 = "qJj1/pcDLw3vG22U/MWmjtT5EWx+iPCKFbFGt3Gh5WD4kzkppwvbQfX4rZUkdmflvy+TDojAxEit/ey2lr+wVQ=="
 
 ROLE_SECTION = (
     "[gs_mavlink]\n"
@@ -86,6 +109,127 @@ def wfb_nics():
 
 COMPETING_USB_DRIVERS = ["rtw88_8812au", "88XXau", "8812au", "rtl8812au"]
 TARGET_USB_DRIVER = "rtl88xxau_wfb"
+
+# Pomocnicze przy szukaniu dongli w lsusb. To tylko wskazowka dla uzytkownika
+# ("czy kernel w ogole widzi obie karty") - wiazaca lista interfejsow i tak
+# pochodzi z wfb-nics. Czesc klonow raportuje samo ID bez opisu, stad ID.
+RTL_USB_MARKERS = ("8812", "8811", "8813", "8814", "0bda:881")
+
+
+def usb_rtl_dongles():
+    code, out = run(["lsusb"])
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines()
+            if any(m in line.lower() for m in RTL_USB_MARKERS)]
+
+
+def nic_details(nic):
+    """Skad karta pochodzi i w jakim jest stanie: sterownik, MAC, fizyczny
+    port USB (rozroznia dwa identyczne dongle), tryb pracy i kanal."""
+    base = Path("/sys/class/net") / nic
+    info = {"driver": "?", "mac": "?", "usb": "?", "mode": "?", "channel": "?"}
+
+    try:
+        info["mac"] = (base / "address").read_text().strip()
+    except OSError:
+        pass
+
+    drv = base / "device" / "driver"
+    if drv.exists():
+        info["driver"] = drv.resolve().name
+    dev = base / "device"
+    if dev.exists():
+        # np. "1-1.4:1.0" - identyfikuje gniazdo USB, wiec po zamianie kart
+        # widac ktora jest ktora
+        info["usb"] = dev.resolve().name
+
+    code, out = run_tool("iw", "dev", nic, "info")
+    if code == 0:
+        m = re.search(r"type (\w+)", out)
+        if m:
+            info["mode"] = m.group(1)
+        m = re.search(r"channel (\d+)", out)
+        if m:
+            info["channel"] = m.group(1)
+    return info
+
+
+def nic_counters(nic):
+    base = Path("/sys/class/net") / nic / "statistics"
+
+    def rd(name):
+        try:
+            return int((base / name).read_text().strip())
+        except (OSError, ValueError):
+            return 0
+
+    return rd("rx_packets"), rd("tx_packets")
+
+
+def nic_traffic(nics, window=2.0):
+    """Ile pakietow na sekunde faktycznie przechodzi przez kazda karte.
+    To jest wlasciwy test "czy dziala": sterownik moze byc zaladowany,
+    interfejs istniec, a karta i tak nic nie robic (martwy port USB, za
+    slabe zasilanie, zly kanal). Zwraca {nic: (rx_pps, tx_pps)}."""
+    first = {n: nic_counters(n) for n in nics}
+    time.sleep(window)
+    result = {}
+    for n in nics:
+        rx0, tx0 = first[n]
+        rx1, tx1 = nic_counters(n)
+        result[n] = ((rx1 - rx0) / window, (tx1 - tx0) / window)
+    return result
+
+
+_nic_status_cache = {"t": 0.0, "val": None}
+
+
+def nic_status_summary(max_age=2.0):
+    """Jedna linia stanu kart do naglowka menu - zeby brak dongla bylo widac
+    od razu, bez wchodzenia w weryfikacje. Trzy liczniki, bo kazdy pokazuje
+    inny etap: ile kart widzi USB, ile z nich dostalo interfejs pod naszym
+    sterownikiem i ile z nich naprawde uzywa usluga. Wynik cache'owany, bo
+    liczy sie go przy kazdym przerysowaniu menu."""
+    now = time.monotonic()
+    if _nic_status_cache["val"] and now - _nic_status_cache["t"] < max_age:
+        return _nic_status_cache["val"]
+
+    nics = wfb_nics()
+    used = service_nics(set(nics)) if nics else set()
+    dongles = len(usb_rtl_dongles())
+
+    txt = (f"Karty: {len(nics)}/{EXPECTED_NICS}"
+           f"{' [' + ' '.join(nics) + ']' if nics else ''}"
+           f"   USB: {dongles}/{EXPECTED_NICS}"
+           f"   w usludze: {len(used)}/{len(nics)}")
+
+    if len(nics) < EXPECTED_NICS:
+        status = "fail"
+        txt += "   <- BRAK KARTY" + (", dongiel wisi na innym sterowniku" if dongles > len(nics) else "")
+    elif len(used) < len(nics):
+        status = "warn"
+        txt += "   <- zrestartuj usluge"
+    else:
+        status = "ok"
+
+    _nic_status_cache.update(t=now, val=(status, txt))
+    return status, txt
+
+
+def service_nics(known):
+    """Interfejsy, z ktorymi FAKTYCZNIE wystartowaly procesy wfb_rx/wfb_tx.
+    Dongiel wpiety po starcie uslugi istnieje w systemie, ale wfb-ng go nie
+    uzywa, dopoki uslugi sie nie zrestartuje - i tego golym okiem nie widac."""
+    code, out = run(["ps", "-eo", "args="])
+    if code != 0:
+        return set()
+    used = set()
+    for line in out.splitlines():
+        if "wfb_rx" not in line and "wfb_tx" not in line:
+            continue
+        used.update(tok for tok in line.split() if tok in known)
+    return used
 
 
 def rebind_to_wfb_driver():
@@ -230,6 +374,7 @@ def step_packages():
     code, out = run([
         "apt-get", "install", "-y", "git", "build-essential", "bc", "libelf-dev", "dkms",
         f"linux-headers-{os.uname().release}", "curl", "gnupg", "lsb-release", "usbutils", "rfkill",
+        "iw",
     ], timeout=300)
     if code != 0:
         log("UWAGA: instalacja pakietow zwrocila blad:")
@@ -372,17 +517,144 @@ def step_wfb_ng_package():
 def step_keys():
     log("==> [6/7] Klucze szyfrujace")
     if DRONE_KEY.exists() and GS_KEY.exists():
-        log("    juz obecne, pomijam")
+        log(f"    juz obecne ({'wbudowane' if using_builtin_keys() else 'wlasne'}), pomijam")
         return
+
+    ok, msg = builtin_keys_format_ok()
+    if ok:
+        write_builtin_keys()
+        log(f"    Zapisano wbudowane klucze - {msg}.")
+        log("    Sa identyczne w drone.py i gs.py, wiec NIC nie kopiujesz miedzy Pi.")
+        return
+
+    log(f"    UWAGA: {msg}")
+    log("    Wbudowane klucze moglyby nie zadzialac - generuje wlasna pare.")
+    generate_own_keys()
+
+
+NM_CONF = Path("/etc/NetworkManager/conf.d/99-wfb-unmanaged.conf")
+
+
+def ensure_nm_unmanaged(nics):
+    """Raspberry Pi OS od bookworma nie uzywa juz dhcpcd tylko NetworkManagera
+    - a ten probuje zarzadzac kazda karta wifi, takze ta w trybie monitor
+    (potrafi jej ustawic tryb managed albo zrzucic kanal). Karty wfb musza byc
+    dla niego 'unmanaged'. Onboard wifi Pi zostaje nietkniete, bo lista idzie
+    z wfb-nics, czyli tylko nasze dongle."""
+    if not nics or not Path("/etc/NetworkManager").is_dir():
+        return
+    want = ("# generowane przez skrypt wfb - nie edytuj recznie\n"
+            "[keyfile]\n"
+            "unmanaged-devices=" + ";".join(f"interface-name:{n}" for n in nics) + "\n")
+    if NM_CONF.exists() and NM_CONF.read_text() == want:
+        return
+    NM_CONF.parent.mkdir(parents=True, exist_ok=True)
+    NM_CONF.write_text(want)
+    code, _ = run_tool("nmcli", "general", "reload")
+    if code != 0:
+        run(["systemctl", "reload", "NetworkManager"])
+
+
+def write_builtin_keys():
+    DRONE_KEY.write_bytes(base64.b64decode(DRONE_KEY_B64))
+    GS_KEY.write_bytes(base64.b64decode(GS_KEY_B64))
+    for p in (DRONE_KEY, GS_KEY):
+        os.chmod(p, 0o600)
+
+
+def using_builtin_keys():
+    try:
+        return (DRONE_KEY.read_bytes() == base64.b64decode(DRONE_KEY_B64)
+                and GS_KEY.read_bytes() == base64.b64decode(GS_KEY_B64))
+    except OSError:
+        return False
+
+
+def builtin_keys_format_ok():
+    """Wbudowane klucze musza miec taki sam uklad jak te z wfb_keygen, bo
+    czytaja je wfb_rx/wfb_tx. Ten format nie zmienil sie w wfb-ng od lat, ale
+    zamiast zakladac - porownujemy z para wygenerowana na TYM systemie. Lepiej
+    dowiedziec sie tu niz szukac pozniej, czemu nie ma linku."""
+    if not wfb_ng_installed():
+        return True, "wfb_keygen niedostepny, pomijam kontrole formatu"
+    tmp = f"/tmp/wfb-keycheck-{os.getpid()}"
+    run(["rm", "-rf", tmp])
+    run(["mkdir", "-p", tmp])
+    run(["bash", "-c", f"cd {tmp} && wfb_keygen"])
+    sizes = {}
+    for name in ("drone.key", "gs.key"):
+        p = Path(tmp) / name
+        sizes[name] = p.stat().st_size if p.exists() else -1
+    run(["rm", "-rf", tmp])
+    ours = len(base64.b64decode(DRONE_KEY_B64))
+    if sizes["drone.key"] != ours or sizes["gs.key"] != ours:
+        return False, f"wfb_keygen robi klucze {sizes}, a wbudowane maja {ours} B"
+    return True, f"format zgodny z wfb_keygen ({ours} B)"
+
+
+def generate_own_keys():
+    """Wlasna, prywatna para - bezpieczniejsza, ale trzeba ja przeniesc na
+    druga strone recznie."""
     run(["bash", "-c", "cd /etc && wfb_keygen"])
     log("")
     log(f"    !!! Wygenerowano NOWA pare kluczy NA TYM urzadzeniu (rola: {ROLE}).")
+    log(f"    !!! Odcisk: drone.key={key_fingerprint(DRONE_KEY)} gs.key={key_fingerprint(GS_KEY)}")
     log("    !!! Skopiuj OBA pliki na DRUGIE urzadzenie (nadpisz tam):")
     log("    !!!   scp /etc/drone.key /etc/gs.key <user>@<ip-drugiego-urzadzenia>:/tmp/")
     log("    !!!   # na drugim urzadzeniu:")
     log("    !!!   sudo mv /tmp/drone.key /tmp/gs.key /etc/")
-    log("    !!! NIE generuj kluczy ponownie na zadnym z urzadzen - stracisz polaczenie.")
+    log("    !!! Do czasu skopiowania nie bedzie polaczenia.")
     log("")
+
+
+def key_fingerprint(path):
+    """Krotki odcisk pliku klucza. Sluzy do porownania go GOLYM OKIEM miedzy
+    dronem a gs - wfb_keygen na kazdym urzadzeniu robi INNA pare, a sama
+    obecnosc plikow (ktora sprawdzamy osobno) niczego nie gwarantuje."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:8]
+    except OSError:
+        return None
+
+
+# Klasyczne objawy przeciazonych portow USB przy dwoch donglach 8812AU.
+POWER_PATTERNS = ("over-current", "overcurrent", "under-voltage", "undervoltage",
+                  "usb disconnect")
+
+
+def usb_power_issues():
+    code, out = run(["dmesg"])
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines()
+            if any(p in line.lower() for p in POWER_PATTERNS)]
+
+
+def ensure_dhcpcd_deny(nics):
+    """dhcpcd nie moze dotykac kart wfb. Dopisujemy PER INTERFEJS, bo drugi
+    dongiel czesto pojawia sie dopiero pozniej - sprawdzanie "czy w pliku
+    jest w ogole slowo denyinterfaces" przepuscilo by go bez wpisu."""
+    dhcpcd = Path("/etc/dhcpcd.conf")
+    if not dhcpcd.exists() or not nics:
+        return
+    txt = dhcpcd.read_text()
+    listed = set()
+    for line in txt.splitlines():
+        if line.strip().startswith("denyinterfaces"):
+            listed.update(line.split()[1:])
+    missing = [n for n in nics if n not in listed]
+    if missing:
+        with dhcpcd.open("a") as f:
+            f.write("denyinterfaces " + " ".join(missing) + "\n")
+
+
+def release_nics_from_network_stack(nics):
+    """Zdejmij karty wfb spod kontroli tego, co akurat zarzadza siecia.
+    Starsze obrazy: dhcpcd, nowsze (bookworm/trixie, wiec i swieze Pi 5):
+    NetworkManager. Wolane tez przy starcie, bo drugi dongiel potrafi
+    pojawic sie dawno po instalacji."""
+    ensure_dhcpcd_deny(nics)
+    ensure_nm_unmanaged(nics)
 
 
 def step_config():
@@ -405,12 +677,7 @@ def step_config():
             f.write("net.core.bpf_jit_enable = 1\n")
     run(["sysctl", "-p"])
 
-    dhcpcd = Path("/etc/dhcpcd.conf")
-    if dhcpcd.exists() and "denyinterfaces" not in dhcpcd.read_text():
-        nics = wfb_nics()
-        if nics:
-            with dhcpcd.open("a") as f:
-                f.write("denyinterfaces " + " ".join(nics) + "\n")
+    release_nics_from_network_stack(wfb_nics())
 
     if not CFG_PATH.exists():
         CFG_PATH.write_text(build_config(DEFAULT_CHANNEL, DEFAULT_REGION))
@@ -436,16 +703,87 @@ def full_setup():
     log("=== Instalacja zakonczona ===")
 
 
+# ------------------------- wykrywanie kart przy starcie -------------------------
+
+def detect_nics_startup():
+    """Odpalane przy KAZDYM starcie, jeszcze przed TUI: czy sa wszystkie
+    dongle, czy kazdy dostal interfejs pod naszym sterownikiem i czy usluga
+    ich uzywa. Jesli czegos brakuje - proba naprawy (przepiecie sterownika,
+    udev, restart uslugi), bo to sa dokladnie te trzy powody, dla ktorych
+    druga karta "jest, a nie dziala"."""
+    log(f"==> Wykrywanie kart RTL88xx (oczekiwano: {EXPECTED_NICS})")
+
+    dongles = usb_rtl_dongles()
+    log(f"    lsusb: {len(dongles)} szt.")
+    for d in dongles:
+        log(f"      - {d}")
+
+    nics = wfb_nics()
+    if len(nics) < EXPECTED_NICS:
+        log(f"    wfb-nics: {len(nics)} z {EXPECTED_NICS} - probuje przepiac reszte pod {TARGET_USB_DRIVER}...")
+        rebind_to_wfb_driver()
+        run(["udevadm", "trigger", "--action=add", "--subsystem-match=usb"])
+        run(["udevadm", "settle"], timeout=15)
+        time.sleep(2)
+        nics = wfb_nics()
+
+    for nic in nics:
+        d = nic_details(nic)
+        log(f"    {nic}: {d['driver']} mac={d['mac']} usb={d['usb']} tryb={d['mode']} kanal={d['channel']}")
+
+    if not nics:
+        log("    BLAD: zadna karta nie jest podpieta pod sterownik wfb.")
+        log("    Sprawdz: lsusb | grep -i 88   oraz   dmesg | tail -50")
+        return nics
+
+    release_nics_from_network_stack(nics)
+
+    if DRONE_KEY.exists() and GS_KEY.exists():
+        if using_builtin_keys():
+            log("    Klucze: wbudowane, te same po obu stronach - nic nie kopiujesz")
+        else:
+            log(f"    Klucze: wlasne, odcisk drone.key={key_fingerprint(DRONE_KEY)} "
+                f"gs.key={key_fingerprint(GS_KEY)} - musi byc IDENTYCZNY na dronie i gs")
+
+    if len(nics) < EXPECTED_NICS:
+        log(f"    UWAGA: dziala {len(nics)} z {EXPECTED_NICS} kart. Sprawdz port USB, kabel")
+        log("    i zasilanie - dwa dongle 8812AU potrafia przeciazyc porty RPi.")
+
+    # Dongiel wpiety po starcie uslugi nie zostanie uzyty sam z siebie.
+    unused = set(nics) - service_nics(set(nics))
+    if unused:
+        log(f"    Usluga nie uzywa: {' '.join(sorted(unused))} - restartuje wifibroadcast@{ROLE}...")
+        run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+        time.sleep(3)
+        still = set(nics) - service_nics(set(nics))
+        if still:
+            log(f"    Nadal poza usluga: {' '.join(sorted(still))} - zobacz: journalctl -u wifibroadcast@{ROLE} -n 50")
+        else:
+            log("    OK - usluga uzywa wszystkich kart.")
+
+    return nics
+
+
 # ------------------------- weryfikacja -------------------------
 
 def collect_checks():
     checks = []
 
-    code, out = run(["lsusb"])
-    if "8812" in out.lower():
-        checks.append(("Karta RTL8812AU", "ok", "wykryta w lsusb"))
+    dongles = usb_rtl_dongles()
+    if len(dongles) >= EXPECTED_NICS:
+        checks.append(("Dongle USB RTL88xx", "ok", f"{len(dongles)} szt. w lsusb (oczekiwano {EXPECTED_NICS})"))
+    elif dongles:
+        checks.append(("Dongle USB RTL88xx", "fail",
+                       f"tylko {len(dongles)} z {EXPECTED_NICS} - sprawdz drugi port USB, kabel i zasilanie"))
     else:
-        checks.append(("Karta RTL8812AU", "fail", "nie widac karty 8812 w lsusb"))
+        checks.append(("Dongle USB RTL88xx", "fail", "nie widac zadnej karty 88xx w lsusb"))
+
+    power = usb_power_issues()
+    if power:
+        checks.append(("Zasilanie / porty USB", "warn",
+                       f"{len(power)} zdarzen w dmesg, ostatnie: {power[-1][:70]}"))
+    else:
+        checks.append(("Zasilanie / porty USB", "ok", "brak over-current / under-voltage w dmesg"))
 
     code, out = run_tool("rfkill", "list")
     if "Soft blocked: yes" in out or "Hard blocked: yes" in out:
@@ -462,6 +800,55 @@ def collect_checks():
     else:
         checks.append(("Sterownik 88XXau_wfb", "fail", "brak - uruchom skrypt ponownie"))
 
+    nics = wfb_nics()
+    if len(nics) >= EXPECTED_NICS:
+        checks.append(("Interfejsy wfb", "ok", f"{len(nics)} z {EXPECTED_NICS}: {' '.join(nics)}"))
+    elif nics:
+        checks.append(("Interfejsy wfb", "fail",
+                       f"tylko {len(nics)} z {EXPECTED_NICS}: {' '.join(nics)} "
+                       f"- reszta wisi na innym sterowniku niz {TARGET_USB_DRIVER}"))
+    else:
+        checks.append(("Interfejsy wfb", "fail", "wfb-nics nie zwraca zadnego interfejsu"))
+
+    if nics and Path("/etc/NetworkManager").is_dir():
+        code, out = run_tool("nmcli", "-t", "-f", "DEVICE,STATE", "device")
+        managed = [ln.split(":")[0] + "=" + ln.split(":")[1] for ln in out.splitlines()
+                   if code == 0 and len(ln.split(":")) >= 2
+                   and ln.split(":")[0] in nics and ln.split(":")[1] != "unmanaged"]
+        if managed:
+            checks.append(("NetworkManager", "fail",
+                           f"zarzadza kartami wfb: {' '.join(managed)} - popraw {NM_CONF}"))
+        else:
+            checks.append(("NetworkManager", "ok", "karty wfb sa unmanaged"))
+
+    cfg_channel = parse_common(CFG_PATH.read_text())[0] if CFG_PATH.exists() else None
+    used_by_service = service_nics(set(nics))
+    traffic = nic_traffic(nics) if nics else {}
+
+    for i, nic in enumerate(nics, 1):
+        d = nic_details(nic)
+        rx_pps, tx_pps = traffic.get(nic, (0.0, 0.0))
+        detail = (f"{d['driver']} mac={d['mac']} usb={d['usb']} tryb={d['mode']} "
+                  f"kanal={d['channel']} rx={rx_pps:.0f}/s tx={tx_pps:.0f}/s")
+
+        if nic not in used_by_service:
+            status, detail = "fail", detail + " - usluga tej karty NIE uzywa"
+        elif d["mode"] != "monitor":
+            status, detail = "fail", detail + " - powinien byc monitor"
+        elif cfg_channel and d["channel"] not in ("?", cfg_channel):
+            status, detail = "fail", detail + f" - config mowi {cfg_channel}"
+        elif rx_pps == 0 and tx_pps == 0:
+            status, detail = "fail", detail + " - brak jakiegokolwiek ruchu"
+        elif tx_pps == 0:
+            # przy dwoch kartach wfb_tx potrafi nadawac tylko przez jedna,
+            # wiec sam brak TX przy dzialajacym RX to jeszcze nie awaria
+            status, detail = "warn", detail + " - odbiera, ale nie nadaje"
+        elif rx_pps == 0:
+            status, detail = "warn", detail + " - nadaje, ale nic nie odbiera (druga strona wylaczona?)"
+        else:
+            status = "ok"
+        checks.append((f"Karta {i}/{len(nics)}: {nic}", status, detail))
+
     code, out = run(["lsmod"])
     if "tun" in out:
         checks.append(("Modul tun", "ok", "zaladowany"))
@@ -474,7 +861,15 @@ def collect_checks():
         checks.append(("Pakiet wfb-ng", "fail", "brak wfb_keygen - pakiet niezainstalowany"))
 
     if DRONE_KEY.exists() and GS_KEY.exists():
-        checks.append(("Klucze /etc/*.key", "ok", "obecne"))
+        if using_builtin_keys():
+            checks.append(("Klucze /etc/*.key", "ok",
+                           f"wbudowane (odcisk {key_fingerprint(DRONE_KEY)}) - identyczne po obu stronach"))
+        else:
+            # Wlasna para: wfb_keygen na kazdym urzadzeniu robi INNA, wiec dwa
+            # "zielone" konce i tak sie nie dogadaja. Odciski musza sie zgadzac.
+            checks.append(("Klucze /etc/*.key", "warn",
+                           f"wlasne: drone.key={key_fingerprint(DRONE_KEY)} "
+                           f"gs.key={key_fingerprint(GS_KEY)} - porownaj z druga strona"))
     else:
         missing = [p.name for p in (DRONE_KEY, GS_KEY) if not p.exists()]
         checks.append(("Klucze /etc/*.key", "fail", f"brakuje: {', '.join(missing)}"))
@@ -648,6 +1043,115 @@ def edit_config_screen(stdscr):
     pause(stdscr)
 
 
+def keys_screen(stdscr):
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - klucze szyfrujace")
+
+    builtin = using_builtin_keys()
+    if builtin:
+        safe_addstr(stdscr, 2, 2, f"Aktualnie: WBUDOWANE (odcisk {key_fingerprint(DRONE_KEY)})",
+                    color_for("ok") | curses.A_BOLD)
+        safe_addstr(stdscr, 3, 2, "Te same w drone.py i gs.py - nic nie kopiujesz miedzy Pi.")
+        safe_addstr(stdscr, 4, 2, "Minus: kto ma ten skrypt, moze podsluchac i wstrzykiwac ramki.")
+    else:
+        safe_addstr(stdscr, 2, 2, f"Aktualnie: WLASNE (drone.key={key_fingerprint(DRONE_KEY)} "
+                                  f"gs.key={key_fingerprint(GS_KEY)})",
+                    color_for("warn") | curses.A_BOLD)
+        safe_addstr(stdscr, 3, 2, "Odcisk musi byc IDENTYCZNY na dronie i gs, inaczej nie ma linku.")
+
+    safe_addstr(stdscr, 6, 2, "w = wroc do wbudowanych (szybko, bez kopiowania)")
+    safe_addstr(stdscr, 7, 2, "g = wygeneruj nowa wlasna pare (trzeba przeniesc na druga strone)")
+    safe_addstr(stdscr, 8, 2, "dowolny inny klawisz = powrot bez zmian")
+    stdscr.refresh()
+
+    key = stdscr.getch()
+    if key not in (ord("w"), ord("W"), ord("g"), ord("G")):
+        return
+
+    if key in (ord("w"), ord("W")):
+        write_builtin_keys()
+        msg, status = "Zapisano wbudowane klucze. Zrob to samo na drugiej stronie.", "ok"
+    else:
+        buf, old_stdout = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            generate_own_keys()
+        finally:
+            sys.stdout = old_stdout
+        msg = f"Nowa para: drone.key={key_fingerprint(DRONE_KEY)} gs.key={key_fingerprint(GS_KEY)}"
+        status = "warn"
+
+    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+    safe_addstr(stdscr, 10, 2, msg, color_for(status) | curses.A_BOLD)
+    if status == "warn":
+        safe_addstr(stdscr, 11, 2, "Skopiuj /etc/drone.key i /etc/gs.key na druga strone (do /etc/),")
+        safe_addstr(stdscr, 12, 2, "inaczej link nie wstanie.")
+    safe_addstr(stdscr, 13, 2, f"Usluga wifibroadcast@{ROLE} zrestartowana.")
+    pause(stdscr)
+
+
+def redetect_screen(stdscr):
+    """Ta sama naprawa co przy starcie skryptu, ale z poziomu TUI: po wpieciu
+    brakujacego dongla nie trzeba wychodzic i uruchamiac wszystkiego od nowa."""
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - ponowne wykrywanie kart")
+    row = 2
+
+    def say(text, status=None):
+        nonlocal row
+        attr = (color_for(status) | curses.A_BOLD) if status else 0
+        safe_addstr(stdscr, row, 2, text, attr)
+        row += 1
+        stdscr.refresh()
+
+    dongles = usb_rtl_dongles()
+    say(f"lsusb: {len(dongles)} dongli RTL88xx (oczekiwano {EXPECTED_NICS})")
+
+    nics = wfb_nics()
+    if len(nics) < EXPECTED_NICS:
+        say(f"wfb-nics: {len(nics)}/{EXPECTED_NICS} - przepinam pod {TARGET_USB_DRIVER}...")
+        # rebind_to_wfb_driver() pisze przez log() na stdout, co rozjechaloby
+        # ekran curses - przechwytujemy i wypisujemy jego linie po swojemu
+        buf, old_stdout = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            rebind_to_wfb_driver()
+        finally:
+            sys.stdout = old_stdout
+        for line in buf.getvalue().splitlines():
+            if line.strip():
+                say("  " + line.strip())
+        run(["udevadm", "trigger", "--action=add", "--subsystem-match=usb"])
+        run(["udevadm", "settle"], timeout=15)
+        time.sleep(2)
+        nics = wfb_nics()
+
+    for nic in nics:
+        d = nic_details(nic)
+        say(f"  {nic}: {d['driver']} mac={d['mac']} usb={d['usb']} tryb={d['mode']} kanal={d['channel']}")
+
+    if nics:
+        release_nics_from_network_stack(nics)
+        unused = set(nics) - service_nics(set(nics))
+        if unused:
+            say(f"usluga nie uzywa: {' '.join(sorted(unused))} - restartuje...", "warn")
+            run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+            time.sleep(3)
+            unused = set(nics) - service_nics(set(nics))
+        if unused:
+            say(f"nadal poza usluga: {' '.join(sorted(unused))}", "fail")
+            say(f"zobacz: journalctl -u wifibroadcast@{ROLE} -n 50")
+
+    row += 1
+    _nic_status_cache["val"] = None  # wymus swiezy odczyt w menu
+    status, txt = nic_status_summary()
+    say(txt, status)
+    if status == "fail" and len(nics) < EXPECTED_NICS:
+        say("Sprawdz port USB, kabel i zasilanie - dwa dongle 8812AU obciazaja porty RPi.")
+
+    pause(stdscr)
+
+
 def verification_screen(stdscr):
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
@@ -656,17 +1160,46 @@ def verification_screen(stdscr):
 
     checks = collect_checks()
 
-    stdscr.clear()
-    draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
-    row = 2
+    # Kazdy check to dwa wiersze (nazwa + szczegol); przy dwoch kartach lista
+    # nie miesci sie na 24-wierszowym terminalu, wiec przewijamy.
+    lines = []
     for name, status, detail in checks:
-        icon = STATUS_ICON[status]
-        safe_addstr(stdscr, row, 2, icon, color_for(status) | curses.A_BOLD)
-        safe_addstr(stdscr, row, 9, name, curses.A_BOLD)
-        row += 1
-        safe_addstr(stdscr, row, 11, detail[:90])
-        row += 2
-    pause(stdscr)
+        lines.append((status, name, True))
+        lines.append((status, detail, False))
+
+    top = 0
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
+        h, _ = stdscr.getmaxyx()
+        view = max(1, h - 3)
+
+        for i, (status, text, is_name) in enumerate(lines[top:top + view]):
+            row = 2 + i
+            if is_name:
+                safe_addstr(stdscr, row, 2, STATUS_ICON[status], color_for(status) | curses.A_BOLD)
+                safe_addstr(stdscr, row, 9, text, curses.A_BOLD)
+            else:
+                safe_addstr(stdscr, row, 11, text)
+
+        if len(lines) > view:
+            hint = f"Strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}/{len(lines)}), q = powrot"
+        else:
+            hint = "Nacisnij dowolny klawisz, aby wrocic..."
+        safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_DOWN, ord("j")) and top + view < len(lines):
+            top += 1
+        elif key in (curses.KEY_UP, ord("k")) and top > 0:
+            top -= 1
+        elif key == curses.KEY_NPAGE:
+            top = min(max(0, len(lines) - view), top + view)
+        elif key == curses.KEY_PPAGE:
+            top = max(0, top - view)
+        else:
+            break
 
 
 def main_menu(stdscr):
@@ -677,6 +1210,8 @@ def main_menu(stdscr):
     items = [
         "Pokaz biezaca konfiguracje",
         "Zmien kanal / region i zapisz",
+        "Wykryj karty ponownie (naprawa)",
+        "Klucze szyfrujace",
         "Uruchom weryfikacje",
         "Wyjdz",
     ]
@@ -689,12 +1224,16 @@ def main_menu(stdscr):
         if not (DRONE_KEY.exists() and GS_KEY.exists()):
             safe_addstr(stdscr, 2, 2, "Brak kluczy - cos poszlo nie tak przy instalacji", color_for("fail"))
 
+        nic_status, nic_txt = nic_status_summary()
+        safe_addstr(stdscr, 3, 2, nic_txt, color_for(nic_status) | curses.A_BOLD)
+
         for i, item in enumerate(items):
             attr = curses.color_pair(5) if i == idx else curses.A_NORMAL
             safe_addstr(stdscr, 5 + i, 4, item.ljust(50), attr)
 
         h, _ = stdscr.getmaxyx()
-        safe_addstr(stdscr, h - 1, 2, "Strzalki gora/dol, Enter = wybierz, q = wyjscie", curses.A_DIM)
+        safe_addstr(stdscr, h - 1, 2, "Strzalki gora/dol, Enter = wybierz, r = odswiez, q = wyjscie",
+                    curses.A_DIM)
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -708,9 +1247,15 @@ def main_menu(stdscr):
             elif idx == 1:
                 edit_config_screen(stdscr)
             elif idx == 2:
-                verification_screen(stdscr)
+                redetect_screen(stdscr)
             elif idx == 3:
+                keys_screen(stdscr)
+            elif idx == 4:
+                verification_screen(stdscr)
+            elif idx == 5:
                 break
+        elif key in (ord("r"), ord("R")):
+            _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
         elif key in (ord("q"), 27):
             break
 
@@ -721,8 +1266,10 @@ def main():
 
     if not is_fully_installed():
         full_setup()
-        print()
-        input("Nacisnij Enter, aby przejsc do konfiguratora/weryfikatora...")
+
+    detect_nics_startup()
+    print()
+    input("Nacisnij Enter, aby przejsc do konfiguratora/weryfikatora...")
 
     curses.wrapper(main_menu)
 
