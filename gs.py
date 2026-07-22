@@ -10,9 +10,10 @@ Gs ma JEDNA karte, dron dwa dongle (EXPECTED_NICS). Kazdy start sprawdza,
 czy karta jest widoczna, przepieta pod nasz sterownik, w trybie monitor na
 wlasciwym kanale i czy faktycznie przepuszcza ruch.
 
-Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec nie trzeba
-nic kopiowac miedzy urzadzeniami - link wstaje od razu. W menu jest opcja
-przelaczenia na wlasna, prywatna pare.
+Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec link wstaje
+od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
+8-znakowy kod, na drugiej sie go wpisuje i obie licza z niego te sama, prywatna
+pare kluczy.
 
 Uzycie:
     sudo python3 gs.py
@@ -24,6 +25,7 @@ import hashlib
 import io
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -555,6 +557,125 @@ def ensure_nm_unmanaged(nics):
         run(["systemctl", "reload", "NetworkManager"])
 
 
+# ------------------------- parowanie -------------------------
+
+# X25519 (RFC 7748) w czystym Pythonie. Swiezy Raspberry Pi OS nie ma
+# gwarantowanego ani pynacl, ani cryptography, a doinstalowywanie biblioteki
+# tylko po to, zeby raz policzyc klucz publiczny, to proszenie sie o problem
+# przy braku sieci. Sprawdzone na wektorach z RFC 7748 i wzgledem libsodium.
+_P = 2 ** 255 - 19
+_A24 = 121665
+
+
+def _cswap(swap, a, b):
+    dummy = swap * ((a - b) % _P)
+    return (a - dummy) % _P, (b + dummy) % _P
+
+
+def x25519(scalar, u_bytes=None):
+    """Mnozenie skalarne na Curve25519. u_bytes=None oznacza punkt bazowy,
+    czyli wyliczenie klucza publicznego z tajnego."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(k, "little")
+    u = 9 if u_bytes is None else int.from_bytes(u_bytes, "little") % (2 ** 255)
+
+    x1, x2, z2, x3, z3, swap = u, 1, 0, u, 1, 0
+    for t in range(254, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        x2, x3 = _cswap(swap, x2, x3)
+        z2, z3 = _cswap(swap, z2, z3)
+        swap = kt
+
+        a = (x2 + z2) % _P
+        aa = a * a % _P
+        b = (x2 - z2) % _P
+        bb = b * b % _P
+        e = (aa - bb) % _P
+        c = (x3 + z3) % _P
+        d = (x3 - z3) % _P
+        da = d * a % _P
+        cb = c * b % _P
+        x3 = pow(da + cb, 2, _P)
+        z3 = x1 * pow(da - cb, 2, _P) % _P
+        x2 = aa * bb % _P
+        z2 = e * ((aa + _A24 * e) % _P) % _P
+
+    x2, x3 = _cswap(swap, x2, x3)
+    z2, z3 = _cswap(swap, z2, z3)
+    return (x2 * pow(z2, _P - 2, _P) % _P).to_bytes(32, "little")
+
+
+PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # bez I, O, 0, 1 - myli sie przy przepisywaniu
+PAIRING_SALT = b"wfb-ng pairing v1"
+PAIRING_CODE_PATH = Path("/etc/wfb-pairing.code")
+
+
+def new_pairing_code():
+    return "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(8))
+
+
+def format_pairing_code(code):
+    return f"{code[:4]}-{code[4:]}"
+
+
+def normalize_pairing_code(text):
+    """Zwraca 8 znakow alfabetu albo None. Wybaczamy male litery, spacje i
+    myslniki - kod przepisuje sie recznie z drugiego ekranu."""
+    raw = "".join(ch for ch in text.upper() if ch.isalnum())
+    if len(raw) != 8 or any(ch not in PAIRING_ALPHABET for ch in raw):
+        return None
+    return raw
+
+
+def derive_keys_from_code(code):
+    """Z jednego kodu obie strony licza IDENTYCZNA pare kluczy - w tym cala
+    sztuczka: nie trzeba przenosic zadnych plikow, wystarczy przepisac 8
+    znakow. Zwraca (drone_key, gs_key) w formacie wfb-ng (po 64 bajty)."""
+    seed = hashlib.sha256(PAIRING_SALT + code.encode()).digest()
+    drone_sk = hashlib.sha256(seed + b"drone").digest()
+    gs_sk = hashlib.sha256(seed + b"gs").digest()
+    return drone_sk + x25519(gs_sk), gs_sk + x25519(drone_sk)
+
+
+def apply_pairing_code(code):
+    """Zapisuje klucze wyliczone z kodu oraz sam kod - zeby dalo sie go
+    podejrzec pozniej, jak sie zapomni przed pojsciem do drugiego Pi."""
+    drone_key, gs_key = derive_keys_from_code(code)
+    DRONE_KEY.write_bytes(drone_key)
+    GS_KEY.write_bytes(gs_key)
+    PAIRING_CODE_PATH.write_text(code + "\n")
+    for p in (DRONE_KEY, GS_KEY, PAIRING_CODE_PATH):
+        os.chmod(p, 0o600)
+
+
+def read_pairing_code():
+    try:
+        return normalize_pairing_code(PAIRING_CODE_PATH.read_text())
+    except OSError:
+        return None
+
+
+def key_mode():
+    """Skad pochodza klucze lezace w /etc: (tryb, kod). Kod jest weryfikowany
+    - zapisany plik z kodem nic nie znaczy, jesli klucze sa juz inne."""
+    if not (DRONE_KEY.exists() and GS_KEY.exists()):
+        return "brak", None
+    if using_builtin_keys():
+        return "wbudowane", None
+    code = read_pairing_code()
+    if code:
+        try:
+            if derive_keys_from_code(code)[0] == DRONE_KEY.read_bytes():
+                return "sparowane", code
+        except OSError:
+            pass
+    return "wlasne", None
+
+
 def write_builtin_keys():
     DRONE_KEY.write_bytes(base64.b64decode(DRONE_KEY_B64))
     GS_KEY.write_bytes(base64.b64decode(GS_KEY_B64))
@@ -738,12 +859,14 @@ def detect_nics_startup():
 
     release_nics_from_network_stack(nics)
 
-    if DRONE_KEY.exists() and GS_KEY.exists():
-        if using_builtin_keys():
-            log("    Klucze: wbudowane, te same po obu stronach - nic nie kopiujesz")
-        else:
-            log(f"    Klucze: wlasne, odcisk drone.key={key_fingerprint(DRONE_KEY)} "
-                f"gs.key={key_fingerprint(GS_KEY)} - musi byc IDENTYCZNY na dronie i gs")
+    mode, code = key_mode()
+    if mode == "sparowane":
+        log(f"    Klucze: sparowane kodem {format_pairing_code(code)}, odcisk {key_fingerprint(DRONE_KEY)}")
+    elif mode == "wbudowane":
+        log("    Klucze: wbudowane, te same po obu stronach - nic nie kopiujesz")
+    elif mode == "wlasne":
+        log(f"    Klucze: wlasne, odcisk drone.key={key_fingerprint(DRONE_KEY)} "
+            f"gs.key={key_fingerprint(GS_KEY)} - musi byc IDENTYCZNY na dronie i gs")
 
     if len(nics) < EXPECTED_NICS:
         log(f"    UWAGA: dziala {len(nics)} z {EXPECTED_NICS} kart. Sprawdz port USB, kabel")
@@ -860,16 +983,20 @@ def collect_checks():
     else:
         checks.append(("Pakiet wfb-ng", "fail", "brak wfb_keygen - pakiet niezainstalowany"))
 
-    if DRONE_KEY.exists() and GS_KEY.exists():
-        if using_builtin_keys():
-            checks.append(("Klucze /etc/*.key", "ok",
-                           f"wbudowane (odcisk {key_fingerprint(DRONE_KEY)}) - identyczne po obu stronach"))
-        else:
-            # Wlasna para: wfb_keygen na kazdym urzadzeniu robi INNA, wiec dwa
-            # "zielone" konce i tak sie nie dogadaja. Odciski musza sie zgadzac.
-            checks.append(("Klucze /etc/*.key", "warn",
-                           f"wlasne: drone.key={key_fingerprint(DRONE_KEY)} "
-                           f"gs.key={key_fingerprint(GS_KEY)} - porownaj z druga strona"))
+    mode, code = key_mode()
+    if mode == "sparowane":
+        checks.append(("Klucze /etc/*.key", "ok",
+                       f"sparowane kodem {format_pairing_code(code)} "
+                       f"(odcisk {key_fingerprint(DRONE_KEY)}) - porownaj z druga strona"))
+    elif mode == "wbudowane":
+        checks.append(("Klucze /etc/*.key", "ok",
+                       f"wbudowane (odcisk {key_fingerprint(DRONE_KEY)}) - identyczne po obu stronach"))
+    elif mode == "wlasne":
+        # wfb_keygen na kazdym urzadzeniu robi INNA pare, wiec dwa "zielone"
+        # konce i tak sie nie dogadaja. Odciski musza sie zgadzac.
+        checks.append(("Klucze /etc/*.key", "warn",
+                       f"wlasne: drone.key={key_fingerprint(DRONE_KEY)} "
+                       f"gs.key={key_fingerprint(GS_KEY)} - porownaj z druga strona"))
     else:
         missing = [p.name for p in (DRONE_KEY, GS_KEY) if not p.exists()]
         checks.append(("Klucze /etc/*.key", "fail", f"brakuje: {', '.join(missing)}"))
@@ -1043,51 +1170,88 @@ def edit_config_screen(stdscr):
     pause(stdscr)
 
 
-def keys_screen(stdscr):
+def show_pairing_code_screen(stdscr, code):
     stdscr.clear()
-    draw_header(stdscr, f"WFB-NG [{ROLE}] - klucze szyfrujace")
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - kod parowania")
+    safe_addstr(stdscr, 2, 2, "Przepisz ten kod na drugim urzadzeniu:")
 
-    builtin = using_builtin_keys()
-    if builtin:
-        safe_addstr(stdscr, 2, 2, f"Aktualnie: WBUDOWANE (odcisk {key_fingerprint(DRONE_KEY)})",
-                    color_for("ok") | curses.A_BOLD)
-        safe_addstr(stdscr, 3, 2, "Te same w drone.py i gs.py - nic nie kopiujesz miedzy Pi.")
-        safe_addstr(stdscr, 4, 2, "Minus: kto ma ten skrypt, moze podsluchac i wstrzykiwac ramki.")
-    else:
-        safe_addstr(stdscr, 2, 2, f"Aktualnie: WLASNE (drone.key={key_fingerprint(DRONE_KEY)} "
-                                  f"gs.key={key_fingerprint(GS_KEY)})",
-                    color_for("warn") | curses.A_BOLD)
-        safe_addstr(stdscr, 3, 2, "Odcisk musi byc IDENTYCZNY na dronie i gs, inaczej nie ma linku.")
+    shown = f"  {format_pairing_code(code)}  "
+    frame = "+" + "-" * len(shown) + "+"
+    safe_addstr(stdscr, 4, 6, frame, curses.A_BOLD)
+    safe_addstr(stdscr, 5, 6, "|", curses.A_BOLD)
+    safe_addstr(stdscr, 5, 7, shown, curses.color_pair(5) | curses.A_BOLD)
+    safe_addstr(stdscr, 5, 7 + len(shown), "|", curses.A_BOLD)
+    safe_addstr(stdscr, 6, 6, frame, curses.A_BOLD)
 
-    safe_addstr(stdscr, 6, 2, "w = wroc do wbudowanych (szybko, bez kopiowania)")
-    safe_addstr(stdscr, 7, 2, "g = wygeneruj nowa wlasna pare (trzeba przeniesc na druga strone)")
-    safe_addstr(stdscr, 8, 2, "dowolny inny klawisz = powrot bez zmian")
-    stdscr.refresh()
-
-    key = stdscr.getch()
-    if key not in (ord("w"), ord("W"), ord("g"), ord("G")):
-        return
-
-    if key in (ord("w"), ord("W")):
-        write_builtin_keys()
-        msg, status = "Zapisano wbudowane klucze. Zrob to samo na drugiej stronie.", "ok"
-    else:
-        buf, old_stdout = io.StringIO(), sys.stdout
-        sys.stdout = buf
-        try:
-            generate_own_keys()
-        finally:
-            sys.stdout = old_stdout
-        msg = f"Nowa para: drone.key={key_fingerprint(DRONE_KEY)} gs.key={key_fingerprint(GS_KEY)}"
-        status = "warn"
-
-    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
-    safe_addstr(stdscr, 10, 2, msg, color_for(status) | curses.A_BOLD)
-    if status == "warn":
-        safe_addstr(stdscr, 11, 2, "Skopiuj /etc/drone.key i /etc/gs.key na druga strone (do /etc/),")
-        safe_addstr(stdscr, 12, 2, "inaczej link nie wstanie.")
-    safe_addstr(stdscr, 13, 2, f"Usluga wifibroadcast@{ROLE} zrestartowana.")
+    safe_addstr(stdscr, 8, 2, "Tam: menu -> Klucze i parowanie -> w (wpisz kod)")
+    safe_addstr(stdscr, 10, 2, f"Odcisk kluczy tutaj: {key_fingerprint(DRONE_KEY)}", curses.A_BOLD)
+    safe_addstr(stdscr, 11, 2, "Po sparowaniu odcisk musi byc taki sam po obu stronach.")
+    safe_addstr(stdscr, 13, 2, f"Kod zapisany w {PAIRING_CODE_PATH} - da sie go tu podejrzec pozniej.")
     pause(stdscr)
+
+
+def keys_screen(stdscr):
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, f"WFB-NG [{ROLE}] - klucze i parowanie")
+        mode, code = key_mode()
+
+        if mode == "sparowane":
+            safe_addstr(stdscr, 2, 2, f"Stan: SPAROWANE kodem {format_pairing_code(code)}",
+                        color_for("ok") | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, f"Odcisk kluczy: {key_fingerprint(DRONE_KEY)} "
+                                      "- na drugiej stronie musi byc taki sam.")
+        elif mode == "wbudowane":
+            safe_addstr(stdscr, 2, 2, "Stan: KLUCZE WBUDOWANE (te same w kazdej kopii skryptu)",
+                        color_for("warn") | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, "Dziala od razu, ale kto ma ten skrypt, ten slyszy transmisje.")
+        elif mode == "wlasne":
+            safe_addstr(stdscr, 2, 2, f"Stan: WLASNA PARA (drone.key={key_fingerprint(DRONE_KEY)} "
+                                      f"gs.key={key_fingerprint(GS_KEY)})",
+                        color_for("warn") | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, "Wymaga recznego skopiowania obu plikow na druga strone.")
+        else:
+            safe_addstr(stdscr, 2, 2, "Stan: BRAK KLUCZY", color_for("fail") | curses.A_BOLD)
+
+        safe_addstr(stdscr, 5, 2, "n = nowy kod parowania (pokaze kod i od razu zastosuje tutaj)")
+        safe_addstr(stdscr, 6, 2, "w = wpisz kod z drugiego urzadzenia")
+        safe_addstr(stdscr, 7, 2, "b = wroc do kluczy wbudowanych")
+        safe_addstr(stdscr, 8, 2, "q = powrot do menu")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+
+        if key in (ord("n"), ord("N")):
+            code = new_pairing_code()
+            apply_pairing_code(code)
+            run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+            show_pairing_code_screen(stdscr, code)
+
+        elif key in (ord("w"), ord("W")):
+            raw = prompt_line(stdscr, 10, "Kod z drugiego urzadzenia", "")
+            norm = normalize_pairing_code(raw)
+            if norm is None:
+                safe_addstr(stdscr, 12, 2, "Niepoprawny kod: 8 znakow, bez I, O, 0 i 1.",
+                            color_for("fail") | curses.A_BOLD)
+            else:
+                apply_pairing_code(norm)
+                run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+                safe_addstr(stdscr, 12, 2, f"Sparowano kodem {format_pairing_code(norm)}. "
+                                           f"Odcisk: {key_fingerprint(DRONE_KEY)}",
+                            color_for("ok") | curses.A_BOLD)
+                safe_addstr(stdscr, 13, 2, "Odcisk musi zgadzac sie z tym na drugim urzadzeniu.")
+            pause(stdscr)
+
+        elif key in (ord("b"), ord("B")):
+            write_builtin_keys()
+            PAIRING_CODE_PATH.unlink(missing_ok=True)
+            run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+            safe_addstr(stdscr, 10, 2, "Przywrocono klucze wbudowane. Zrob to samo na drugiej stronie.",
+                        color_for("ok") | curses.A_BOLD)
+            pause(stdscr)
+
+        else:
+            return
 
 
 def redetect_screen(stdscr):
@@ -1211,7 +1375,7 @@ def main_menu(stdscr):
         "Pokaz biezaca konfiguracje",
         "Zmien kanal / region i zapisz",
         "Wykryj karty ponownie (naprawa)",
-        "Klucze szyfrujace",
+        "Klucze i parowanie",
         "Uruchom weryfikacje",
         "Wyjdz",
     ]
