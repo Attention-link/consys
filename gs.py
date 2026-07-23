@@ -24,6 +24,7 @@ Uzycie:
     sudo python3 gs.py
 """
 
+import ast
 import base64
 import curses
 import hashlib
@@ -447,50 +448,110 @@ def parse_common(txt):
     return (ch.group(1) if ch else DEFAULT_CHANNEL, reg.group(1) if reg else DEFAULT_REGION)
 
 
-def video_section_bounds(txt):
-    """Zakres sekcji [<rola>_video] w configu - zeby ruszac tylko ja."""
-    header = f"[{ROLE}_video]"
+def wfb_streams():
+    """Lista strumieni profilu tak, jak widzi ja wfb-ng PO scaleniu master.cfg,
+    site.cfg i /etc/wifibroadcast.cfg. Pytamy biblioteke zamiast parsowac pliki,
+    bo typ uslugi nie stoi w sekcji [<rola>_video] - tam sa tylko fwmark i peer
+    - tylko w profilu [<rola>] w liscie 'streams'. Osobny interpreter, a nie
+    import u siebie, bo wfb_ng.conf cache'uje config przy imporcie i po naszej
+    zmianie oddawalby nieaktualne dane."""
+    code, out = run(["python3", "-c",
+                     f"from wfb_ng.conf import settings; print(repr(settings.{ROLE}.streams))"],
+                    timeout=30)
+    if code != 0:
+        return None
+
+    start, end = out.find("["), out.rfind("]")  # run() sklei stdout ze stderr,
+    if start == -1 or end <= start:             # wiec wycinamy sam literal
+        return None
+    try:
+        streams = ast.literal_eval(out[start:end + 1])
+    except (ValueError, SyntaxError):
+        return None
+    return streams if isinstance(streams, list) else None
+
+
+def video_service_type(streams=None):
+    """Tryb uslugi wideo widziany przez wfb-ng albo None, gdy nie da sie go
+    ustalic (np. wfb-ng jeszcze nie zainstalowany)."""
+    streams = wfb_streams() if streams is None else streams
+    if not streams:
+        return None
+    return next((s.get("service_type") for s in streams if s.get("name") == "video"), None)
+
+
+def backup_config_once():
+    """Kopia oryginalnego configu przed pierwsza nasza ingerencja - zeby bylo
+    do czego wrocic, gdyby nadpisanie 'streams' okazalo sie nietrafione."""
+    bak = Path(str(CFG_PATH) + ".bak")
+    if CFG_PATH.exists() and not bak.exists():
+        bak.write_text(CFG_PATH.read_text())
+
+
+def set_cfg_option(section, key, value_txt):
+    """Ustawia klucz w sekcji /etc/wifibroadcast.cfg: dopisuje sekcje, gdy jej
+    nie ma, podmienia wartosc, gdy klucz juz tam jest."""
+    txt = CFG_PATH.read_text()
+    header = f"[{section}]"
+    line = f"{key} = {value_txt}"
+    start = txt.find(header)
+
+    if start == -1:
+        CFG_PATH.write_text(txt.rstrip("\n") + f"\n\n{header}\n{line}\n")
+        return
+
+    end = txt.find("\n[", start + 1)
+    end = len(txt) if end == -1 else end
+    body = txt[start:end]
+    if re.search(rf"^\s*{re.escape(key)}\s*=", body, re.M):
+        body = re.sub(rf"^\s*{re.escape(key)}\s*=.*$", line, body, count=1, flags=re.M)
+    else:
+        body = body.replace(header, f"{header}\n{line}", 1)
+    CFG_PATH.write_text(txt[:start] + body + txt[end:])
+
+
+def drop_cfg_option(section, key):
+    """Usuwa klucz z sekcji - sprzata po wpisie, ktory i tak nic nie robil."""
+    txt = CFG_PATH.read_text()
+    header = f"[{section}]"
     start = txt.find(header)
     if start == -1:
-        return None
+        return False
     end = txt.find("\n[", start + 1)
-    return start, (len(txt) if end == -1 else end)
-
-
-def video_service_type(txt):
-    """Tryb uslugi wideo z configu albo None, gdy nie ustawiony - wtedy
-    obowiazuje domyslny z master.cfg wfb-ng."""
-    bounds = video_section_bounds(txt)
-    if not bounds:
-        return None
-    m = re.search(r"^\s*service_type\s*=\s*'([^']*)'", txt[bounds[0]:bounds[1]], re.M)
-    return m.group(1) if m else None
+    end = len(txt) if end == -1 else end
+    body = txt[start:end]
+    new_body = re.sub(rf"^\s*{re.escape(key)}\s*=.*\n?", "", body, flags=re.M)
+    if new_body == body:
+        return False
+    CFG_PATH.write_text(txt[:start] + new_body + txt[end:])
+    return True
 
 
 def ensure_video_service_type(nics):
-    """Domyslny tryb wideo nie umie obsluzyc kilku kart naraz: serwer konczy
-    sie wtedy bledem "udp_direct_tx doesn't supports diversity and/or rx-only
-    wlans. Use udp_proxy for such case." i systemd restartuje go w kolko -
-    z zewnatrz widac tylko status "activating". Przy wiecej niz jednej karcie
-    wymuszamy udp_proxy. Na gs, z jedna karta, nie robi nic - ale kod jest
-    wspolny z drone.py, gdzie karty sa dwie."""
+    """Domyslny tryb wideo (udp_direct_tx) nie umie obsluzyc kilku kart naraz:
+    serwer konczy sie wtedy bledem "udp_direct_tx doesn't supports diversity
+    and/or rx-only wlans. Use udp_proxy for such case." i systemd restartuje go
+    w kolko - z zewnatrz widac tylko status "activating", a karty wygladaja na
+    sprawne. Przy wiecej niz jednej karcie nadpisujemy w profilu [<rola>] cala
+    liste 'streams' z podmienionym service_type dla wideo. Na gs, z jedna
+    karta, nie robi nic - ale kod jest wspolny z drone.py, gdzie karty sa
+    dwie."""
     if len(nics) < 2 or not CFG_PATH.exists():
         return False
 
-    txt = CFG_PATH.read_text()
-    bounds = video_section_bounds(txt)
-    if not bounds or video_service_type(txt) == "udp_proxy":
-        return False
+    # sprzatanie po wczesniejszej wersji tego skryptu: service_type w sekcji
+    # [<rola>_video] byl martwym wpisem, wfb-ng go tam nie czyta
+    dead_key = drop_cfg_option(f"{ROLE}_video", "service_type")
 
-    start, end = bounds
-    section = txt[start:end]
-    if video_service_type(txt) is None:
-        section = section.replace(f"[{ROLE}_video]",
-                                  f"[{ROLE}_video]\nservice_type = 'udp_proxy'", 1)
-    else:
-        section = re.sub(r"^\s*service_type\s*=.*$", "service_type = 'udp_proxy'",
-                         section, count=1, flags=re.M)
-    CFG_PATH.write_text(txt[:start] + section + txt[end:])
+    streams = wfb_streams()
+    if not streams or video_service_type(streams) != "udp_direct_tx":
+        return dead_key  # juz naprawione, inna wersja albo brak wfb-ng
+
+    backup_config_once()
+    fixed = [dict(s, service_type="udp_proxy") if s.get("name") == "video" else s
+             for s in streams]
+    # repr() daje jedna linie - parser configu nie lubi zawijanych wartosci
+    set_cfg_option(ROLE, "streams", repr(fixed))
     return True
 
 
@@ -1219,8 +1280,8 @@ def detect_nics_startup():
         log("    i zasilanie - dwa dongle 8812AU potrafia przeciazyc porty RPi.")
 
     if ensure_video_service_type(nics):
-        log(f"    {CFG_PATH}: [{ROLE}_video] przestawione na udp_proxy - domyslny")
-        log(f"    tryb nie umie obsluzyc {len(nics)} kart i zabijal usluge przy starcie.")
+        log(f"    {CFG_PATH}: wideo przestawione na udp_proxy - domyslny tryb")
+        log(f"    (udp_direct_tx) nie umie obsluzyc {len(nics)} kart i zabijal usluge.")
         run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
         time.sleep(3)
 
@@ -1379,13 +1440,12 @@ def collect_checks():
         checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
 
     if CFG_PATH.exists():
-        txt = CFG_PATH.read_text()
-        ch, reg = parse_common(txt)
-        vtype = video_service_type(txt) or "domyslny"
-        detail = f"kanal={ch} region={reg} rola={ROLE} wideo={vtype}"
-        if len(nics) > 1 and video_service_type(txt) != "udp_proxy":
+        ch, reg = parse_common(CFG_PATH.read_text())
+        vtype = video_service_type()
+        detail = f"kanal={ch} region={reg} rola={ROLE} wideo={vtype or '?'}"
+        if len(nics) > 1 and vtype == "udp_direct_tx":
             checks.append(("wifibroadcast.cfg", "fail",
-                           detail + f" - przy {len(nics)} kartach usluga sie wywali, potrzeba udp_proxy"))
+                           detail + f" - ten tryb nie umie {len(nics)} kart, usluga bedzie sie wywalac"))
         else:
             checks.append(("wifibroadcast.cfg", "ok", detail))
     else:
@@ -1681,7 +1741,7 @@ def redetect_screen(stdscr):
     if nics:
         release_nics_from_network_stack(nics)
         if ensure_video_service_type(nics):
-            say(f"config: [{ROLE}_video] -> udp_proxy (domyslny tryb nie umie {len(nics)} kart)", "warn")
+            say(f"config: wideo -> udp_proxy (domyslny tryb nie umie {len(nics)} kart)", "warn")
             run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
             time.sleep(3)
         unused = set(nics) - service_nics(set(nics))
