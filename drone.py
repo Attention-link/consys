@@ -2007,6 +2007,108 @@ def redetect_screen(stdscr):
     pause(stdscr)
 
 
+def nic_snapshot():
+    """{nazwa: (gniazdo USB, mac)} - lekko, bez wolania 'iw', bo ten ekran
+    odpytuje karty dwa razy na sekunde."""
+    snap = {}
+    for nic in wfb_nics():
+        try:
+            mac = (Path("/sys/class/net") / nic / "address").read_text().strip()
+        except OSError:
+            mac = "?"
+        snap[nic] = (nic_usb_slot(nic) or "?", mac)
+    return snap
+
+
+def nic_identify_screen(stdscr):
+    """Zywy podglad kart: wypnij dongla, a ekran powie, ktora nazwa wlasnie
+    zniknela. To najprostszy sposob dopasowania nazwy do konkretnej anteny,
+    bo dwa dongle 8812AU wygladaja identycznie i nie widac po nich, ktory
+    siedzi w ktorym gniezdzie. Przy okazji licza sie liczniki rx/tx na zywo,
+    wiec w tym samym miejscu widac, przez ktora karte leci nadawanie."""
+    stdscr.timeout(500)  # getch wraca po 0.5 s, wiec petla sama sie odswieza
+
+    known = nic_snapshot()
+    prev_dongles = len(usb_rtl_dongles())
+    counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in known}
+    events = []
+
+    def note(text, status):
+        events.insert(0, (time.strftime("%H:%M:%S"), text, status))
+        del events[8:]
+
+    try:
+        while True:
+            now = time.monotonic()
+            current = nic_snapshot()
+            dongles = len(usb_rtl_dongles())
+
+            for nic in [n for n in known if n not in current]:
+                slot, mac = known[nic]
+                note(f"WYPIETO: {nic}   (gniazdo {slot}, mac {mac})", "fail")
+                if dongles < prev_dongles:
+                    note(f"   ... dongiel zniknal tez z lsusb - to fizyczne wypiecie", "warn")
+                else:
+                    note("   ... ale lsusb dalej go widzi - to nie kabel, tylko sterownik", "warn")
+
+            for nic in [n for n in current if n not in known]:
+                slot, mac = current[nic]
+                note(f"WPIETO: {nic}   (gniazdo {slot}, mac {mac})", "ok")
+                note("   ... usluga uzyje jej dopiero po 'Wykryj karty ponownie'", "warn")
+
+            known, prev_dongles = current, dongles
+
+            stdscr.clear()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - identyfikacja kart")
+            safe_addstr(stdscr, 2, 2,
+                        "Wypnij jeden dongiel - ekran powie, ktora nazwa zniknela.", curses.A_BOLD)
+
+            row = 4
+            safe_addstr(stdscr, row, 2,
+                        f"Karty: {len(current)}/{EXPECTED_NICS}    dongle w lsusb: {dongles}/{EXPECTED_NICS}",
+                        color_for("ok" if len(current) == EXPECTED_NICS else "fail") | curses.A_BOLD)
+            row += 2
+
+            used = service_nics(set(current)) if current else set()
+            for nic in sorted(current):
+                slot, mac = current[nic]
+                rx, tx = nic_counters(nic)
+                prev = counters.get(nic)
+                if prev and now > prev[2]:
+                    dt = now - prev[2]
+                    rx_pps = max(0.0, (rx - prev[0]) / dt)
+                    tx_pps = max(0.0, (tx - prev[1]) / dt)
+                else:
+                    rx_pps = tx_pps = 0.0  # karta dopiero co wpieta, brak odniesienia
+                counters[nic] = (rx, tx, now)
+
+                safe_addstr(stdscr, row, 2, f"{nic:<12} gniazdo={slot:<10} mac={mac}",
+                            color_for("ok" if nic in used else "warn") | curses.A_BOLD)
+                safe_addstr(stdscr, row + 1, 4,
+                            f"rx={rx_pps:6.0f}/s  tx={tx_pps:6.0f}/s   w usludze="
+                            f"{'tak' if nic in used else 'NIE'}"
+                            + ("   <- ta karta nadaje" if tx_pps > 0 else ""),
+                            color_for("ok") if tx_pps > 0 else 0)
+                row += 3
+
+            if events:
+                safe_addstr(stdscr, row, 2, "Zdarzenia:", curses.A_BOLD)
+                row += 1
+                for stamp, text, status in events:
+                    safe_addstr(stdscr, row, 4, f"{stamp}  {text}", color_for(status))
+                    row += 1
+
+            h, _ = stdscr.getmaxyx()
+            safe_addstr(stdscr, h - 1, 2, "q = powrot", curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+    finally:
+        stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
+
+
 def verification_screen(stdscr):
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
@@ -2066,6 +2168,7 @@ def main_menu(stdscr):
         "Pokaz biezaca konfiguracje",
         "Zmien kanal / region i zapisz",
         "Wykryj karty ponownie (naprawa)",
+        "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
         "Uruchom weryfikacje",
         "Wyjdz",
@@ -2104,10 +2207,12 @@ def main_menu(stdscr):
             elif idx == 2:
                 redetect_screen(stdscr)
             elif idx == 3:
-                keys_screen(stdscr)
+                nic_identify_screen(stdscr)
             elif idx == 4:
-                verification_screen(stdscr)
+                keys_screen(stdscr)
             elif idx == 5:
+                verification_screen(stdscr)
+            elif idx == 6:
                 break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
