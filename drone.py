@@ -82,6 +82,11 @@ ROLE_SECTION = (
     "[drone_mavlink]\n"
     "# peer = 'listen://0.0.0.0:14550'\n\n"
     "[drone_video]\n"
+    # Domyslny tryb wfb-ng dla wideo to udp_direct_tx, ktory NIE obsluguje
+    # nadawania z kilku kart ("udp_direct_tx doesn't supports diversity").
+    # Dron ma dwa dongle, wiec bez tego serwer wywala sie przy starcie
+    # i wpada w petle restartow. Patrz ensure_video_service_type().
+    "service_type = 'udp_proxy'\n"
     "peer = 'listen://0.0.0.0:5602'\n"
 )
 
@@ -222,6 +227,7 @@ def nic_status_summary(max_age=2.0):
         return _nic_status_cache["val"]
 
     nics = wfb_nics()
+    props = service_props()
     used = service_nics(set(nics)) if nics else set()
     dongles = len(usb_rtl_dongles())
 
@@ -233,6 +239,11 @@ def nic_status_summary(max_age=2.0):
     if len(nics) < EXPECTED_NICS:
         status = "fail"
         txt += "   <- BRAK KARTY" + (", dongiel wisi na innym sterowniku" if dongles > len(nics) else "")
+    elif not service_active(props):
+        # Karty moga byc idealne, a i tak 0/2 - bo usluga w ogole nie wstala.
+        # Radzenie "zrestartuj usluge" byloby wtedy myleniem tropu.
+        status = "fail"
+        txt += f"   <- USLUGA NIE DZIALA ({service_state_txt(props)})"
     elif len(used) < len(nics):
         status = "warn"
         txt += "   <- zrestartuj usluge"
@@ -241,6 +252,64 @@ def nic_status_summary(max_age=2.0):
 
     _nic_status_cache.update(t=now, val=(status, txt))
     return status, txt
+
+
+def service_props():
+    """Stan uslugi wprost z systemd. ActiveState/SubState ida do komunikatow,
+    InvocationID - do wyciecia z journala TYLKO biezacego uruchomienia."""
+    code, out = run(["systemctl", "show", f"wifibroadcast@{ROLE}",
+                     "-p", "ActiveState", "-p", "SubState", "-p", "InvocationID"])
+    if code != 0:
+        return {}
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
+def service_active(props=None):
+    props = service_props() if props is None else props
+    return props.get("ActiveState") == "active"
+
+
+def service_state_txt(props=None):
+    props = service_props() if props is None else props
+    return f"{props.get('ActiveState', '?')}/{props.get('SubState', '?')}"
+
+
+def service_last_errors(n=6):
+    """Ogon journala uslugi. Gdy usluga nie wstaje, powod jest wlasnie tam -
+    lepiej pokazac go od razu na ekranie niz odsylac do recznego journalctl."""
+    code, out = run(["journalctl", "-u", f"wifibroadcast@{ROLE}", "-n", str(n),
+                     "-o", "cat", "--no-pager"], timeout=15)
+    if code != 0:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def packet_socket_nics(known):
+    """Karty, na ktorych ktos trzyma otwarte gniazdo AF_PACKET - czyli realnie
+    z nich czyta i przez nie wstrzykuje (wfb_rx/wfb_tx robia to przez libpcap).
+    Najpewniejsze zrodlo, bo pyta jadro o stan TERAZ, a nie o to, co bylo
+    w argumentach procesu przy starcie: po zmianie nazwy interfejsu argumenty
+    i log uslugi nadal pokazuja stara nazwe, a gniazdo siedzi na tej karcie.
+    /proc/net/packet: kolumny sk RefCnt Type Proto Iface R Rmem User Inode."""
+    try:
+        lines = Path("/proc/net/packet").read_text().splitlines()[1:]
+    except OSError:
+        return set()
+
+    bound = set()
+    for ln in lines:
+        f = ln.split()
+        if len(f) >= 5 and f[4].isdigit() and f[4] != "0":  # 0 = gniazdo na "any"
+            bound.add(int(f[4]))
+
+    used = set()
+    for nic in known:
+        try:
+            if int((Path("/sys/class/net") / nic / "ifindex").read_text()) in bound:
+                used.add(nic)
+        except (OSError, ValueError):
+            pass
+    return used
 
 
 def proc_cmdlines():
@@ -267,11 +336,8 @@ def service_log_nics(known):
     wfb_rx/wfb_tx inaczej (gniazda unix zamiast argumentow), a ten log jest
     w kazdej. Patrzymy tylko na biezace uruchomienie uslugi - logi sprzed
     restartu klamalyby, ze wypieta karta nadal jest uzywana."""
-    code, out = run(["systemctl", "show", f"wifibroadcast@{ROLE}",
-                     "-p", "ActiveState", "-p", "InvocationID"])
-    props = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
-    inv = props.get("InvocationID", "").strip()
-    if code != 0 or props.get("ActiveState") != "active" or not inv:
+    inv = service_props().get("InvocationID", "").strip()
+    if not inv:
         return set()
 
     base = ["journalctl", f"_SYSTEMD_INVOCATION_ID={inv}", "-o", "cat", "--no-pager"]
@@ -286,16 +352,27 @@ def service_log_nics(known):
 def service_nics(known):
     """Interfejsy, ktorych FAKTYCZNIE uzywa dzialajaca usluga. Dongiel wpiety
     po jej starcie istnieje w systemie, ale wfb-ng go nie uzywa, dopoki uslugi
-    sie nie zrestartuje - i tego golym okiem nie widac."""
+    sie nie zrestartuje - i tego golym okiem nie widac.
+
+    Trzy niezalezne zrodla, od najpewniejszego: otwarte gniazda AF_PACKET (stan
+    jadra TERAZ), argumenty procesow wfb_rx/wfb_tx i log uslugi z biezacego
+    uruchomienia. Kazde z nich osobno potrafi sie mylic przy innej wersji
+    wfb-ng albo po zmianie nazwy interfejsu, wiec bierzemy ich sume."""
     known = set(known)
-    used = set()
+    if not known or not service_active():
+        return set()  # nie ma uslugi - zadna karta nie jest "w usludze"
+
+    used = packet_socket_nics(known)
+    if known.issubset(used):
+        return used & known
+
     for args in proc_cmdlines():
         if not any("wfb_rx" in a or "wfb_tx" in a for a in args):
             continue
         used.update(a for a in args if a in known)
     if not known.issubset(used):
-        # journalctl wolamy dopiero, gdy czegos brakuje - ta funkcja liczy sie
-        # przy kazdym przerysowaniu menu, a to najdrozszy z jej kawalkow
+        # journalctl wolamy na koncu - ta funkcja liczy sie przy kazdym
+        # przerysowaniu menu, a to najdrozszy z jej kawalkow
         used |= service_log_nics(known)
     return used & known
 
@@ -352,6 +429,53 @@ def parse_common(txt):
     ch = re.search(r"wifi_channel\s*=\s*(\d+)", txt)
     reg = re.search(r"wifi_region\s*=\s*'([^']*)'", txt)
     return (ch.group(1) if ch else DEFAULT_CHANNEL, reg.group(1) if reg else DEFAULT_REGION)
+
+
+def video_section_bounds(txt):
+    """Zakres sekcji [<rola>_video] w configu - zeby ruszac tylko ja."""
+    header = f"[{ROLE}_video]"
+    start = txt.find(header)
+    if start == -1:
+        return None
+    end = txt.find("\n[", start + 1)
+    return start, (len(txt) if end == -1 else end)
+
+
+def video_service_type(txt):
+    """Tryb uslugi wideo z configu albo None, gdy nie ustawiony - wtedy
+    obowiazuje domyslny z master.cfg wfb-ng, czyli udp_direct_tx."""
+    bounds = video_section_bounds(txt)
+    if not bounds:
+        return None
+    m = re.search(r"^\s*service_type\s*=\s*'([^']*)'", txt[bounds[0]:bounds[1]], re.M)
+    return m.group(1) if m else None
+
+
+def ensure_video_service_type(nics):
+    """Domyslny tryb wideo (udp_direct_tx) nie umie nadawac z kilku kart:
+    serwer konczy sie wtedy bledem "udp_direct_tx doesn't supports diversity
+    and/or rx-only wlans. Use udp_proxy for such case." i systemd restartuje
+    go w kolko - z zewnatrz widac tylko status "activating". Przy wiecej niz
+    jednej karcie wymuszamy udp_proxy. Naprawia tez configi zapisane starsza
+    wersja skryptu, bo tych step_config() juz nie nadpisuje."""
+    if len(nics) < 2 or not CFG_PATH.exists():
+        return False
+
+    txt = CFG_PATH.read_text()
+    bounds = video_section_bounds(txt)
+    if not bounds or video_service_type(txt) == "udp_proxy":
+        return False
+
+    start, end = bounds
+    section = txt[start:end]
+    if video_service_type(txt) is None:
+        section = section.replace(f"[{ROLE}_video]",
+                                  f"[{ROLE}_video]\nservice_type = 'udp_proxy'", 1)
+    else:
+        section = re.sub(r"^\s*service_type\s*=.*$", "service_type = 'udp_proxy'",
+                         section, count=1, flags=re.M)
+    CFG_PATH.write_text(txt[:start] + section + txt[end:])
+    return True
 
 
 def build_config(channel, region):
@@ -1078,6 +1202,12 @@ def detect_nics_startup():
         log(f"    UWAGA: dziala {len(nics)} z {EXPECTED_NICS} kart. Sprawdz port USB, kabel")
         log("    i zasilanie - dwa dongle 8812AU potrafia przeciazyc porty RPi.")
 
+    if ensure_video_service_type(nics):
+        log(f"    {CFG_PATH}: [{ROLE}_video] przestawione na udp_proxy - domyslny")
+        log(f"    tryb nie umie nadawac z {len(nics)} kart i zabijal usluge przy starcie.")
+        run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+        time.sleep(3)
+
     # Dongiel wpiety po starcie uslugi nie zostanie uzyty sam z siebie.
     unused = set(nics) - service_nics(set(nics))
     if unused:
@@ -1085,10 +1215,18 @@ def detect_nics_startup():
         run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
         time.sleep(3)
         still = set(nics) - service_nics(set(nics))
-        if still:
-            log(f"    Nadal poza usluga: {' '.join(sorted(still))} - zobacz: journalctl -u wifibroadcast@{ROLE} -n 50")
-        else:
+        if not still:
             log("    OK - usluga uzywa wszystkich kart.")
+        elif not service_active():
+            # Nie chodzi o karty - usluga w ogole nie wstaje. Powod jest
+            # w journalu, wiec pokazujemy go od razu.
+            log(f"    USLUGA NIE DZIALA (status: {service_state_txt()}), karty sa tu bez winy.")
+            log("    Ostatnie linie journala:")
+            for ln in service_last_errors():
+                log(f"      {ln}")
+            log(f"    Wiecej: journalctl -u wifibroadcast@{ROLE} -n 50")
+        else:
+            log(f"    Nadal poza usluga: {' '.join(sorted(still))} - zobacz: journalctl -u wifibroadcast@{ROLE} -n 50")
 
     return nics
 
@@ -1215,21 +1353,39 @@ def collect_checks():
         checks.append(("Moc nadawania (TX)", "warn", "override wylaczony (0) - uzywana kalibracja EEPROM"))
     elif live_tx != saved_tx:
         checks.append(("Moc nadawania (TX)", "warn", f"na zywo={live_tx}/63, zapisane={saved_tx}/63 (niezgodne)"))
+    elif live_tx.isdigit() and int(live_tx) < 10:
+        # Spojna, ale bardzo niska wartosc to typowy cichy zabojca zasiegu -
+        # link "dziala na biurku" i pada kilka metrow dalej. Zostaje warn,
+        # bo do testow w pomieszczeniu ustawia sie ja swiadomie.
+        checks.append(("Moc nadawania (TX)", "warn",
+                       f"{live_tx}/63 - bardzo nisko, zasieg bedzie zaden (max = 63)"))
     else:
         checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
 
     if CFG_PATH.exists():
         txt = CFG_PATH.read_text()
         ch, reg = parse_common(txt)
-        checks.append(("wifibroadcast.cfg", "ok", f"kanal={ch} region={reg} rola={ROLE}"))
+        vtype = video_service_type(txt) or "udp_direct_tx (domyslny)"
+        detail = f"kanal={ch} region={reg} rola={ROLE} wideo={vtype}"
+        if len(nics) > 1 and video_service_type(txt) != "udp_proxy":
+            checks.append(("wifibroadcast.cfg", "fail",
+                           detail + f" - przy {len(nics)} kartach usluga sie wywali, potrzeba udp_proxy"))
+        else:
+            checks.append(("wifibroadcast.cfg", "ok", detail))
     else:
         checks.append(("wifibroadcast.cfg", "fail", "plik nie istnieje"))
 
-    code, out = run(["systemctl", "is-active", f"wifibroadcast@{ROLE}"])
-    if out.strip() == "active":
-        checks.append((f"Usluga wifibroadcast@{ROLE}", "ok", "aktywna"))
+    props = service_props()
+    if service_active(props):
+        checks.append((f"Usluga wifibroadcast@{ROLE}", "ok", f"aktywna ({service_state_txt(props)})"))
     else:
-        checks.append((f"Usluga wifibroadcast@{ROLE}", "fail", f"status: {out.strip()}"))
+        # "activating" tez tu wpada: usluga w petli restartow wyglada na
+        # wstajaca, a nie dziala. Ogon journala od razu obok, bo bez niego
+        # ten check tylko stwierdza fakt, zamiast pokazac przyczyne.
+        checks.append((f"Usluga wifibroadcast@{ROLE}", "fail",
+                       f"status: {service_state_txt(props)} - ponizej ostatnie linie journala"))
+        for ln in service_last_errors(5):
+            checks.append(("  journal", "fail", ln[:110]))
 
     code, out = run(["ip", "-brief", "addr", "show", f"{ROLE}-wfb"])
     if code == 0 and out.strip():
@@ -1508,13 +1664,22 @@ def redetect_screen(stdscr):
 
     if nics:
         release_nics_from_network_stack(nics)
+        if ensure_video_service_type(nics):
+            say(f"config: [{ROLE}_video] -> udp_proxy (domyslny tryb nie umie {len(nics)} kart)", "warn")
+            run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+            time.sleep(3)
         unused = set(nics) - service_nics(set(nics))
         if unused:
             say(f"usluga nie uzywa: {' '.join(sorted(unused))} - restartuje...", "warn")
             run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
             time.sleep(3)
             unused = set(nics) - service_nics(set(nics))
-        if unused:
+        if unused and not service_active():
+            say(f"USLUGA NIE DZIALA (status: {service_state_txt()}) - karty sa tu bez winy", "fail")
+            for ln in service_last_errors(4):
+                say("  " + ln[:100])
+            say(f"wiecej: journalctl -u wifibroadcast@{ROLE} -n 50")
+        elif unused:
             say(f"nadal poza usluga: {' '.join(sorted(unused))}", "fail")
             say(f"zobacz: journalctl -u wifibroadcast@{ROLE} -n 50")
 
