@@ -10,6 +10,11 @@ Gs ma JEDNA karte, dron dwa dongle (EXPECTED_NICS). Kazdy start sprawdza,
 czy karta jest widoczna, przepieta pod nasz sterownik, w trybie monitor na
 wlasciwym kanale i czy faktycznie przepuszcza ruch.
 
+Karta dostaje stala nazwe (NIC_NAMES: gs_wfb) zamiast wlanX - przypieta regula
+udev do gniazda USB, wiec ta sama karta w tym samym porcie ma zawsze te sama
+nazwe. Jedna nazwa, bo gs ma jedna karte i ta sama karta odbiera wideo i nadaje
+mavlink/RC w gore - nie ma tu podzialu na RX i TX.
+
 Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec link wstaje
 od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
 8-znakowy kod, na drugiej sie go wpisuje i obie licza z niego te sama, prywatna
@@ -51,6 +56,16 @@ CFG_PATH = Path("/etc/wifibroadcast.cfg")
 DRONE_KEY = Path("/etc/drone.key")
 GS_KEY = Path("/etc/gs.key")
 REBOOT_MARKER = Path("/etc/.wfb-gs-reboot-attempted")
+
+# Zamiast wlanX (numer zalezy od kolejnosci wykrycia i potrafi sie zmienic
+# miedzy bootami) dajemy karcie stala, czytelna nazwe. Nazwa jest przypieta do
+# GNIAZDA USB, wiec po restarcie ta sama karta w tym samym porcie ma ta sama
+# nazwe. Gs ma JEDNA karte i ta jedna karta robi oba kierunki (odbiera wideo,
+# nadaje mavlink/RC w gore) - dlatego jedna nazwa bez RX/TX, bo nie ma tu
+# czego rozrozniac. Na dronie, gdzie karty sa dwie, sa to drone_RX/drone_TX.
+NIC_NAMES = ["gs_wfb"]
+UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
+WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
 
 # Staly komplet kluczy, ten sam w drone.py i gs.py - dzieki temu nic nie trzeba
 # przenosic miedzy urzadzeniami (wfb_keygen na kazdym Pi zrobilby INNA pare i
@@ -126,6 +141,16 @@ def usb_rtl_dongles():
             if any(m in line.lower() for m in RTL_USB_MARKERS)]
 
 
+def nic_usb_slot(nic):
+    """Gniazdo USB karty, np. '1-1:1.0'. Stale dla danego portu niezaleznie od
+    tego, ktory dongiel w nim siedzi - dlatego to na nim wieszamy nazwy."""
+    dev = Path("/sys/class/net") / nic / "device"
+    try:
+        return dev.resolve().name if dev.exists() else ""
+    except OSError:
+        return ""
+
+
 def nic_details(nic):
     """Skad karta pochodzi i w jakim jest stanie: sterownik, MAC, fizyczny
     port USB (rozroznia dwa identyczne dongle), tryb pracy i kanal."""
@@ -140,11 +165,9 @@ def nic_details(nic):
     drv = base / "device" / "driver"
     if drv.exists():
         info["driver"] = drv.resolve().name
-    dev = base / "device"
-    if dev.exists():
-        # np. "1-1.4:1.0" - identyfikuje gniazdo USB, wiec po zamianie kart
-        # widac ktora jest ktora
-        info["usb"] = dev.resolve().name
+    # np. "1-1.4:1.0" - identyfikuje gniazdo USB, wiec po zamianie kart
+    # widac ktora jest ktora
+    info["usb"] = nic_usb_slot(nic) or "?"
 
     code, out = run_tool("iw", "dev", nic, "info")
     if code == 0:
@@ -219,19 +242,61 @@ def nic_status_summary(max_age=2.0):
     return status, txt
 
 
-def service_nics(known):
-    """Interfejsy, z ktorymi FAKTYCZNIE wystartowaly procesy wfb_rx/wfb_tx.
-    Dongiel wpiety po starcie uslugi istnieje w systemie, ale wfb-ng go nie
-    uzywa, dopoki uslugi sie nie zrestartuje - i tego golym okiem nie widac."""
-    code, out = run(["ps", "-eo", "args="])
-    if code != 0:
-        return set()
-    used = set()
-    for line in out.splitlines():
-        if "wfb_rx" not in line and "wfb_tx" not in line:
+def proc_cmdlines():
+    """Pelne linie polecen wszystkich procesow, prosto z /proc. Nie przez 'ps':
+    ten - gdy nie pisze na terminal - tnie wynik do 80 kolumn i obcina
+    dokladnie to, czego tu szukamy, czyli nazwy kart na koncu polecenia."""
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
             continue
-        used.update(tok for tok in line.split() if tok in known)
-    return used
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue  # proces zdazyl sie zakonczyc
+        if raw:
+            out.append([a for a in raw.decode("utf-8", "replace").split("\0") if a])
+    return out
+
+
+def service_log_nics(known):
+    """Karty przejete przez usluge w BIEZACYM uruchomieniu - wfb-ng loguje dla
+    kazdej "Interface <nic> has driver <sterownik>". Drugie zrodlo prawdy obok
+    argumentow procesow, bo kolejne wersje wfb-ng przekazuja karty do
+    wfb_rx/wfb_tx inaczej (gniazda unix zamiast argumentow), a ten log jest
+    w kazdej. Patrzymy tylko na biezace uruchomienie uslugi - logi sprzed
+    restartu klamalyby, ze wypieta karta nadal jest uzywana."""
+    code, out = run(["systemctl", "show", f"wifibroadcast@{ROLE}",
+                     "-p", "ActiveState", "-p", "InvocationID"])
+    props = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+    inv = props.get("InvocationID", "").strip()
+    if code != 0 or props.get("ActiveState") != "active" or not inv:
+        return set()
+
+    base = ["journalctl", f"_SYSTEMD_INVOCATION_ID={inv}", "-o", "cat", "--no-pager"]
+    code, out = run(base + ["-g", "has driver"], timeout=15)  # -g = filtr po stronie journalctl
+    if code != 0:
+        code, out = run(base, timeout=15)  # starszy journalctl bez -g
+        if code != 0:
+            return set()
+    return {n for n in re.findall(r"Interface (\S+) has driver", out) if n in known}
+
+
+def service_nics(known):
+    """Interfejsy, ktorych FAKTYCZNIE uzywa dzialajaca usluga. Dongiel wpiety
+    po jej starcie istnieje w systemie, ale wfb-ng go nie uzywa, dopoki uslugi
+    sie nie zrestartuje - i tego golym okiem nie widac."""
+    known = set(known)
+    used = set()
+    for args in proc_cmdlines():
+        if not any("wfb_rx" in a or "wfb_tx" in a for a in args):
+            continue
+        used.update(a for a in args if a in known)
+    if not known.issubset(used):
+        # journalctl wolamy dopiero, gdy czegos brakuje - ta funkcja liczy sie
+        # przy kazdym przerysowaniu menu, a to najdrozszy z jej kawalkow
+        used |= service_log_nics(known)
+    return used & known
 
 
 def rebind_to_wfb_driver():
@@ -778,6 +843,144 @@ def release_nics_from_network_stack(nics):
     ensure_nm_unmanaged(nics)
 
 
+# ------------------------- stale nazwy kart -------------------------
+
+def parse_name_rules():
+    """{gniazdo USB: nazwa} z naszego pliku regul udev - czyli przypisania,
+    ktore juz kiedys ustalilismy."""
+    mapping = {}
+    if not UDEV_NAMES.exists():
+        return mapping
+    for line in UDEV_NAMES.read_text().splitlines():
+        m = re.search(r'KERNELS=="([^"]+)".*NAME="([^"]+)"', line)
+        if m:
+            mapping[m.group(1)] = m.group(2)
+    return mapping
+
+
+def plan_nic_names(nics):
+    """Przydziela nazwy kartom. Raz ustalone przypisanie gniazdo->nazwa zostaje
+    (lezy w regulach udev), nowe gniazdo dostaje pierwsza wolna nazwe. Dzieki
+    temu przy jednej wypietej karcie druga NIE przejmuje jej nazwy - inaczej po
+    kazdym przepieciu dongla nazwy mowilyby co innego niz poprzednio.
+    Zwraca (mapa gniazdo->nazwa, mapa interfejs->nazwa)."""
+    by_slot = parse_name_rules()
+    slots = {nic: nic_usb_slot(nic) for nic in nics}
+    live = {s for s in slots.values() if s}
+
+    # Puste gniazdo nie moze w nieskonczonosc trzymac nazwy - inaczej dongiel
+    # przelozony do innego portu zostawaly przy wlanX. Ale zwalniamy je TYLKO
+    # gdy jest jakas karta bez nazwy, czyli jest komu te nazwe oddac: sam
+    # chwilowy brak dongla (zly kabel, port nie wstal po boocie) niczego nie
+    # przestawia i po ponownym wpieciu karta wraca do swojej nazwy.
+    if any(s not in by_slot for s in live):
+        for slot in [s for s in by_slot if s not in live]:
+            del by_slot[slot]
+
+    free = [n for n in NIC_NAMES if n not in by_slot.values()]
+    per_nic = {}
+    for nic in sorted(nics, key=lambda n: slots[n]):
+        slot = slots[nic]
+        if not slot:
+            continue  # karta bez gniazda USB - nie ma czego zakotwiczyc w regule
+        if slot not in by_slot:
+            if not free:
+                continue  # wiecej kart niz nazw - reszta zostaje przy wlanX
+            by_slot[slot] = free.pop(0)
+        per_nic[nic] = by_slot[slot]
+    return by_slot, per_nic
+
+
+def write_name_rules(by_slot):
+    txt = ("# generowane przez skrypt wfb - nie edytuj recznie\n"
+           "# stale nazwy kart RTL88xx; nazwa jest przypieta do GNIAZDA USB,\n"
+           "# wiec zamiana dwoch dongli miejscami zamienia tez ich nazwy\n")
+    for slot, name in sorted(by_slot.items()):
+        txt += f'SUBSYSTEM=="net", ACTION=="add", KERNELS=="{slot}", NAME="{name}"\n'
+    if UDEV_NAMES.exists() and UDEV_NAMES.read_text() == txt:
+        return False
+    UDEV_NAMES.parent.mkdir(parents=True, exist_ok=True)
+    UDEV_NAMES.write_text(txt)
+    run(["udevadm", "control", "--reload-rules"])
+    return True
+
+
+def rename_nic(old, new):
+    """Jadro pozwala zmienic nazwe tylko interfejsowi w stanie DOWN."""
+    run(["ip", "link", "set", old, "down"])
+    code, out = run(["ip", "link", "set", old, "name", new])
+    if code != 0:
+        run(["ip", "link", "set", old, "up"])
+        return False, out
+    run(["ip", "link", "set", new, "up"])
+    return True, ""
+
+
+def update_wfb_defaults(renames):
+    """Jesli /etc/default/wifibroadcast wymienia karty z nazwy (WFB_NICS),
+    podmieniamy stare nazwy na nowe - inaczej usluga wystartowalaby na
+    nieistniejacym juz interfejsie."""
+    if not WFB_DEFAULTS.exists():
+        return
+    txt = WFB_DEFAULTS.read_text()
+    new_txt = txt
+    for old, name in renames:
+        new_txt = re.sub(rf"\b{re.escape(old)}\b", name, new_txt)
+    if new_txt != txt:
+        WFB_DEFAULTS.write_text(new_txt)
+        log(f"    poprawiono nazwy kart w {WFB_DEFAULTS}")
+
+
+def ensure_nic_names():
+    """Nadaje kartom stale nazwy z NIC_NAMES zamiast wlanX. Zmiana nazwy nie
+    powiedzie sie na pracujacym interfejsie, wiec na czas operacji zatrzymujemy
+    usluge. Gdyby po zmianie wfb-nics przestalo widziec karty (jakas wersja
+    szukajaca ich po nazwie "wlan*"), wycofujemy wszystko - dzialajace lacze
+    jest wazniejsze niz ladna nazwa. Zwraca aktualna liste interfejsow."""
+    nics = wfb_nics()
+    if not nics:
+        return nics
+
+    by_slot, per_nic = plan_nic_names(nics)
+    write_name_rules(by_slot)  # zeby przetrwalo reboot i ponowne wpiecie dongla
+    todo = [(nic, name) for nic, name in per_nic.items() if nic != name]
+    if not todo:
+        return nics
+
+    was_active = run(["systemctl", "is-active", "--quiet", f"wifibroadcast@{ROLE}"])[0] == 0
+    if was_active:
+        run(["systemctl", "stop", f"wifibroadcast@{ROLE}"])
+
+    done = []
+    for old, name in todo:
+        ok, err = rename_nic(old, name)
+        if ok:
+            log(f"    nazwa karty: {old} -> {name}")
+            done.append((old, name))
+        else:
+            log(f"    nie udalo sie przemianowac {old} na {name}: {err}")
+
+    nics = wfb_nics()
+    if done and not nics:
+        log("    wfb-nics nie widzi juz zadnej karty - cofam zmiane nazw")
+        for old, name in done:
+            rename_nic(name, old)
+        try:
+            UDEV_NAMES.unlink()
+        except OSError:
+            pass
+        run(["udevadm", "control", "--reload-rules"])
+        nics = wfb_nics()
+    elif done:
+        update_wfb_defaults(done)
+        release_nics_from_network_stack(nics)  # wpisy NM/dhcpcd ida po nazwie
+
+    if was_active:
+        run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
+        time.sleep(2)
+    return nics
+
+
 def step_config():
     log("==> [7/7] /etc/wifibroadcast.cfg i usluga")
 
@@ -847,6 +1050,8 @@ def detect_nics_startup():
         run(["udevadm", "settle"], timeout=15)
         time.sleep(2)
         nics = wfb_nics()
+
+    nics = ensure_nic_names()
 
     for nic in nics:
         d = nic_details(nic)
@@ -1271,24 +1476,30 @@ def redetect_screen(stdscr):
     dongles = usb_rtl_dongles()
     say(f"lsusb: {len(dongles)} dongli RTL88xx (oczekiwano {EXPECTED_NICS})")
 
-    nics = wfb_nics()
-    if len(nics) < EXPECTED_NICS:
-        say(f"wfb-nics: {len(nics)}/{EXPECTED_NICS} - przepinam pod {TARGET_USB_DRIVER}...")
-        # rebind_to_wfb_driver() pisze przez log() na stdout, co rozjechaloby
-        # ekran curses - przechwytujemy i wypisujemy jego linie po swojemu
+    def quietly(fn):
+        """Funkcje z czesci instalacyjnej pisza przez log() na stdout, co
+        rozjechaloby ekran curses - przechwytujemy i wypisujemy po swojemu."""
         buf, old_stdout = io.StringIO(), sys.stdout
         sys.stdout = buf
         try:
-            rebind_to_wfb_driver()
+            result = fn()
         finally:
             sys.stdout = old_stdout
         for line in buf.getvalue().splitlines():
             if line.strip():
                 say("  " + line.strip())
+        return result
+
+    nics = wfb_nics()
+    if len(nics) < EXPECTED_NICS:
+        say(f"wfb-nics: {len(nics)}/{EXPECTED_NICS} - przepinam pod {TARGET_USB_DRIVER}...")
+        quietly(rebind_to_wfb_driver)
         run(["udevadm", "trigger", "--action=add", "--subsystem-match=usb"])
         run(["udevadm", "settle"], timeout=15)
         time.sleep(2)
         nics = wfb_nics()
+
+    nics = quietly(ensure_nic_names)
 
     for nic in nics:
         d = nic_details(nic)
@@ -1433,10 +1644,18 @@ def main():
 
     detect_nics_startup()
     print()
-    input("Nacisnij Enter, aby przejsc do konfiguratora/weryfikatora...")
+    try:
+        input("Nacisnij Enter, aby przejsc do konfiguratora/weryfikatora...")
+    except EOFError:  # skrypt puszczony bez terminala (np. z potoku)
+        pass
 
     curses.wrapper(main_menu)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C to normalne wyjscie, nie ma po co straszyc traceback'iem
+        print("\nPrzerwane (Ctrl+C).")
+        sys.exit(130)
