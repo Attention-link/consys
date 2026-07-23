@@ -682,6 +682,26 @@ def ping_stats(ip, count=5, timeout=2):
     return code, loss, avg
 
 
+def ip_addresses():
+    """[(interfejs, adres/maska)] - wszystkie adresy IPv4 poza loopbackiem.
+    Zeby na jednym ekranie bylo widac, pod jakim adresem to Pi jest w sieci
+    lokalnej (do ssh) i czy tunel wfb dostal swoj adres."""
+    code, out = run(["ip", "-4", "-brief", "addr", "show"])
+    if code != 0:
+        return []
+    result = []
+    for ln in out.splitlines():
+        fields = ln.split()
+        if len(fields) >= 3 and fields[0] != "lo":
+            result.extend((fields[0], addr) for addr in fields[2:] if "/" in addr)
+    return result
+
+
+def wfb_ng_version():
+    code, out = run(["dpkg-query", "-W", "-f=${Version}", "wfb-ng"])
+    return out.strip() if code == 0 and out.strip() else "?"
+
+
 def check_ssh(ip, port=SSH_PORT, timeout=3):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
@@ -1610,16 +1630,133 @@ def pause(stdscr, msg="Nacisnij dowolny klawisz, aby wrocic..."):
     stdscr.getch()
 
 
+def scroll_view(stdscr, title, lines):
+    """Prosty pager na liste (tekst, atrybut) - tresc bywa dluzsza niz ekran."""
+    top = 0
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, title)
+        h, _ = stdscr.getmaxyx()
+        view = max(1, h - 3)
+
+        for i, (text, attr) in enumerate(lines[top:top + view]):
+            safe_addstr(stdscr, 2 + i, 2, text, attr)
+
+        if len(lines) > view:
+            hint = f"Strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}/{len(lines)}), q = powrot"
+        else:
+            hint = "Nacisnij dowolny klawisz, aby wrocic..."
+        safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_DOWN, ord("j")) and top + view < len(lines):
+            top += 1
+        elif key in (curses.KEY_UP, ord("k")) and top > 0:
+            top -= 1
+        elif key == curses.KEY_NPAGE:
+            top = min(max(0, len(lines) - view), top + view)
+        elif key == curses.KEY_PPAGE:
+            top = max(0, top - view)
+        else:
+            break
+
+
+def config_overview_lines():
+    """Wszystko, co warto miec pod reka na jednym ekranie: adresy IP tego
+    urzadzenia, parametry radia, karty, klucze, stan uslugi - a na koncu
+    surowa tresc /etc/wifibroadcast.cfg. Wczesniej byl tu sam plik, przez co
+    najprostsze pytania ("pod jakim IP jest ten Pi?", "jaka mam moc?")
+    wymagaly wychodzenia do powloki."""
+    lines = []
+
+    def section(title):
+        if lines:
+            lines.append(("", 0))
+        lines.append((title, curses.A_BOLD))
+
+    def row(label, value, status=None):
+        lines.append((f"  {label:<14}{value}", color_for(status) if status else 0))
+
+    section("Urzadzenie")
+    row("rola", ROLE)
+    row("hostname", socket.gethostname())
+    row("wfb-ng", wfb_ng_version())
+    row("jadro", os.uname().release)
+
+    section("Siec")
+    addrs = ip_addresses()
+    tunnel = f"{ROLE}-wfb"
+    for nic, addr in addrs:
+        row(nic, addr + ("   <- tunel wfb" if nic == tunnel else ""),
+            "ok" if nic == tunnel else None)
+    if not any(nic == tunnel for nic, _ in addrs):
+        row(tunnel, "brak interfejsu tunelu - link nie stoi", "fail")
+    row("druga strona", f"{PEER_IP}   (ping i ssh sprawdza weryfikacja)")
+
+    section("Radio")
+    ch, reg = (parse_common(CFG_PATH.read_text()) if CFG_PATH.exists()
+               else (DEFAULT_CHANNEL, DEFAULT_REGION))
+    freq = channel_freq(ch)
+    span = channel_span(freq)
+    row("kanal", f"{ch}" + (f"   {freq} MHz, HT20 zajmuje {span[0]}-{span[1]} MHz" if freq else ""))
+    country, ranges = reg_domain_ranges()
+    in_band = bool(freq and ranges and any(lo <= span[0] and span[1] <= hi for lo, hi in ranges))
+    row("region", f"{reg}   (w jadrze: {country or '?'})", "ok" if in_band else "warn")
+    live_tx, saved_tx = read_tx_power_live(), parse_tx_power()
+    row("moc TX", f"{live_tx or '?'}/63 na zywo, {saved_tx}/63 zapisane",
+        "warn" if live_tx != saved_tx else None)
+    row("tryb wideo", video_service_type() or "?")
+
+    section("Karty")
+    nics = wfb_nics()
+    used = service_nics(set(nics)) if nics else set()
+    traffic = nic_traffic(nics) if nics else {}
+    for nic in nics:
+        d = nic_details(nic)
+        rx_pps, tx_pps = traffic.get(nic, (0.0, 0.0))
+        row(nic, f"{d['driver']} mac={d['mac']} usb={d['usb']} {d['mode']} kan={d['channel']}",
+            "ok" if nic in used else "fail")
+        row("", f"rx={rx_pps:.0f}/s tx={tx_pps:.0f}/s   w usludze={'tak' if nic in used else 'NIE'}"
+                f"{'   <- przez ta karte leci nadawanie' if tx_pps > 0 else ''}",
+            "ok" if tx_pps > 0 else None)
+    if nics:
+        row("", "(licznik tx > 0 wskazuje karte, ktora faktycznie nadaje)")
+    else:
+        row("(brak)", "wfb-nics nie zwraca zadnego interfejsu", "fail")
+
+    section("Klucze")
+    mode, code = key_mode()
+    row("tryb", f"sparowane kodem {format_pairing_code(code)}" if mode == "sparowane" else mode)
+    row("odcisk", f"drone.key={key_fingerprint(DRONE_KEY)} gs.key={key_fingerprint(GS_KEY)}"
+                  "   - musi byc taki sam po obu stronach")
+
+    section("Usluga")
+    props = service_props()
+    row(f"wifibroadcast@{ROLE}", service_state_txt(props),
+        "ok" if service_active(props) else "fail")
+
+    section(f"Plik {CFG_PATH}")
+    if CFG_PATH.exists():
+        for raw in CFG_PATH.read_text().splitlines():
+            # 'streams' bywa bardzo dluga linia - lamiemy, zeby nie uciekala
+            # poza ekran i dalo sie ja przeczytac w calosci
+            while len(raw) > 100:
+                lines.append(("  " + raw[:100], 0))
+                raw = "      " + raw[100:]
+            lines.append(("  " + raw, 0))
+    else:
+        row("", "plik nie istnieje jeszcze", "fail")
+
+    return lines
+
+
 def show_config_screen(stdscr):
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - biezaca konfiguracja")
-    if CFG_PATH.exists():
-        lines = CFG_PATH.read_text().splitlines()
-    else:
-        lines = [f"{CFG_PATH} nie istnieje jeszcze."]
-    for i, line in enumerate(lines):
-        safe_addstr(stdscr, 2 + i, 2, line)
-    pause(stdscr)
+    safe_addstr(stdscr, 2, 2, "Zbieram dane...")
+    stdscr.refresh()
+    scroll_view(stdscr, f"WFB-NG [{ROLE}] - biezaca konfiguracja", config_overview_lines())
 
 
 def prompt_line(stdscr, y, label, default):
