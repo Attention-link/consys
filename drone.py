@@ -48,8 +48,13 @@ EXPECTED_NICS = 2  # dron: dwa dongle USB (dywersyfikacja RX + nadawanie z obu)
 
 DRIVER_TAG = "v5.2.20"
 APT_RELEASE = "master"
-DEFAULT_CHANNEL = "161"
-DEFAULT_REGION = "BO"
+# Link ma chodzic na 2.4 GHz. Kanal 13 (2472 MHz) - najwyzszy dozwolony w PL
+# i w calym ETSI, zwykle mniej zatloczony niz standardowe 1/6/11. Region PL
+# obejmuje 2400-2483, wiec kanaly 1-13 sa w nim legalne; pasma 5 GHz nie
+# ruszamy (kanal 161 = 5805 MHz w PL w ogole nie istnieje i karta na nim nie
+# nadaje). Zmiana obu wartosci jest w menu i MUSI byc taka sama na dronie i gs.
+DEFAULT_CHANNEL = "13"
+DEFAULT_REGION = "PL"
 DEFAULT_TX_POWER = "63"  # 0-63, wg sterownika: 0 = wylaczone (EEPROM), 63 = max
 
 MODPROBE_WFB = Path("/etc/modprobe.d/wfb.conf")
@@ -565,6 +570,18 @@ def build_config(channel, region):
     )
 
 
+def save_common_config(channel, region):
+    """Zapis kanalu i regionu BEZ deptania reszty pliku. Ekran zmiany
+    konfiguracji przepisywal go wczesniej od zera z build_config(), przez co
+    kasowal nadpisanie 'streams' zrobione przez ensure_video_service_type() -
+    i usluga wracala do petli restartow zaraz po zmianie kanalu albo mocy."""
+    if not CFG_PATH.exists():
+        CFG_PATH.write_text(build_config(channel, region))
+        return
+    set_cfg_option("common", "wifi_channel", channel)
+    set_cfg_option("common", "wifi_region", f"'{region}'")
+
+
 def parse_tx_power():
     """Aktualnie zapisana (persystowana) wartosc mocy - z pliku modprobe.d,
     nie z live sysfs (ta moze byc chwilowo inna np. tuz po instalacji)."""
@@ -604,6 +621,56 @@ def read_tx_power_live():
         except OSError:
             return None
     return None
+
+
+def channel_freq(channel):
+    """Czestotliwosc srodkowa kanalu w MHz (2.4 GHz i 5 GHz)."""
+    try:
+        ch = int(channel)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= ch <= 13:
+        return 2407 + 5 * ch
+    if ch == 14:
+        return 2484
+    if 32 <= ch <= 177:
+        return 5000 + 5 * ch
+    return None
+
+
+HT20_HALF = 10  # MHz w kazda strone od srodka kanalu
+
+
+def channel_span(freq):
+    """Zakres zajmowany przez kanal HT20 - to on, a nie sama czestotliwosc
+    srodkowa, decyduje przy krawedziach przydzialu."""
+    return (freq - HT20_HALF, freq + HT20_HALF) if freq else None
+
+
+def reg_domain_ranges():
+    """(kraj, [(od_MHz, do_MHz), ...]) z pierwszego bloku 'iw reg get'. Sluzy
+    do sprawdzenia, czy w ustawionym regionie kanal w ogole istnieje: domeny
+    europejskie (PL i reszta ETSI) nie obejmuja pasma 5.8 GHz, wiec po ich
+    ustawieniu karta przestaje nadawac na kanale 161, a wszystko inne -
+    sterownik, tryb monitor, usluga - wyglada dalej poprawnie."""
+    code, out = run_tool("iw", "reg", "get")
+    if code != 0:
+        return None, []
+
+    country, ranges, seen = None, [], False
+    for ln in out.splitlines():
+        m = re.match(r"\s*country (\S+?):", ln)
+        if m:
+            if seen:
+                break  # kolejny blok (phy#N) to zwykle to samo
+            country, seen = m.group(1), True
+            continue
+        if not seen:
+            continue
+        m = re.match(r"\s*\((\d+)\s*-\s*(\d+)\s*@", ln)
+        if m:
+            ranges.append((int(m.group(1)), int(m.group(2))))
+    return country, ranges
 
 
 def ping_stats(ip, count=5, timeout=2):
@@ -1449,6 +1516,24 @@ def collect_checks():
                            detail + f" - ten tryb nie umie {len(nics)} kart, usluga bedzie sie wywalac"))
         else:
             checks.append(("wifibroadcast.cfg", "ok", detail))
+
+        freq = channel_freq(ch)
+        country, ranges = reg_domain_ranges()
+        if freq and ranges:
+            span = channel_span(freq)
+            where = f"kanal {ch}: {freq} MHz, HT20 zajmuje {span[0]}-{span[1]} MHz"
+            if any(lo <= span[0] and span[1] <= hi for lo, hi in ranges):
+                checks.append(("Region vs kanal", "ok", f"{country}: {where} - caly w dozwolonym pasmie"))
+            elif any(lo <= freq <= hi for lo, hi in ranges):
+                # srodek lapie sie w przydziale, ale polowka kanalu z niego
+                # wystaje - istotne przy krawedziach i przy pracy z PA
+                checks.append(("Region vs kanal", "warn",
+                               f"{country}: {where} - srodek w pasmie, ale kanal wystaje poza krawedz"))
+            else:
+                bands = ", ".join(f"{lo}-{hi}" for lo, hi in ranges)
+                checks.append(("Region vs kanal", "fail",
+                               f"{country} nie obejmuje {freq} MHz ({where}) - karta nie bedzie "
+                               f"nadawac. Dozwolone [MHz]: {bands}"))
     else:
         checks.append(("wifibroadcast.cfg", "fail", "plik nie istnieje"))
 
@@ -1578,7 +1663,21 @@ def edit_config_screen(stdscr):
             safe_addstr(stdscr, 10, 2, "Podaj liczbe 0-63 (0 = wylaczone, uzyj kalibracji EEPROM).",
                         color_for("fail"))
 
-    safe_addstr(stdscr, 12, 2, f"Nowy kanal: {channel}   region: {region}   moc TX: {tx_power}/63")
+    freq = channel_freq(channel)
+    country, ranges = reg_domain_ranges()
+    span = channel_span(freq)
+    band = f" ({freq} MHz, HT20: {span[0]}-{span[1]})" if freq else ""
+    safe_addstr(stdscr, 12, 2,
+                f"Nowy kanal: {channel}{band}   region: {region}   moc TX: {tx_power}/63")
+
+    # Kanal spoza pasma dozwolonego w regionie = karta w ogole nie nadaje,
+    # a wyglada zdrowo. Lepiej powiedziec to PRZED zapisem niz szukac potem.
+    if freq and ranges and not any(lo <= span[0] and span[1] <= hi for lo, hi in ranges):
+        note = f"UWAGA: {span[0]}-{span[1]} MHz nie miesci sie w domenie {country}"
+        if region != country:
+            note += f" (zapisujesz {region} - sprawdz po restarcie w weryfikacji)"
+        safe_addstr(stdscr, 13, 2, note[:110], color_for("warn"))
+
     safe_addstr(stdscr, 14, 2, "Zapisac i zrestartowac usluge? [t/N]: ")
     stdscr.refresh()
     curses.echo()
@@ -1592,9 +1691,10 @@ def edit_config_screen(stdscr):
         pause(stdscr)
         return
 
-    CFG_PATH.write_text(build_config(channel, region))
+    save_common_config(channel, region)
     write_modprobe_wfb(tx_power)
     live_ok = apply_tx_power_live(tx_power)
+    ensure_video_service_type(wfb_nics())  # gdyby config byl jeszcze sprzed migracji
     run(["systemctl", "daemon-reload"])
     code2, out2 = run(["systemctl", "enable", "--now", f"wifibroadcast@{ROLE}"])
     code3, out3 = run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
