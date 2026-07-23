@@ -274,14 +274,36 @@ def service_state_txt(props=None):
     return f"{props.get('ActiveState', '?')}/{props.get('SubState', '?')}"
 
 
-def service_last_errors(n=6):
-    """Ogon journala uslugi. Gdy usluga nie wstaje, powod jest wlasnie tam -
-    lepiej pokazac go od razu na ekranie niz odsylac do recznego journalctl."""
-    code, out = run(["journalctl", "-u", f"wifibroadcast@{ROLE}", "-n", str(n),
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+ERROR_MARKERS = ("#error", "exception", "traceback", "error:", "fatal", "failed")
+
+
+def service_last_errors(n=6, scan=300):
+    """Linie z journala uslugi, ktore faktycznie cos MOWIA. Sam ogon nie
+    wystarcza: gdy serwer sie wywala, ostatnie linie to sprzatanie po nim
+    (systemd zabija wfb_tx, "Failed with result"), a powod - wyjatek - jest
+    kilkanascie linii wyzej. Bierzemy wiec szerszy kawalek i filtrujemy po
+    slowach kluczowych, a gdy nic nie pasuje, wracamy do zwyklego ogona.
+    Przy petli restartow te same linie powtarzaja sie w kolko, wiec zwracamy
+    je bez duplikatow. Kody ANSI (wfb-ng loguje w kolorach) ida precz, bo
+    w curses robia z ekranu sieczke."""
+    code, out = run(["journalctl", "-u", f"wifibroadcast@{ROLE}", "-n", str(scan),
                      "-o", "cat", "--no-pager"], timeout=15)
     if code != 0:
         return []
-    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    lines = [ANSI_RE.sub("", ln).strip() for ln in out.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if any(m in ln.lower() for m in ERROR_MARKERS)]
+
+    seen, uniq = set(), []
+    for ln in reversed(hits or lines):
+        if ln in seen:
+            continue
+        seen.add(ln)
+        uniq.append(ln)
+        if len(uniq) >= n:
+            break
+    return list(reversed(uniq))
 
 
 def packet_socket_nics(known):
