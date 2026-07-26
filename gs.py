@@ -33,13 +33,16 @@ import os
 import re
 import secrets
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 ROLE = "gs"
 PEER_IP = "10.5.0.2"  # adres drugiej strony (drone) w tunelu
+PEER_NAME = "drone"
 SSH_PORT = 22
 
 EXPECTED_NICS = 1  # gs: jedna karta RTL (dron nadaje z dwoch, tu wystarczy jedna)
@@ -708,6 +711,343 @@ def check_ssh(ip, port=SSH_PORT, timeout=3):
             return True
     except OSError:
         return False
+
+
+# ------------------------- statystyki lacza (API wfb-ng) -------------------------
+
+# Liczniki jadra (rx/tx pakietow) mowia tylko "cos leci". O tym, JAK leci -
+# jaki jest sygnal, ile pakietow poszlo w kosmos, ile uratowal FEC - wie
+# wylacznie wfb-ng. Wystawia te dane na lokalnym porcie TCP; to samo zrodlo,
+# z ktorego korzysta wfb-cli. Format: ramka = 4 bajty dlugosci (big-endian)
+# + slownik msgpack, komplet raz na sekunde. Port stoi w configu wfb-ng,
+# 8003 to wartosc domyslna.
+WFB_CLI_PORT_DEFAULT = 8003
+_cli_port_cache = {"val": None}
+
+
+def wfb_cli_port():
+    if _cli_port_cache["val"]:
+        return _cli_port_cache["val"]
+    port = WFB_CLI_PORT_DEFAULT
+    code, out = run(["python3", "-c",
+                     "from wfb_ng.conf import settings; print(settings.common.cli_port)"],
+                    timeout=30)
+    if code == 0:
+        # run() sklei stdout ze stderr, wiec bierzemy ostatnia linie bedaca
+        # sama liczba - ewentualne ostrzezenia importu nie podmienia portu
+        for ln in reversed(out.splitlines()):
+            if ln.strip().isdigit():
+                port = int(ln.strip())
+                break
+    _cli_port_cache["val"] = port
+    return port
+
+
+def _to_text(value):
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+
+def _mget(mapping, name, default=None):
+    """Wartosc z rozpakowanego msgpacka. Starsze wersje biblioteki oddaja
+    klucze jako bajty, nowsze jako tekst - sprawdzamy oba warianty."""
+    if not isinstance(mapping, dict):
+        return default
+    if name in mapping:
+        return mapping[name]
+    return mapping.get(name.encode(), default)
+
+
+def _num(value, default=0):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return value
+
+
+def _flatten(value):
+    if not isinstance(value, (list, tuple)):
+        return [value]
+    out = []
+    for item in value:
+        out.extend(_flatten(item))
+    return out
+
+
+def _unpack_msg(payload):
+    """use_list=False jest tu istotne: klucze statystyk anten to krotki, a
+    rozpakowane do list byly by niehaszowalne i cala wiadomosc padalaby przy
+    skladaniu slownika. Kolejne warianty argumentow to ustepstwo dla starszych
+    wersji msgpacka, ktore ich jeszcze nie znaja."""
+    import msgpack
+    for kwargs in ({"strict_map_key": False, "use_list": False, "raw": False},
+                   {"use_list": False, "raw": False},
+                   {"use_list": False}):
+        try:
+            return msgpack.unpackb(payload, **kwargs)
+        except TypeError:
+            continue
+    return None
+
+
+def rx_packets(msg, name):
+    """Licznik ze statystyk: (w ostatniej sekundzie, lacznie). wfb-ng podaje
+    pare [przyrost_w_okresie, suma], starsze wersje samo pojedyncze liczby."""
+    value = _mget(_mget(msg, "packets") or {}, name)
+    if isinstance(value, (list, tuple)):
+        cur = _num(value[0]) if len(value) > 0 else 0
+        return cur, (_num(value[1]) if len(value) > 1 else cur)
+    return _num(value), _num(value)
+
+
+def rx_loss_pct(msg):
+    """Procent pakietow, ktore przepadly bezpowrotnie. 'all' to wszystko, co
+    dotarlo, 'lost' - dziury wykryte po numerach sekwencji. Pakiety odtworzone
+    przez FEC nie sa strata: doszly, tylko okrezna droga."""
+    got = rx_packets(msg, "all")[0]
+    lost = rx_packets(msg, "lost")[0]
+    total = got + lost
+    return (100.0 * lost / total) if total else None
+
+
+def antenna_rows(msg, nics):
+    """[(etykieta, pakiety/s, (rssi min,sr,max), (snr min,sr,max), MHz)] z
+    jednej wiadomosci 'rx'.
+
+    Kluczem statystyk anteny jest u wfb-ng krotka (czestotliwosc, MCS,
+    szerokosc, id anteny), w starszych wersjach samo id. Id koduje karte
+    w gornym bajcie (numer wlan w kolejnosci przekazanej do wfb_rx) i numer
+    anteny w dolnym - stad da sie podpiac nazwe interfejsu."""
+    stats = _mget(msg, "rx_ant_stats") or {}
+    items = stats.items() if isinstance(stats, dict) else stats
+    rows = []
+    for pair in items:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        key, val = pair
+        nums = [_num(x) for x in _flatten(key)]
+        ant_id = int(nums[-1]) if nums else 0
+        freq = int(nums[0]) if nums and nums[0] > 1000 else None
+        val = list(val) if isinstance(val, (list, tuple)) else [val]
+        count = _num(val[0]) if val else 0
+        rssi = tuple(_num(x) for x in val[1:4]) if len(val) >= 4 else None
+        snr = tuple(_num(x) for x in val[4:7]) if len(val) >= 7 else None
+        idx, ant = ant_id >> 8, ant_id & 0xFF
+        label = nics[idx] if 0 <= idx < len(nics) else f"karta{idx}"
+        rows.append((f"{label} ant{ant}", count, rssi, snr, freq))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def tx_wlan_rows(msg, nics):
+    """[(etykieta karty, wstrzykniete/s, odrzucone/s, opoznienie ms)] - czyli
+    ktora karta faktycznie nadaje i czy sterownik nadaza. wfb-ng trzyma to
+    w polu 'latency' pod numerem wlan; wartosci czasu sa w mikrosekundach."""
+    stats = _mget(msg, "latency") or {}
+    items = stats.items() if isinstance(stats, dict) else stats
+    rows = []
+    for pair in items:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        key, val = pair
+        nums = [_num(x) for x in _flatten(key)]
+        idx = int(nums[-1]) if nums else 0
+        val = list(val) if isinstance(val, (list, tuple)) else [val]
+        if len(val) < 2:
+            continue
+        injected, dropped = _num(val[0]), _num(val[1])
+        lat_avg = _num(val[3]) / 1000.0 if len(val) >= 4 else None
+        label = nics[idx] if 0 <= idx < len(nics) else f"karta{idx}"
+        rows.append((label, injected, dropped, lat_avg))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+class WfbStatsProbe:
+    """Statystyki z API wfb-ng czytane w watku w tle.
+
+    Polaczenie trzeba trzymac otwarte, a komplet danych przychodzi raz na
+    sekunde - ekran testu odrysowuje sie czesciej i nie moze na to czekac,
+    stad osobny watek. Gdy usluga sie zrestartuje, watek po prostu laczy sie
+    ponownie, wiec test mozna zostawic wlaczony przez caly czas grzebania
+    w konfiguracji."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._msgs = {}
+        self._error = "laczenie z wfb-ng..."
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def close(self):
+        self._stop.set()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._msgs), self._error
+
+    def _set_error(self, msg):
+        with self._lock:
+            self._error = msg
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._session()
+            self._stop.wait(2.0)
+
+    def _session(self):
+        try:
+            import msgpack  # noqa: F401 - sprawdzamy tylko dostepnosc
+        except ImportError:
+            self._set_error("brak modulu python3-msgpack - nie odczytam statystyk wfb-ng")
+            self._stop.wait(10)
+            return
+
+        port = wfb_cli_port()
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError as e:
+            self._set_error(f"API wfb-ng (127.0.0.1:{port}) nie odpowiada - usluga nie dziala? [{e}]")
+            return
+
+        sock.settimeout(0.5)
+        buf = b""
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break  # usluga zamknela polaczenie - petla sprobuje jeszcze raz
+                buf = self._consume(buf + chunk)
+        finally:
+            sock.close()
+        if not self._stop.is_set():
+            self._set_error("polaczenie z API wfb-ng zerwane - usluga sie restartuje?")
+
+    def _consume(self, buf):
+        while len(buf) >= 4:
+            size = struct.unpack(">I", buf[:4])[0]
+            if size > 8 * 1024 * 1024:
+                self._set_error(f"port {wfb_cli_port()} odpowiada nieznanym protokolem")
+                return b""
+            if len(buf) < 4 + size:
+                break
+            payload, buf = buf[4:4 + size], buf[4 + size:]
+            try:
+                msg = _unpack_msg(payload)
+            except Exception:
+                continue  # jedna zepsuta ramka nie moze zabic calego testu
+            if not isinstance(msg, dict):
+                continue
+            mtype = _to_text(_mget(msg, "type"))
+            if mtype in ("rx", "tx"):
+                with self._lock:
+                    self._msgs[(mtype, _to_text(_mget(msg, "id")))] = msg
+                    self._error = None
+        return buf
+
+
+class PingProbe:
+    """Ping do drugiej strony, tez w watku w tle - jedna proba trwa okolo
+    sekundy, a ekran ma sie odswiezac plynnie. Zlicza tez sumy od poczatku
+    testu: przy sprawdzaniu zasiegu wazniejsze od chwilowej wartosci jest to,
+    ile pakietow przepadlo przez caly przelot."""
+
+    def __init__(self, ip, count=3):
+        self.ip = ip
+        self.count = count
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._rtt = None        # (min, sr, max) z ostatniej proby
+        self._last_loss = None  # % z ostatniej proby
+        self._sent = 0
+        self._recv = 0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def close(self):
+        self._stop.set()
+
+    def reset(self):
+        with self._lock:
+            self._sent = self._recv = 0
+
+    def snapshot(self):
+        """(rtt, utrata w ostatniej probie %, utrata od poczatku %, wyslane, odebrane)"""
+        with self._lock:
+            total = (100.0 * (self._sent - self._recv) / self._sent) if self._sent else None
+            return self._rtt, self._last_loss, total, self._sent, self._recv
+
+    def _loop(self):
+        while not self._stop.is_set():
+            _, out = run(["ping", "-c", str(self.count), "-i", "0.3", "-W", "1", self.ip],
+                         timeout=self.count + 6)
+            m = re.search(r"(\d+) packets transmitted, (\d+)[^,]*received", out)
+            r = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)", out)
+            with self._lock:
+                if m:
+                    sent, recv = int(m.group(1)), int(m.group(2))
+                    self._sent += sent
+                    self._recv += recv
+                    self._last_loss = 100.0 * (sent - recv) / sent if sent else None
+                else:
+                    self._last_loss = None
+                self._rtt = (float(r.group(1)), float(r.group(2)), float(r.group(3))) if r else None
+            self._stop.wait(0.4)
+
+
+# Progi z praktyki dla 8812AU: powyzej -50 dBm karty sa praktycznie obok
+# siebie, ponizej -75 dBm zaczynaja sie zrywy obrazu.
+def rssi_grade(rssi):
+    if rssi is None:
+        return None, "?"
+    if rssi >= -50:
+        return "ok", "doskonaly"
+    if rssi >= -65:
+        return "ok", "dobry"
+    if rssi >= -75:
+        return "warn", "slaby"
+    return "fail", "na granicy zasiegu"
+
+
+def loss_grade(pct):
+    if pct is None:
+        return None, "?"
+    if pct < 0.5:
+        return "ok", "znikome"
+    if pct < 3:
+        return "warn", "zauwazalne"
+    return "fail", "duze"
+
+
+def snr_grade(snr):
+    if snr is None:
+        return None, "?"
+    if snr >= 20:
+        return "ok", "czysto"
+    if snr >= 10:
+        return "warn", "szum blisko sygnalu"
+    return "fail", "sygnal tonie w szumie"
+
+
+def worst_status(statuses):
+    for level in ("fail", "warn", "ok"):
+        if level in statuses:
+            return level
+    return None
+
+
+def mbit(bytes_per_s):
+    return bytes_per_s * 8 / 1_000_000.0
 
 
 # ------------------------- instalacja (idempotentna) -------------------------
@@ -1582,9 +1922,9 @@ def collect_checks():
         checks.append((f"Ping przez RTL (tunel, {PEER_IP})", "warn", f"brak odpowiedzi (utrata {loss}%)"))
 
     if check_ssh(PEER_IP):
-        checks.append((f"SSH do drone ({PEER_IP}:{SSH_PORT})", "ok", "port otwarty, SSH odpowiada"))
+        checks.append((f"SSH do {PEER_NAME} ({PEER_IP}:{SSH_PORT})", "ok", "port otwarty, SSH odpowiada"))
     else:
-        checks.append((f"SSH do drone ({PEER_IP}:{SSH_PORT})", "warn", "brak polaczenia na porcie 22"))
+        checks.append((f"SSH do {PEER_NAME} ({PEER_IP}:{SSH_PORT})", "warn", "brak polaczenia na porcie 22"))
 
     return checks
 
@@ -2108,6 +2448,264 @@ def nic_identify_screen(stdscr):
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
 
 
+def meter(value, lo, hi, width=18):
+    """Pasek postepu - w terminalu latwiej ocenic "ile brakuje" z paska niz
+    z samej liczby, zwlaszcza gdy patrzy sie na ekran co chwile podczas
+    chodzenia z antena. Pelny pasek zawsze znaczy "dobrze", wiec dla wartosci,
+    ktore lepiej miec male (opoznienie), podaje sie lo/hi na odwrot."""
+    if value is None:
+        return "[" + "?" * width + "]"
+    span = hi - lo
+    frac = min(1.0, max(0.0, (value - lo) / span)) if span else 0.0
+    filled = int(round(frac * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+STREAM_ORDER = ("video", "mavlink", "tunnel")
+
+
+def stream_key(name):
+    base = (name or "").split()[0]
+    return (STREAM_ORDER.index(base) if base in STREAM_ORDER else len(STREAM_ORDER), name or "")
+
+
+def link_test_lines(msgs, api_error, nics, used, traffic, ping, worst, elapsed):
+    """Cala tresc ekranu testu jako lista (tekst, atrybut) - budowana od nowa
+    przy kazdym odswiezeniu, bo wszystkie liczby sa chwilowe."""
+    lines = []
+
+    def blank():
+        lines.append(("", 0))
+
+    def section(title):
+        if lines:
+            blank()
+        lines.append((title, curses.A_BOLD))
+
+    def row(text, status=None, indent=2):
+        lines.append((" " * indent + text, color_for(status) if status else 0))
+
+    rx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "rx"}
+    tx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "tx"}
+
+    ants = []
+    for name in sorted(rx_msgs, key=stream_key):
+        ants.extend(antenna_rows(rx_msgs[name], nics))
+    # Przy dywersyfikacji liczy sie NAJLEPSZA antena - wfb-ng i tak sklada
+    # strumien z tej, ktora akurat slyszy lepiej.
+    best_rssi = max((a[2][1] for a in ants if a[2]), default=None)
+    best_snr = max((a[3][1] for a in ants if a[3]), default=None)
+
+    main_rx = next((rx_msgs[n] for n in sorted(rx_msgs, key=stream_key)), None)
+    loss = rx_loss_pct(main_rx) if main_rx else None
+    rx_pps_total = sum(rx_packets(m, "all")[0] for m in rx_msgs.values())
+
+    rtt, last_loss, total_loss, sent, recv = ping
+
+    if best_rssi is not None:
+        worst["rssi"] = min(worst["rssi"], best_rssi) if worst["rssi"] is not None else best_rssi
+    if loss is not None:
+        worst["loss"] = max(worst["loss"], loss) if worst["loss"] is not None else loss
+    if main_rx:
+        worst["lost"] = max(worst["lost"], rx_packets(main_rx, "lost")[1])
+
+    rssi_st, rssi_txt = rssi_grade(best_rssi)
+    loss_st, loss_txt = loss_grade(loss)
+    snr_st, snr_txt = snr_grade(best_snr)
+    ping_st, _ = loss_grade(last_loss)
+
+    overall = worst_status([s for s in (rssi_st, loss_st, snr_st, ping_st) if s])
+    if not ants and rx_pps_total <= 0 and not rtt:
+        overall, overall_txt = "fail", "BRAK ODBIORU"
+    else:
+        overall_txt = {"ok": "DOBRE", "warn": "SLABE", "fail": "ZLE"}.get(overall, "?")
+        if overall == "ok" and rssi_txt == "doskonaly":
+            overall_txt = "DOSKONALE"
+
+    head = f"Ocena lacza: {overall_txt}"
+    parts = []
+    if best_rssi is not None:
+        parts.append(f"sygnal {best_rssi:.0f} dBm")
+    if loss is not None:
+        parts.append(f"straty {loss:.1f}%")
+    if rtt:
+        parts.append(f"ping {rtt[1]:.1f} ms")
+    parts.append(f"czas testu {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
+    lines.append((f"{head}   " + "   ".join(parts), color_for(overall) | curses.A_BOLD))
+
+    if overall == "fail" and not ants and rx_pps_total <= 0:
+        row("Nic nie przychodzi z drugiej strony. Sprawdz po obu stronach: ten sam kanal,", "fail")
+        row("ten sam odcisk kluczy, wlaczona usluga i moc TX wieksza od zera.", "fail")
+
+    if api_error:
+        section("Statystyki wfb-ng")
+        row(api_error, "warn")
+        row("Ping i liczniki kart ponizej dzialaja niezaleznie od API.")
+
+    if ants:
+        section("Sygnal (kazda antena osobno)")
+        for label, count, rssi, snr, freq in ants:
+            st, txt = rssi_grade(rssi[1] if rssi else None)
+            where = f"{freq} MHz" if freq else ""
+            row(f"{label:<16}{count:>7.0f} pkt/s   {where}", st)
+            if rssi:
+                row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
+                    f"{meter(rssi[1], -90, -40)}  {txt}", st, indent=4)
+            if snr:
+                sst, stxt = snr_grade(snr[1])
+                row(f"SNR  {snr[0]:>5.0f}/{snr[1]:>5.0f}/{snr[2]:>5.0f} dB   "
+                    f"{meter(snr[1], 0, 40)}  {stxt}", sst, indent=4)
+        row("(min / srednia / max w ostatniej sekundzie)")
+
+    if rx_msgs:
+        section("Odbior (RX)")
+        for name in sorted(rx_msgs, key=stream_key):
+            m = rx_msgs[name]
+            got, got_all = rx_packets(m, "all")
+            fec = rx_packets(m, "fec_rec")[0]
+            lost, lost_all = rx_packets(m, "lost")
+            bad = rx_packets(m, "bad")[0] + rx_packets(m, "dec_err")[0]
+            bytes_s = rx_packets(m, "out_bytes")[0] or rx_packets(m, "all_bytes")[0]
+            pct = rx_loss_pct(m)
+            st = loss_grade(pct)[0]
+            row(f"{name:<16}{got:>7.0f} pkt/s   {mbit(bytes_s):>7.2f} Mbit/s", st)
+            row(f"FEC naprawil {fec:.0f}/s   utracone {lost:.0f}/s"
+                + (f" ({pct:.1f}%)" if pct is not None else "")
+                + f"   bledne {bad:.0f}/s", st, indent=4)
+            row(f"od startu uslugi: odebrane {got_all:.0f}, utracone {lost_all:.0f}", indent=4)
+        row("(FEC naprawil = pakiety odtworzone z nadmiarowych - doszly, ale link sie meczy)")
+
+    if tx_msgs:
+        section("Nadawanie (TX)")
+        for name in sorted(tx_msgs, key=stream_key):
+            m = tx_msgs[name]
+            inj = rx_packets(m, "injected")[0]
+            dropped = rx_packets(m, "dropped")[0]
+            bytes_s = rx_packets(m, "injected_bytes")[0]
+            st = "warn" if dropped > 0 else None
+            row(f"{name:<16}{inj:>7.0f} pkt/s   {mbit(bytes_s):>7.2f} Mbit/s   "
+                f"odrzucone {dropped:.0f}/s", st)
+            for label, w_inj, w_drop, lat in tx_wlan_rows(m, nics):
+                extra = f"   wstrzykiwanie {lat:.1f} ms" if lat else ""
+                row(f"{label:<14}nadane {w_inj:.0f}   odrzucone {w_drop:.0f}{extra}",
+                    "warn" if w_drop else None, indent=4)
+
+    section(f"Tunel do {PEER_NAME} ({PEER_IP}) - ping leci przez radio")
+    if rtt:
+        st = "ok" if rtt[1] < 50 else ("warn" if rtt[1] < 150 else "fail")
+        row(f"RTT min/sr/max {rtt[0]:.1f}/{rtt[1]:.1f}/{rtt[2]:.1f} ms   {meter(rtt[1], 200, 0)}", st)
+    else:
+        row("brak odpowiedzi - tunel nie stoi albo druga strona jest wylaczona", "fail")
+    if last_loss is not None:
+        st = loss_grade(last_loss)[0]
+        row(f"utrata: ostatnia proba {last_loss:.0f}%"
+            + (f"   od poczatku testu {total_loss:.1f}% ({recv}/{sent} pakietow)"
+               if total_loss is not None else ""), st)
+
+    section("Karty (liczniki jadra)")
+    if nics:
+        for nic in nics:
+            rx_pps, tx_pps = traffic.get(nic, (0.0, 0.0))
+            row(f"{nic:<14}rx={rx_pps:>7.0f}/s  tx={tx_pps:>7.0f}/s   "
+                f"w usludze={'tak' if nic in used else 'NIE'}"
+                + ("   <- ta karta nadaje" if tx_pps > 0 else ""),
+                "ok" if nic in used else "fail")
+    else:
+        row("wfb-nics nie zwraca zadnego interfejsu", "fail")
+
+    section("Najgorsze wartosci od poczatku testu")
+    row(f"sygnal {worst['rssi']:.0f} dBm" if worst["rssi"] is not None else "sygnal ?",
+        rssi_grade(worst["rssi"])[0])
+    row(f"straty {worst['loss']:.1f}%" if worst["loss"] is not None else "straty ?",
+        loss_grade(worst["loss"])[0])
+    if worst["lost"]:
+        row(f"pakietow utraconych lacznie (od startu uslugi): {worst['lost']:.0f}")
+
+    return lines
+
+
+def link_test_screen(stdscr):
+    """Zywy test lacza: co widac po drugiej stronie, jak mocny jest sygnal,
+    ile pakietow przepada i jak dlugo leci ping przez radio. Weryfikacja mowi
+    "dziala / nie dziala", a to jest ekran do patrzenia w czasie rzeczywistym -
+    przy ustawianiu anten, sprawdzaniu zasiegu albo szukaniu czystszego kanalu.
+
+    Sam odswieza sie kilka razy na sekunde i mozna go zostawic wlaczonego -
+    po restarcie uslugi podlaczy sie do niej z powrotem."""
+    stdscr.timeout(400)  # getch wraca po 0.4 s, wiec petla sama sie odswieza
+    stats = WfbStatsProbe().start()
+    ping = PingProbe(PEER_IP).start()
+
+    nics = wfb_nics()
+    used = service_nics(set(nics))
+    counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in nics}
+    worst = {"rssi": None, "loss": None, "lost": 0}
+    started = time.monotonic()
+    next_nic_scan = started + 2.0
+    top = 0
+
+    try:
+        while True:
+            now = time.monotonic()
+            # Lista kart i to, ktore z nich siedza w usludze, zmienia sie rzadko,
+            # a jest droga (wfb-nics, w gorszym razie journalctl) - ekran
+            # odrysowuje sie duzo czesciej, wiec odswiezamy ja co dwie sekundy.
+            if now >= next_nic_scan:
+                nics = wfb_nics()
+                used = service_nics(set(nics))
+                next_nic_scan = now + 2.0
+
+            traffic = {}
+            for nic in nics:
+                rx, tx = nic_counters(nic)
+                prev = counters.get(nic)
+                if prev and now > prev[2]:
+                    dt = now - prev[2]
+                    traffic[nic] = (max(0.0, (rx - prev[0]) / dt), max(0.0, (tx - prev[1]) / dt))
+                else:
+                    traffic[nic] = (0.0, 0.0)  # karta dopiero co wpieta, brak odniesienia
+                counters[nic] = (rx, tx, now)
+
+            msgs, api_error = stats.snapshot()
+            lines = link_test_lines(msgs, api_error, nics, used, traffic,
+                                    ping.snapshot(), worst, now - started)
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - test polaczenia")
+            h, _ = stdscr.getmaxyx()
+            view = max(1, h - 3)
+            top = max(0, min(top, max(0, len(lines) - view)))
+            for i, (text, attr) in enumerate(lines[top:top + view]):
+                safe_addstr(stdscr, 2 + i, 2, text, attr)
+
+            hint = "q = powrot, z = zeruj liczniki testu"
+            if len(lines) > view:
+                hint = (f"strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}"
+                        f"/{len(lines)}), " + hint)
+            safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            elif key in (curses.KEY_DOWN, ord("j")):
+                top += 1
+            elif key in (curses.KEY_UP, ord("k")):
+                top -= 1
+            elif key == curses.KEY_NPAGE:
+                top += view
+            elif key == curses.KEY_PPAGE:
+                top -= view
+            elif key in (ord("z"), ord("Z")):
+                worst.update(rssi=None, loss=None, lost=0)
+                ping.reset()
+                started = now
+    finally:
+        stats.close()
+        ping.close()
+        stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
+
+
 def verification_screen(stdscr):
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
@@ -2169,6 +2767,7 @@ def main_menu(stdscr):
         "Wykryj karty ponownie (naprawa)",
         "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
+        "Test polaczenia (sygnal, straty, ping)",
         "Uruchom weryfikacje",
         "Wyjdz",
     ]
@@ -2210,8 +2809,10 @@ def main_menu(stdscr):
             elif idx == 4:
                 keys_screen(stdscr)
             elif idx == 5:
-                verification_screen(stdscr)
+                link_test_screen(stdscr)
             elif idx == 6:
+                verification_screen(stdscr)
+            elif idx == 7:
                 break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
