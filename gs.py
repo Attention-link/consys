@@ -64,6 +64,7 @@ TX_POWER_SYSFS = Path("/sys/module/88XXau_wfb/parameters/rtw_tx_pwr_idx_override
 CFG_PATH = Path("/etc/wifibroadcast.cfg")
 DRONE_KEY = Path("/etc/drone.key")
 GS_KEY = Path("/etc/gs.key")
+TEST_LOG_DIR = Path("/var/log/wfb-testy")  # zapisy z ekranu "Test polaczenia"
 REBOOT_MARKER = Path("/etc/.wfb-gs-reboot-attempted")
 
 # Zamiast wlanX (numer zalezy od kolejnosci wykrycia i potrafi sie zmienic
@@ -2448,6 +2449,147 @@ def nic_identify_screen(stdscr):
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
 
 
+def popup(stdscr, title, lines, question=None, status=None):
+    """Okienko na srodku ekranu. Bez 'question' tylko informuje (dowolny
+    klawisz zamyka), z 'question' pyta i zwraca True dla 't'. Rysowane wprost
+    po stdscr, jak reszta tego TUI - podokien nie uzywamy nigdzie indziej,
+    a tresc pod spodem i tak zaraz zostanie przerysowana."""
+    body = list(lines) + ([""] if question else []) + [question or "dowolny klawisz = zamknij"]
+    h, w = stdscr.getmaxyx()
+    inner = min(max(len(s) for s in [title] + body) + 2, max(8, w - 4))
+    left = max(0, (w - inner - 2) // 2)
+    top = max(0, (h - (len(body) + 4)) // 2)
+
+    def frame(y):
+        safe_addstr(stdscr, y, left, "+" + "-" * inner + "+", curses.A_BOLD)
+
+    def line(y, text, attr=0):
+        safe_addstr(stdscr, y, left, "|" + text[:inner].ljust(inner) + "|", attr)
+
+    frame(top)
+    line(top + 1, " " + title, (color_for(status) if status else 0) | curses.A_BOLD)
+    line(top + 2, "")
+    for i, text in enumerate(body):
+        line(top + 3 + i, " " + text)
+    frame(top + 3 + len(body))
+    stdscr.refresh()
+
+    key = stdscr.getch()
+    return key in (ord("t"), ord("T"), ord("y"), ord("Y")) if question else None
+
+
+def _stat_line(values, fmt="{:.1f}"):
+    if not values:
+        return "brak danych"
+    return (f"min {fmt.format(min(values))}   srednio {fmt.format(sum(values) / len(values))}"
+            f"   max {fmt.format(max(values))}")
+
+
+class TestRecorder:
+    """Zapis przebiegu testu do pliku: naglowek z cala konfiguracja, potem
+    jeden wiersz na sekunde, na koniec podsumowanie. Plik zamyka sie z chwila
+    wyjscia z ekranu testu.
+
+    Po co: przy sprawdzaniu zasiegu wyniku nie da sie ogladac na biezaco (jest
+    sie kilkaset metrow od ekranu), a i tak trzeba go z czyms porownac - "przed"
+    i "po" przestawieniu anteny albo zmianie kanalu. Wiersze sa rozdzielone
+    srednikami, wiec plik otwiera sie tez w arkuszu."""
+
+    COLUMNS = ("czas", "sek", "rssi_best_dBm", "snr_best_dB", "straty_%", "rx_pkt_s",
+               "rx_Mbit_s", "fec_naprawil_s", "utracone_s", "ping_ms", "ping_utrata_%",
+               "anteny_rssi")
+
+    def __init__(self, path):
+        self.path = path
+        self.samples = 0
+        self._fh = None
+        self._rssi = []
+        self._loss = []
+        self._ping = []
+
+    def open(self):
+        """Moze rzucic OSError - wolajacy pokazuje to w okienku i test idzie
+        dalej bez zapisu."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("w", encoding="utf-8")
+        self._header()
+        return self
+
+    def _header(self):
+        ch, reg = (parse_common(CFG_PATH.read_text()) if CFG_PATH.exists()
+                   else (DEFAULT_CHANNEL, DEFAULT_REGION))
+        freq = channel_freq(ch)
+        mode, code = key_mode()
+        w = self._fh.write
+        w(f"# test polaczenia wfb-ng, rola: {ROLE}\n")
+        w(f"# start: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        w(f"# host: {socket.gethostname()}   jadro: {os.uname().release}"
+          f"   wfb-ng: {wfb_ng_version()}\n")
+        w(f"# kanal: {ch}" + (f" ({freq} MHz)" if freq else "") + f"   region: {reg}"
+          f"   moc TX: {read_tx_power_live() or '?'}/63\n")
+        fingerprint = key_fingerprint(DRONE_KEY)
+        w(f"# klucze: {mode}" + (f", kod {format_pairing_code(code)}" if code else "")
+          + (f"   odcisk drone.key={fingerprint}" if fingerprint else "") + "\n")
+        for nic in wfb_nics():
+            d = nic_details(nic)
+            w(f"# karta {nic}: mac={d['mac']} usb={d['usb']} tryb={d['mode']}"
+              f" kanal={d['channel']}\n")
+        w(f"# druga strona: {PEER_NAME} {PEER_IP}\n#\n")
+        w(";".join(self.COLUMNS) + "\n")
+        self._fh.flush()
+
+    def note(self, text):
+        """Komentarz w srodku pliku - np. o wyzerowaniu licznikow, zeby przy
+        czytaniu bylo widac, ze w tym miejscu cos sie zmienilo."""
+        if self._fh:
+            self._fh.write(f"# {time.strftime('%H:%M:%S')}  {text}\n")
+            self._fh.flush()
+
+    def sample(self, elapsed, metrics, ping):
+        rtt, last_loss = ping[0], ping[1]
+        rssi, snr, loss = metrics["best_rssi"], metrics["best_snr"], metrics["loss"]
+        ants = " ".join(f"{label.replace(' ', ':')}={a_rssi[1]:.0f}"
+                        for label, _cnt, a_rssi, _snr, _freq in metrics["ants"] if a_rssi)
+
+        def num(value, fmt="{:.1f}"):
+            return fmt.format(value) if value is not None else ""
+
+        self._fh.write(";".join([
+            time.strftime("%H:%M:%S"), f"{elapsed:.0f}",
+            num(rssi, "{:.0f}"), num(snr, "{:.0f}"), num(loss),
+            f"{metrics['rx_pps']:.0f}", f"{mbit(metrics['rx_bytes']):.2f}",
+            f"{metrics['fec']:.0f}", f"{metrics['lost']:.0f}",
+            num(rtt[1] if rtt else None), num(last_loss, "{:.0f}"), ants,
+        ]) + "\n")
+        self._fh.flush()  # zeby po Ctrl+C albo zaniku zasilania zostalo to, co juz bylo
+        self.samples += 1
+
+        if rssi is not None:
+            self._rssi.append(rssi)
+        if loss is not None:
+            self._loss.append(loss)
+        if rtt:
+            self._ping.append(rtt[1])
+
+    def close(self, worst, elapsed):
+        if not self._fh:
+            return
+        w = self._fh.write
+        w("#\n# --- podsumowanie ---\n")
+        w(f"# koniec: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        w(f"# czas testu: {int(elapsed) // 60} min {int(elapsed) % 60} s"
+          f"   probek: {self.samples}\n")
+        w(f"# RSSI [dBm]:  {_stat_line(self._rssi, '{:.0f}')}\n")
+        w(f"# straty [%]:  {_stat_line(self._loss)}\n")
+        w(f"# ping [ms]:   {_stat_line(self._ping)}\n")
+        if worst["rssi"] is not None:
+            w(f"# najslabszy sygnal: {worst['rssi']:.0f} dBm ({rssi_grade(worst['rssi'])[1]})\n")
+        if worst["loss"] is not None:
+            w(f"# najwieksze straty: {worst['loss']:.1f}% ({loss_grade(worst['loss'])[1]})\n")
+        self._fh.close()
+        self._fh = None
+
+
 def meter(value, lo, hi, width=18):
     """Pasek postepu - w terminalu latwiej ocenic "ile brakuje" z paska niz
     z samej liczby, zwlaszcza gdy patrzy sie na ekran co chwile podczas
@@ -2469,7 +2611,37 @@ def stream_key(name):
     return (STREAM_ORDER.index(base) if base in STREAM_ORDER else len(STREAM_ORDER), name or "")
 
 
-def link_test_lines(msgs, api_error, nics, used, traffic, ping, worst, elapsed):
+def link_metrics(msgs, nics):
+    """Liczby wyluskane z wiadomosci API. Osobno od rysowania, bo dokladnie te
+    same wartosci ida na ekran i do pliku z zapisem testu - liczymy je raz."""
+    rx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "rx"}
+    tx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "tx"}
+
+    ants = []
+    for name in sorted(rx_msgs, key=stream_key):
+        ants.extend(antenna_rows(rx_msgs[name], nics))
+    main_rx = next((rx_msgs[n] for n in sorted(rx_msgs, key=stream_key)), None)
+
+    return {
+        "rx": rx_msgs,
+        "tx": tx_msgs,
+        "ants": ants,
+        "main_rx": main_rx,
+        # Przy dywersyfikacji liczy sie NAJLEPSZA antena - wfb-ng i tak sklada
+        # strumien z tej, ktora akurat slyszy lepiej.
+        "best_rssi": max((a[2][1] for a in ants if a[2]), default=None),
+        "best_snr": max((a[3][1] for a in ants if a[3]), default=None),
+        "loss": rx_loss_pct(main_rx) if main_rx else None,
+        "rx_pps": sum(rx_packets(m, "all")[0] for m in rx_msgs.values()),
+        "rx_bytes": ((rx_packets(main_rx, "out_bytes")[0]
+                      or rx_packets(main_rx, "all_bytes")[0]) if main_rx else 0),
+        "fec": rx_packets(main_rx, "fec_rec")[0] if main_rx else 0,
+        "lost": rx_packets(main_rx, "lost")[0] if main_rx else 0,
+        "lost_total": rx_packets(main_rx, "lost")[1] if main_rx else 0,
+    }
+
+
+def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapsed):
     """Cala tresc ekranu testu jako lista (tekst, atrybut) - budowana od nowa
     przy kazdym odswiezeniu, bo wszystkie liczby sa chwilowe."""
     lines = []
@@ -2485,20 +2657,9 @@ def link_test_lines(msgs, api_error, nics, used, traffic, ping, worst, elapsed):
     def row(text, status=None, indent=2):
         lines.append((" " * indent + text, color_for(status) if status else 0))
 
-    rx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "rx"}
-    tx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "tx"}
-
-    ants = []
-    for name in sorted(rx_msgs, key=stream_key):
-        ants.extend(antenna_rows(rx_msgs[name], nics))
-    # Przy dywersyfikacji liczy sie NAJLEPSZA antena - wfb-ng i tak sklada
-    # strumien z tej, ktora akurat slyszy lepiej.
-    best_rssi = max((a[2][1] for a in ants if a[2]), default=None)
-    best_snr = max((a[3][1] for a in ants if a[3]), default=None)
-
-    main_rx = next((rx_msgs[n] for n in sorted(rx_msgs, key=stream_key)), None)
-    loss = rx_loss_pct(main_rx) if main_rx else None
-    rx_pps_total = sum(rx_packets(m, "all")[0] for m in rx_msgs.values())
+    rx_msgs, tx_msgs, ants = metrics["rx"], metrics["tx"], metrics["ants"]
+    best_rssi, best_snr = metrics["best_rssi"], metrics["best_snr"]
+    loss, rx_pps_total = metrics["loss"], metrics["rx_pps"]
 
     rtt, last_loss, total_loss, sent, recv = ping
 
@@ -2506,8 +2667,7 @@ def link_test_lines(msgs, api_error, nics, used, traffic, ping, worst, elapsed):
         worst["rssi"] = min(worst["rssi"], best_rssi) if worst["rssi"] is not None else best_rssi
     if loss is not None:
         worst["loss"] = max(worst["loss"], loss) if worst["loss"] is not None else loss
-    if main_rx:
-        worst["lost"] = max(worst["lost"], rx_packets(main_rx, "lost")[1])
+    worst["lost"] = max(worst["lost"], metrics["lost_total"])
 
     rssi_st, rssi_txt = rssi_grade(best_rssi)
     loss_st, loss_txt = loss_grade(loss)
@@ -2631,7 +2791,25 @@ def link_test_screen(stdscr):
     przy ustawianiu anten, sprawdzaniu zasiegu albo szukaniu czystszego kanalu.
 
     Sam odswieza sie kilka razy na sekunde i mozna go zostawic wlaczonego -
-    po restarcie uslugi podlaczy sie do niej z powrotem."""
+    po restarcie uslugi podlaczy sie do niej z powrotem. Na wejsciu pyta, czy
+    zapisywac przebieg do pliku; zapis konczy sie z chwila wyjscia stad."""
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - test polaczenia")
+    path = TEST_LOG_DIR / f"test-{ROLE}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    recorder = None
+    if popup(stdscr, "Zapis testu do pliku",
+             ["Zapisywac przebieg tego testu do pliku?",
+              "",
+              f"Plik:  {path}",
+              "Jeden wiersz na sekunde: sygnal, straty, ping.",
+              "Zapis konczy sie w chwili wyjscia z ekranu testu."],
+             "t = tak, dowolny inny klawisz = nie"):
+        try:
+            recorder = TestRecorder(path).open()
+        except OSError as e:
+            popup(stdscr, "Nie udalo sie otworzyc pliku", [str(e), "Test ruszy bez zapisu."],
+                  status="fail")
+
     stdscr.timeout(400)  # getch wraca po 0.4 s, wiec petla sama sie odswieza
     stats = WfbStatsProbe().start()
     ping = PingProbe(PEER_IP).start()
@@ -2641,7 +2819,11 @@ def link_test_screen(stdscr):
     counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in nics}
     worst = {"rssi": None, "loss": None, "lost": 0}
     started = time.monotonic()
+    rec_started = started  # nie zeruje sie klawiszem 'z', wiec czas w pliku rosnie
     next_nic_scan = started + 2.0
+    next_sample = started
+    rec_error = None
+    elapsed = 0.0
     top = 0
 
     try:
@@ -2667,8 +2849,18 @@ def link_test_screen(stdscr):
                 counters[nic] = (rx, tx, now)
 
             msgs, api_error = stats.snapshot()
-            lines = link_test_lines(msgs, api_error, nics, used, traffic,
-                                    ping.snapshot(), worst, now - started)
+            ping_snap = ping.snapshot()
+            metrics = link_metrics(msgs, nics)
+            elapsed = now - started
+            lines = link_test_lines(metrics, api_error, nics, used, traffic,
+                                    ping_snap, worst, elapsed)
+
+            if recorder and now >= next_sample:
+                next_sample = now + 1.0
+                try:
+                    recorder.sample(now - rec_started, metrics, ping_snap)
+                except OSError as e:
+                    rec_error, recorder = str(e), None  # np. brak miejsca na karcie
 
             stdscr.erase()
             draw_header(stdscr, f"WFB-NG [{ROLE}] - test polaczenia")
@@ -2682,6 +2874,10 @@ def link_test_screen(stdscr):
             if len(lines) > view:
                 hint = (f"strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}"
                         f"/{len(lines)}), " + hint)
+            if recorder:
+                hint = f"ZAPIS: {recorder.samples} probek -> {recorder.path.name} | " + hint
+            elif rec_error:
+                hint = "ZAPIS PRZERWANY (blad pliku) | " + hint
             safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
             stdscr.refresh()
 
@@ -2700,10 +2896,28 @@ def link_test_screen(stdscr):
                 worst.update(rssi=None, loss=None, lost=0)
                 ping.reset()
                 started = now
+                if recorder:
+                    recorder.note("wyzerowano liczniki testu")
     finally:
         stats.close()
         ping.close()
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
+
+    if recorder:
+        try:
+            recorder.close(worst, time.monotonic() - rec_started)
+            popup(stdscr, "Zapis zakonczony",
+                  [f"Plik:    {recorder.path}",
+                   f"Probek:  {recorder.samples}   (co sekunde)",
+                   "",
+                   "Podglad na Pi:   less " + str(recorder.path),
+                   f"Sciagniecie:     scp <user>@<ip>:{recorder.path} ."],
+                  status="ok")
+        except OSError as e:
+            popup(stdscr, "Blad przy zamykaniu pliku", [str(e)], status="fail")
+    elif rec_error:
+        popup(stdscr, "Zapis przerwany", [rec_error, "Czesc probek moze byc w pliku:",
+                                          str(path)], status="fail")
 
 
 def verification_screen(stdscr):
