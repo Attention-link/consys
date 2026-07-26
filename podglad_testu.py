@@ -59,6 +59,7 @@ class TestLog:
 
     def __init__(self, path):
         self.path = Path(path)
+        self.label = self.path.stem
         self.header = []
         self.summary = []
         self.events = []     # (sekunda, tekst)
@@ -66,6 +67,10 @@ class TestLog:
         self.samples = []
         self.antennas = []   # nazwy w kolejnosci pojawienia sie
         self._parse()
+        # Przy porownywaniu kilku testow liczy sie czas OD POCZATKU kazdego
+        # z nich, a nie zegar - inaczej dwa przeloty zrobione o roznych porach
+        # leza na wykresie obok siebie zamiast jeden na drugim.
+        self.t0 = self.samples[0]["sek"] if self.samples else 0.0
 
     def _parse(self):
         in_summary = False
@@ -126,12 +131,16 @@ class TestLog:
         first, last = self.samples[0]["sek"], self.samples[-1]["sek"]
         return (first, last) if last > first else (first, first + 1)
 
+    def duration(self):
+        first, last = self.span()
+        return last - first
+
     def series(self, column):
-        return [(s["sek"], s[column]) for s in self.samples
+        return [(s["sek"] - self.t0, s[column]) for s in self.samples
                 if s.get(column) is not None]
 
     def antenna_series(self, name):
-        return [(s["sek"], s["anteny"][name]) for s in self.samples
+        return [(s["sek"] - self.t0, s["anteny"][name]) for s in self.samples
                 if name in s["anteny"]]
 
     def has(self, column):
@@ -158,6 +167,16 @@ def nice_step(span, target=5):
         if raw <= mag * mult:
             return mag * mult
     return mag * 10
+
+
+def as_paths(value):
+    """Jedna sciezka albo kilka - zawsze lista. Bez tego pojedynczy napis
+    rozsypalby sie na pojedyncze znaki, bo str tez jest iterowalny."""
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(p) for p in value]
 
 
 def nice_time_step(span, target=8):
@@ -217,7 +236,7 @@ class ChartArea:
 
     def __init__(self, canvas):
         self.canvas = canvas
-        self.log = None
+        self.logs = []
         self.panels = []
         self.t0, self.t1 = 0.0, 1.0
         self.x0, self.x1 = PAD_L, PAD_L + 1
@@ -226,47 +245,62 @@ class ChartArea:
         canvas.bind("<Motion>", self._on_motion)
         canvas.bind("<Leave>", lambda e: self.canvas.delete("kursor"))
 
-    def set_log(self, log):
-        self.log = log
+    def set_logs(self, logs):
+        self.logs = list(logs)
         self.redraw()
+
+    def log_color(self, index):
+        return SERIES_COLORS[index % len(SERIES_COLORS)]
 
     # --- budowa paneli ---
 
     def _build_panels(self):
-        log = self.log
+        """Przy jednym pliku kolor oznacza antene/wielkosc, przy kilku - PLIK.
+        Inaczej przy porownaniu nie dalo by sie odroznic, ktora krzywa jest
+        z ktorego testu, a o to w porownaniu chodzi."""
+        multi = len(self.logs) > 1
         panels = []
 
-        ant_series = [(name, SERIES_COLORS[i % len(SERIES_COLORS)], log.antenna_series(name))
-                      for i, name in enumerate(log.antennas)]
-        ant_series = [s for s in ant_series if len(s[2]) > 1]
-        if not ant_series and log.has("rssi_best_dBm"):
-            ant_series = [("najlepsza antena", SERIES_COLORS[0], log.series("rssi_best_dBm"))]
-        elif ant_series and log.has("rssi_best_dBm") and len(ant_series) > 1:
-            ant_series.append(("najlepsza", "#202124", log.series("rssi_best_dBm")))
-        if ant_series:
-            panels.append(Panel("rssi", "Sygnal RSSI [dBm]", 3, ant_series,
+        rssi = []
+        for i, log in enumerate(self.logs):
+            color = self.log_color(i)
+            if multi:
+                rssi.append((log.label, color, log.series("rssi_best_dBm")))
+                continue
+            for j, name in enumerate(log.antennas):
+                points = log.antenna_series(name)
+                if len(points) > 1:
+                    rssi.append((name, SERIES_COLORS[j % len(SERIES_COLORS)], points))
+            if not rssi and log.has("rssi_best_dBm"):
+                rssi.append(("najlepsza antena", color, log.series("rssi_best_dBm")))
+            elif len(rssi) > 1 and log.has("rssi_best_dBm"):
+                rssi.append(("najlepsza", "#202124", log.series("rssi_best_dBm")))
+        rssi = [s for s in rssi if len(s[2]) > 1]
+        if rssi:
+            panels.append(Panel("rssi", "Sygnal RSSI [dBm]", 3, rssi,
                                 unit="dBm", bands=RSSI_BANDS))
 
-        if log.has("snr_best_dB"):
-            panels.append(Panel("snr", "SNR [dB]", 2,
-                                [("SNR", SERIES_COLORS[2], log.series("snr_best_dB"))],
-                                unit="dB"))
-        if log.has("rx_mcs"):
-            panels.append(Panel("mcs", "Modulacja (MCS odbioru)", 1,
-                                [("MCS", SERIES_COLORS[1], log.series("rx_mcs"))],
-                                step=True))
-        if log.has("straty_%"):
-            panels.append(Panel("loss", "Straty pakietow [%]", 2,
-                                [("straty", SERIES_COLORS[5], log.series("straty_%"))],
-                                unit="%", bands=LOSS_BANDS, y_fmt="{:.1f}", y_floor=0))
-        if log.has("rx_Mbit_s"):
-            panels.append(Panel("mbit", "Przeplyw odbioru [Mbit/s]", 2,
-                                [("Mbit/s", SERIES_COLORS[4], log.series("rx_Mbit_s"))],
-                                unit="Mbit/s", y_fmt="{:.1f}", y_floor=0))
-        if log.has("ping_ms"):
-            panels.append(Panel("ping", "Ping przez tunel [ms]", 2,
-                                [("ping", SERIES_COLORS[3], log.series("ping_ms"))],
-                                unit="ms", y_fmt="{:.0f}", y_floor=0))
+        for key, title, weight, column, opts in (
+                ("snr", "SNR [dB]", 2, "snr_best_dB", {"unit": "dB"}),
+                ("mcs", "Modulacja (MCS odbioru)", 1, "rx_mcs", {"step": True}),
+                ("loss", "Straty pakietow [%]", 2, "straty_%",
+                 {"unit": "%", "bands": LOSS_BANDS, "y_fmt": "{:.1f}", "y_floor": 0}),
+                ("mbit", "Przeplyw odbioru [Mbit/s]", 2, "rx_Mbit_s",
+                 {"unit": "Mbit/s", "y_fmt": "{:.1f}", "y_floor": 0}),
+                ("ping", "Ping przez tunel [ms]", 2, "ping_ms",
+                 {"unit": "ms", "y_floor": 0})):
+            default_color = {"snr": SERIES_COLORS[2], "mcs": SERIES_COLORS[1],
+                             "loss": SERIES_COLORS[5], "mbit": SERIES_COLORS[4],
+                             "ping": SERIES_COLORS[3]}[key]
+            series = []
+            for i, log in enumerate(self.logs):
+                if not log.has(column):
+                    continue
+                series.append((log.label if multi else title.split(" [")[0],
+                               self.log_color(i) if multi else default_color,
+                               log.series(column)))
+            if series:
+                panels.append(Panel(key, title, weight, series, **opts))
         return panels
 
     # --- rysowanie ---
@@ -279,11 +313,14 @@ class ChartArea:
         if width < 60 or height < 60:
             return
 
-        if not self.log or len(self.log.samples) < 2:
-            msg = ("Przeciagnij plik test-*.log na podglad_testu.py\n"
-                   "albo kliknij \"Otworz plik...\"")
-            if self.log:
-                msg = f"Za malo danych w {self.log.path.name}\n(potrzebne co najmniej dwie probki)"
+        usable_logs = [log for log in self.logs if len(log.samples) >= 2]
+        if not usable_logs:
+            msg = ("Przeciagnij plik (albo kilka na raz) test-*.log\n"
+                   "na podglad_testu.py, albo kliknij \"Otworz pliki...\"")
+            if self.logs:
+                msg = ("Za malo danych w: "
+                       + ", ".join(log.path.name for log in self.logs)
+                       + "\n(potrzebne co najmniej dwie probki)")
             c.create_text(width // 2, height // 2, text=msg, fill=MUTED,
                           font=("Segoe UI", 11), justify="center")
             return
@@ -302,7 +339,8 @@ class ChartArea:
         total = max(height, need)
         c.configure(scrollregion=(0, 0, width, total))
 
-        self.t0, self.t1 = self.log.span()
+        # wspolna os: od zera do najdluzszego z porownywanych testow
+        self.t0, self.t1 = 0.0, max(log.duration() for log in usable_logs) or 1.0
         self.x0, self.x1 = PAD_L, max(PAD_L + 10, width - PAD_R)
         usable = total - PAD_T - PAD_B - gaps
         self.top, self.bottom = PAD_T, total - PAD_B
@@ -349,9 +387,12 @@ class ChartArea:
                               font=("Segoe UI", 8))
             t += t_step
 
-        for sec, _text in self.log.events:
-            x = self.x_at(sec)
-            c.create_line(x, y0, x, y1, fill="#b0b6c0", dash=(3, 3))
+        # Zdarzenia rysujemy tylko przy jednym pliku - przy porownaniu kreski
+        # z kilku testow zlewaja sie w plot i nie wiadomo, czyja jest ktora.
+        if len(self.logs) == 1:
+            for sec, _text in self.logs[0].events:
+                x = self.x_at(sec - self.logs[0].t0)
+                c.create_line(x, y0, x, y1, fill="#b0b6c0", dash=(3, 3))
 
         c.create_rectangle(x0, y0, x1, y1, outline=AXIS)
 
@@ -397,48 +438,74 @@ class ChartArea:
     def _on_motion(self, event):
         c = self.canvas
         c.delete("kursor")
-        if not self.log or not self.panels:
+        usable = [log for log in self.logs if log.samples]
+        if not usable or not self.panels:
             return
         x = c.canvasx(event.x)
         if not (self.x0 <= x <= self.x1):
             return
 
         t = self.t0 + (x - self.x0) / (self.x1 - self.x0) * (self.t1 - self.t0)
-        sample = min(self.log.samples, key=lambda s: abs(s["sek"] - t))
-        sx = self.x_at(sample["sek"])
+        sx = self.x_at(t)
         c.create_line(sx, self.top, sx, self.bottom, fill="#5f6368", dash=(2, 2),
                       tags="kursor")
 
+        # przy porownaniu kazdy plik ma w tej chwili wlasna probke - kropki
+        # i odczyt pokazuja je wszystkie
+        picks = []
+        for i, log in enumerate(usable):
+            sample = min(log.samples, key=lambda s: abs(s["sek"] - log.t0 - t))
+            if abs(sample["sek"] - log.t0 - t) <= max(2.0, self.t1 / 200):
+                picks.append((i, log, sample))
+
         for panel in self.panels:
-            for _label, color, points in panel.series:
-                value = next((v for tt, v in points if tt == sample["sek"]), None)
-                if value is None:
-                    continue
-                y = panel.y_at(value)
-                c.create_oval(sx - 3, y - 3, sx + 3, y + 3, fill=color, outline=BG,
-                              tags="kursor")
+            for i, log, sample in picks:
+                rel = sample["sek"] - log.t0
+                for _label, color, points in panel.series:
+                    value = next((v for tt, v in points if abs(tt - rel) < 1e-6), None)
+                    if value is None:
+                        continue
+                    y = panel.y_at(value)
+                    c.create_oval(self.x_at(rel) - 3, y - 3, self.x_at(rel) + 3, y + 3,
+                                  fill=color, outline=BG, tags="kursor")
 
-        self._draw_readout(sample, sx, c.canvasy(event.y))
+        self._draw_readout(picks, sx, c.canvasy(event.y))
 
-    def _readout_lines(self, sample):
-        lines = [f"{sample.get('czas') or ''}   {fmt_time(sample['sek'])} od startu"]
-        for name in self.log.antennas:
-            if name in sample["anteny"]:
-                lines.append(f"{name}: {sample['anteny'][name]:.0f} dBm")
-        for column, label, fmt in (("rssi_best_dBm", "najlepszy sygnal", "{:.0f} dBm"),
-                                   ("snr_best_dB", "SNR", "{:.0f} dB"),
-                                   ("rx_mcs", "MCS", "{:.0f}"),
-                                   ("straty_%", "straty", "{:.1f} %"),
-                                   ("rx_Mbit_s", "przeplyw", "{:.2f} Mbit/s"),
-                                   ("ping_ms", "ping", "{:.1f} ms")):
-            value = sample.get(column)
-            if value is not None:
-                lines.append(f"{label}: {fmt.format(value)}")
-        return lines
+    READOUT = (("rssi_best_dBm", "najlepszy sygnal", "{:.0f} dBm", "{:.0f} dBm"),
+               ("snr_best_dB", "SNR", "{:.0f} dB", "SNR {:.0f}"),
+               ("rx_mcs", "MCS", "{:.0f}", "MCS {:.0f}"),
+               ("straty_%", "straty", "{:.1f} %", "straty {:.1f}%"),
+               ("rx_Mbit_s", "przeplyw", "{:.2f} Mbit/s", "{:.2f} Mbit/s"),
+               ("ping_ms", "ping", "{:.1f} ms", "ping {:.1f} ms"))
 
-    def _draw_readout(self, sample, sx, sy):
+    def _readout_lines(self, picks):
+        """Przy jednym pliku wypisujemy wszystko po kolei, przy porownaniu -
+        po jednej gestej linii na plik. Inaczej ramka z odczytem zaslania pol
+        wykresu, czyli dokladnie to, co chcemy porownac."""
+        multi = len(self.logs) > 1
+        lines = []
+        for _i, log, sample in picks:
+            rel = sample["sek"] - log.t0
+            if multi:
+                cells = [fmt.format(sample[col]) for col, _lbl, _long, fmt in self.READOUT
+                         if sample.get(col) is not None]
+                lines.append(f"{log.label}  ({fmt_time(rel)})")
+                lines.append("  " + "  ".join(cells))
+                continue
+
+            lines.append(f"{sample.get('czas') or ''}   {fmt_time(rel)} od startu")
+            for name in log.antennas:
+                if name in sample["anteny"]:
+                    lines.append(f"{name}: {sample['anteny'][name]:.0f} dBm")
+            for column, label, long_fmt, _short in self.READOUT:
+                value = sample.get(column)
+                if value is not None:
+                    lines.append(f"{label}: {long_fmt.format(value)}")
+        return lines or ["brak danych w tym miejscu"]
+
+    def _draw_readout(self, picks, sx, sy):
         c = self.canvas
-        lines = self._readout_lines(sample)
+        lines = self._readout_lines(picks)
         width = 9 * max(len(ln) for ln in lines) + 16
         height = 15 * len(lines) + 12
         x = sx + 14 if sx + 14 + width < self.x1 else sx - 14 - width
@@ -455,7 +522,7 @@ class ChartArea:
 # ------------------------- okno -------------------------
 
 class App(tk.Tk):
-    def __init__(self, path=None):
+    def __init__(self, paths=()):
         super().__init__()
         self.title("WFB-NG - podglad testu polaczenia")
         # na malym ekranie (laptop 1366x768) okno w stalym rozmiarze wychodzi
@@ -464,17 +531,18 @@ class App(tk.Tk):
         height = min(800, self.winfo_screenheight() - 110)
         self.geometry(f"{width}x{height}+30+20")
         self.minsize(820, 520)
-        self.log = None
+        self.logs = []
 
         self._build_menu()
         self._build_widgets()
 
-        if path:
-            self.load(path)
+        paths = as_paths(paths)
+        if paths:
+            self.load(paths)
         else:
             newest = self.newest_log()
             if newest:
-                self.load(newest)
+                self.load([newest])
 
     # --- budowa okna ---
 
@@ -482,12 +550,17 @@ class App(tk.Tk):
         menu = tk.Menu(self)
         plik = tk.Menu(menu, tearoff=0)
         plik.add_command(label="Otworz...", accelerator="Ctrl+O", command=self.ask_open)
+        plik.add_command(label="Dodaj do porownania...", accelerator="Ctrl+D",
+                         command=self.ask_add)
+        plik.add_command(label="Zostaw tylko pierwszy", command=self.clear_extra)
+        plik.add_separator()
         plik.add_command(label="Odswiez", accelerator="F5", command=self.reload)
         plik.add_separator()
         plik.add_command(label="Zamknij", command=self.destroy)
         menu.add_cascade(label="Plik", menu=plik)
         self.config(menu=menu)
         self.bind("<Control-o>", lambda e: self.ask_open())
+        self.bind("<Control-d>", lambda e: self.ask_add())
         self.bind("<F5>", lambda e: self.reload())
 
     def _build_widgets(self):
@@ -498,7 +571,12 @@ class App(tk.Tk):
 
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(fill="x")
-        ttk.Button(bar, text="Otworz plik...", command=self.ask_open).pack(side="left")
+        ttk.Button(bar, text="Otworz pliki...", command=self.ask_open).pack(side="left")
+        ttk.Button(bar, text="Dodaj do porownania...",
+                   command=self.ask_add).pack(side="left", padx=6)
+        self.clear_button = ttk.Button(bar, text="Zostaw pierwszy",
+                                       command=self.clear_extra, state="disabled")
+        self.clear_button.pack(side="left")
         ttk.Button(bar, text="Odswiez", command=self.reload).pack(side="left", padx=6)
         self.file_label = ttk.Label(bar, text="(brak pliku)", foreground=MUTED)
         self.file_label.pack(side="left", padx=12)
@@ -547,41 +625,92 @@ class App(tk.Tk):
         logs = sorted(folder.glob("test-*.log"), key=lambda p: p.stat().st_mtime)
         return logs[-1] if logs else None
 
-    def ask_open(self):
-        path = filedialog.askopenfilename(
-            title="Wybierz log z testu",
+    def _ask_files(self, title):
+        """Okno wyboru pozwala zaznaczyc kilka plikow na raz (Ctrl / Shift)."""
+        return filedialog.askopenfilenames(
+            title=title,
             initialdir=str(Path(__file__).resolve().parent),
             filetypes=[("Logi testu", "test-*.log"), ("Pliki log", "*.log"),
                        ("Wszystkie pliki", "*.*")])
-        if path:
-            self.load(path)
+
+    def ask_open(self):
+        paths = self._ask_files("Wybierz log (albo kilka do porownania)")
+        if paths:
+            self.load(paths)
+
+    def ask_add(self):
+        paths = self._ask_files("Dolacz log do porownania")
+        if paths:
+            self.load(paths, add=True)
+
+    def clear_extra(self):
+        if len(self.logs) > 1:
+            self.load([self.logs[0].path])
 
     def reload(self):
-        if self.log:
-            self.load(self.log.path)
+        if self.logs:
+            self.load([log.path for log in self.logs])
 
-    def load(self, path):
-        try:
-            log = TestLog(path)
-        except OSError as e:
-            messagebox.showerror("Nie moge otworzyc pliku", str(e))
+    def load(self, paths, add=False):
+        logs = list(self.logs) if add else []
+        known = {str(log.path) for log in logs}
+        for path in as_paths(paths):
+            if str(path) in known:
+                continue  # ten sam plik dwa razy nic nie wnosi
+            try:
+                log = TestLog(path)
+            except OSError as e:
+                messagebox.showerror("Nie moge otworzyc pliku", str(e))
+                continue
+            if not log.samples:
+                messagebox.showwarning(
+                    "Pusty log",
+                    f"{path.name} nie zawiera ani jednej probki.\n"
+                    "Czy na pewno to plik z ekranu \"Test polaczenia\"?")
+            logs.append(log)
+            known.add(str(path))
+
+        if not logs:
             return
-        if not log.samples:
-            messagebox.showwarning(
-                "Pusty log",
-                f"{Path(path).name} nie zawiera ani jednej probki.\n"
-                "Czy na pewno to plik z ekranu \"Test polaczenia\"?")
+        self.logs = logs
+        self._shorten_labels()
 
-        self.log = log
-        self.title(f"{Path(path).name} - podglad testu polaczenia")
-        self.file_label.configure(text=log.path.name)
+        many = len(logs) > 1
+        self.title(("porownanie " + str(len(logs)) + " testow" if many
+                    else logs[0].path.name) + " - podglad testu polaczenia")
+        self.file_label.configure(
+            text="   ".join(log.path.name for log in logs) if many else logs[0].path.name)
+        self.clear_button.configure(state="normal" if many else "disabled")
         self._fill_info()
-        self.chart.set_log(log)
-        span = log.span()
+        self.chart.set_logs(logs)
         self.status.configure(
-            text=f"Probek: {len(log.samples)}   czas: {fmt_time(span[1] - span[0])}"
-                 f"   anteny: {', '.join(log.antennas) or 'brak'}"
-                 f"   zdarzenia: {len(log.events)}   |   {log.path}")
+            text=f"Plikow: {len(logs)}   probek: {sum(len(l.samples) for l in logs)}"
+                 f"   najdluzszy test: {fmt_time(max(l.duration() for l in logs))}"
+                 + ("" if many else f"   anteny: {', '.join(logs[0].antennas) or 'brak'}"
+                                    f"   |   {logs[0].path}"))
+
+    def _shorten_labels(self):
+        """Nazwy logow roznia sie zwykle tylko koncowka z godzina - pelna nazwa
+        zajelaby pol legendy, wiec obcinamy wspolny poczatek. Ciecie cofamy do
+        najblizszego myslnika, zeby z 'test-gs-20260727-2100' zostalo '2100',
+        a nie '100'."""
+        names = [log.path.stem for log in self.logs]
+        prefix = 0
+        if len(names) > 1:
+            first = names[0]
+            while prefix < len(first) and all(
+                    len(n) > prefix and n[prefix] == first[prefix] for n in names):
+                prefix += 1
+            cut = max(first.rfind("-", 0, prefix), first.rfind("_", 0, prefix))
+            prefix = cut + 1 if cut >= 0 else prefix
+        for log, name in zip(self.logs, names):
+            log.label = name[prefix:] if prefix and len(name) - prefix >= 3 else name
+
+    STAT_ROWS = (("rssi_best_dBm", "RSSI dBm", "{:.0f}"),
+                 ("snr_best_dB", "SNR dB", "{:.0f}"),
+                 ("straty_%", "straty %", "{:.1f}"),
+                 ("rx_Mbit_s", "Mbit/s", "{:.2f}"),
+                 ("ping_ms", "ping ms", "{:.1f}"))
 
     def _fill_info(self):
         self.info.configure(state="normal")
@@ -594,47 +723,74 @@ class App(tk.Tk):
             for line in lines:
                 self.info.insert("end", line + "\n")
 
-        block("Warunki testu", self.log.header)
-
-        stats = []
-        for column, label, fmt in (("rssi_best_dBm", "RSSI dBm", "{:.0f}"),
-                                   ("snr_best_dB", "SNR dB", "{:.0f}"),
-                                   ("straty_%", "straty %", "{:.1f}"),
-                                   ("rx_Mbit_s", "Mbit/s", "{:.2f}"),
-                                   ("ping_ms", "ping ms", "{:.1f}")):
-            stat = self.log.stat(column)
-            if stat:
-                lo, avg, hi = stat
-                stats.append(f"{label:<9}{fmt.format(lo):>7} /{fmt.format(avg):>7} /"
-                             f"{fmt.format(hi):>7}")
-        if stats:
-            stats.insert(0, f"{'':<9}{'min':>7} /{'srednio':>7} /{'max':>7}")
-        mcs = sorted({int(v) for _, v in self.log.series("rx_mcs")})
-        if mcs:
-            stats.append("MCS      " + ", ".join(str(m) for m in mcs))
-        block("Policzone z probek", stats)
-
-        block("Podsumowanie z pliku", self.log.summary)
-        block("Zdarzenia w trakcie",
-              [f"{fmt_time(sec)}  {text}" for sec, text in self.log.events])
+        if len(self.logs) > 1:
+            block("Porownanie (srednie)", self._comparison_lines())
+            for i, log in enumerate(self.logs):
+                block(f"[{i + 1}] {log.path.name}",
+                      log.header + self._stat_lines(log) + log.summary)
+        else:
+            log = self.logs[0]
+            block("Warunki testu", log.header)
+            block("Policzone z probek", self._stat_lines(log))
+            block("Podsumowanie z pliku", log.summary)
+            block("Zdarzenia w trakcie",
+                  [f"{fmt_time(sec - log.t0)}  {text}" for sec, text in log.events])
 
         self.info.configure(state="disabled")
 
+    def _stat_lines(self, log):
+        lines = []
+        for column, label, fmt in self.STAT_ROWS:
+            stat = log.stat(column)
+            if stat:
+                lo, avg, hi = stat
+                lines.append(f"{label:<9}{fmt.format(lo):>7} /{fmt.format(avg):>7} /"
+                             f"{fmt.format(hi):>7}")
+        if lines:
+            lines.insert(0, f"{'':<9}{'min':>7} /{'srednio':>7} /{'max':>7}")
+        mcs = sorted({int(v) for _, v in log.series("rx_mcs")})
+        if mcs:
+            lines.append("MCS      " + ", ".join(str(m) for m in mcs))
+        return lines
+
+    def _comparison_lines(self):
+        """Srednie z kazdego pliku jedna obok drugiej - to jest wlasciwa
+        odpowiedz na pytanie "czy po przestawieniu anteny jest lepiej", ktorej
+        z samych krzywych nie da sie odczytac z dokladnoscia do liczby."""
+        width = 9
+        lines = [" " * 10 + "".join(f"[{i + 1}]".rjust(width) for i in range(len(self.logs)))]
+        for column, label, fmt in self.STAT_ROWS:
+            cells = []
+            for log in self.logs:
+                stat = log.stat(column)
+                cells.append((fmt.format(stat[1]) if stat else "-").rjust(width))
+            lines.append(f"{label:<10}" + "".join(cells))
+        lines.append(f"{'czas':<10}" + "".join(
+            fmt_time(log.duration()).rjust(width) for log in self.logs))
+        lines.append(f"{'probek':<10}" + "".join(
+            str(len(log.samples)).rjust(width) for log in self.logs))
+        lines.append("")
+        for i, log in enumerate(self.logs):
+            lines.append(f"[{i + 1}] {log.label}")
+        return lines
+
 
 def main():
-    path = None
-    if len(sys.argv) > 1:
-        path = Path(sys.argv[1])
-        if not path.exists():
-            # komunikat i na konsole, i w okienku - po zmianie rozszerzenia na
-            # .pyw (zeby nie wyskakiwalo czarne okno) konsoli po prostu nie ma
-            print(f"Nie ma takiego pliku: {path}")
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror("Nie ma takiego pliku", str(path))
-            root.destroy()
-            return 2
-    App(path).mainloop()
+    # kilka plikow naraz: mozna zaznaczyc je w eksploratorze i przeciagnac
+    # razem na podglad_testu.py - wtedy od razu widac je na wspolnych wykresach
+    paths = [Path(a) for a in sys.argv[1:]]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        # komunikat i na konsole, i w okienku - po zmianie rozszerzenia na
+        # .pyw (zeby nie wyskakiwalo czarne okno) konsoli po prostu nie ma
+        text = "\n".join(str(p) for p in missing)
+        print(f"Nie ma takich plikow:\n{text}")
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Nie ma takich plikow", text)
+        root.destroy()
+        return 2
+    App(paths).mainloop()
     return 0
 
 
