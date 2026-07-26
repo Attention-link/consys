@@ -455,9 +455,68 @@ def wfb_ng_installed():
 
 
 def parse_common(txt):
+    """Kanal i region WPISANE do /etc/wifibroadcast.cfg. Brak wpisu zwraca
+    nasza wartosc domyslna - ale uwaga: to nie znaczy, ze wfb-ng jej uzywa.
+    Do pokazywania stanu sluzy wfb_effective_common()."""
     ch = re.search(r"wifi_channel\s*=\s*(\d+)", txt)
     reg = re.search(r"wifi_region\s*=\s*'([^']*)'", txt)
     return (ch.group(1) if ch else DEFAULT_CHANNEL, reg.group(1) if reg else DEFAULT_REGION)
+
+
+def cfg_has_common():
+    """Czy kanal i region stoja w naszym pliku, czy tylko je zakladamy."""
+    if not CFG_PATH.exists():
+        return False, False
+    txt = CFG_PATH.read_text()
+    return (bool(re.search(r"^\s*wifi_channel\s*=", txt, re.M)),
+            bool(re.search(r"^\s*wifi_region\s*=", txt, re.M)))
+
+
+_common_cache = {"t": 0.0, "val": None}
+
+
+def wfb_effective_common(max_age=5.0):
+    """(kanal, region) tak, jak widzi je wfb-ng PO scaleniu master.cfg
+    z /etc/wifibroadcast.cfg - czyli to, na czym karta naprawde nadaje.
+
+    Pytamy biblioteke, a nie sam plik, bo brak wpisu w /etc NIE znaczy "no to
+    domyslnie 13". Znaczy "to, co wfb-ng ma u siebie", a tam domyslny kanal to
+    161, czyli 5805 MHz - i wlasnie stad link potrafi wstac na 5.8 GHz, mimo ze
+    ten skrypt jest pisany pod 2.4 GHz."""
+    now = time.monotonic()
+    if _common_cache["val"] and now - _common_cache["t"] < max_age:
+        return _common_cache["val"]
+
+    value = None
+    code, out = run(["python3", "-c",
+                     "from wfb_ng.conf import settings; "
+                     "print(settings.common.wifi_channel, settings.common.wifi_region)"],
+                    timeout=30)
+    if code == 0:
+        for ln in reversed(out.splitlines()):
+            m = re.match(r"^\s*(\d+)\s+(\S+)\s*$", ln)
+            if m:
+                value = (m.group(1), m.group(2).strip("'\""))
+                break
+    if value is None:  # brak wfb-ng albo inna wersja - zostaje sam plik
+        value = (parse_common(CFG_PATH.read_text()) if CFG_PATH.exists()
+                 else (DEFAULT_CHANNEL, DEFAULT_REGION))
+    _common_cache.update(t=now, val=value)
+    return value
+
+
+def channel_source_note(channel):
+    """Skad wzial sie kanal, na ktorym stoi link - albo None, gdy wszystko sie
+    zgadza. Bez tego "13" na ekranie potrafi byc nasza domyslna wartoscia,
+    a karta i tak siedzi na 161."""
+    has_channel, _ = cfg_has_common()
+    if not has_channel:
+        return (f"kanal {channel} pochodzi z ustawien wfb-ng, w {CFG_PATH} nie ma "
+                f"wpisu wifi_channel")
+    written = parse_common(CFG_PATH.read_text())[0]
+    if written != channel:
+        return f"w {CFG_PATH} stoi kanal {written}, a wfb-ng uzywa {channel}"
+    return None
 
 
 def wfb_streams():
@@ -1244,6 +1303,388 @@ def mbit(bytes_per_s):
     return bytes_per_s * 8 / 1_000_000.0
 
 
+# ------------------------- skan kanalow -------------------------
+
+# 2.4 GHz: w PL (i calym ETSI) legalne sa kanaly 1-13. 5 GHz: tylko te bez
+# obowiazku wykrywania radaru (DFS) - na kanalach 52-140 nie wolno tak po
+# prostu nadawac, wiec ich nie proponujemy. Co z tego jest naprawde dozwolone
+# w ustawionym regionie, sprawdzamy i tak przez 'iw reg get'.
+CHANNELS_24 = list(range(1, 14))
+CHANNELS_5 = [36, 40, 44, 48, 149, 153, 157, 161, 165]
+
+
+def channel_allowed(freq, ranges=None):
+    """Czy caly kanal HT20 miesci sie w pasmie dozwolonym w tym regionie."""
+    ranges = reg_domain_ranges()[1] if ranges is None else ranges
+    span = channel_span(freq)
+    if not span or not ranges:
+        return None  # nie wiadomo - nie udajemy, ze wiemy
+    return any(lo <= span[0] and span[1] <= hi for lo, hi in ranges)
+
+
+def iw_survey(nic):
+    """{czestotliwosc MHz: (aktywny_ms, zajety_ms, szum_dBm)} z 'iw survey dump'.
+    To jedyny pomiar zajetosci pasma dostepny w trybie monitor - zwykly skan
+    (iw scan) w tym trybie nie przechodzi."""
+    code, out = run_tool("iw", "dev", nic, "survey", "dump", timeout=15)
+    if code != 0:
+        return {}
+
+    result = {}
+    freq = active = busy = noise = None
+
+    def flush():
+        if freq is not None:
+            result[freq] = (active, busy, noise)
+
+    for ln in out.splitlines():
+        m = re.search(r"frequency:\s+(\d+) MHz", ln)
+        if m:
+            flush()
+            freq, active, busy, noise = int(m.group(1)), None, None, None
+            continue
+        m = re.search(r"noise:\s+(-?\d+)", ln)
+        if m:
+            noise = int(m.group(1))
+            continue
+        m = re.search(r"channel active time:\s+(\d+)", ln)
+        if m:
+            active = int(m.group(1))
+            continue
+        m = re.search(r"channel busy time:\s+(\d+)", ln)
+        if m:
+            busy = int(m.group(1))
+    flush()
+    return result
+
+
+def set_nic_channel(nic, channel):
+    """Przestawia karte na kanal. Niektore wersje sterownika przyjmuja tylko
+    czestotliwosc, stad druga proba."""
+    code, out = run_tool("iw", "dev", nic, "set", "channel", str(channel), timeout=10)
+    if code == 0:
+        return True, ""
+    freq = channel_freq(channel)
+    if freq:
+        code, out = run_tool("iw", "dev", nic, "set", "freq", str(freq), timeout=10)
+    return code == 0, out.strip()
+
+
+def scan_channels(nic, channels, dwell=1.2, on_result=None):
+    """Przechodzi po kanalach i mierzy, ile sie na kazdym dzieje.
+
+    Dla kazdego kanalu: procent czasu, w ktorym pasmo bylo zajete przez cudze
+    transmisje, poziom szumu i ile obcych ramek wpadlo na karte. Liczniki
+    survey sa narastajace, wiec bierzemy roznice dwoch odczytow - inaczej
+    pierwszy kanal wygladalby na najbardziej zatloczony tylko dlatego, ze
+    karta siedziala na nim najdluzej.
+
+    UWAGA: przez caly skan karta jest poza kanalem linku, czyli polaczenia
+    nie ma. Kanal wyjsciowy przywraca wolajacy (patrz channel_scan_screen)."""
+    results = []
+    for channel in channels:
+        freq = channel_freq(channel)
+        entry = {"channel": channel, "freq": freq}
+        ok, err = set_nic_channel(nic, channel)
+        if not ok:
+            entry["error"] = err[:60] or "karta nie przyjmuje tego kanalu"
+        else:
+            before = iw_survey(nic).get(freq)
+            rx0 = nic_counters(nic)[0]
+            time.sleep(dwell)
+            after = iw_survey(nic).get(freq)
+            rx1 = nic_counters(nic)[0]
+
+            entry["pps"] = max(0.0, (rx1 - rx0) / dwell)
+            entry["noise"] = after[2] if after else None
+            if before and after and None not in (before[0], before[1], after[0], after[1]):
+                d_active = after[0] - before[0]
+                d_busy = after[1] - before[1]
+                if d_active > 0:
+                    entry["busy"] = min(100.0, 100.0 * d_busy / d_active)
+        results.append(entry)
+        if on_result:
+            on_result(entry)
+    return results
+
+
+def rank_channels(results):
+    """Od najlepszego: najmniej zajete pasmo, przy remisie nizszy szum, a na
+    koncu mniej obcych ramek."""
+    def key(r):
+        return (r["busy"] if r.get("busy") is not None else 999.0,
+                r["noise"] if r.get("noise") is not None else 0,
+                r.get("pps", 0.0))
+    return sorted([r for r in results if "error" not in r], key=key)
+
+
+# ------------------------- automatyczny dobor kanalu -------------------------
+
+# Port sterowania w tunelu wfb. Tryb automatyczny musi uzgadniac skoki
+# z druga strona, bo kanal MUSI byc po obu stronach ten sam - inaczej skok
+# to gwarantowana utrata linku, a nie jego ratowanie.
+AUTO_PORT = 14570
+# Kanaly 2.4 GHz maksymalnie od siebie oddalone (13 pierwszy, bo to nasz
+# domyslny). Uzywane, gdy nie bylo jeszcze skanu.
+AUTO_CANDIDATES = [13, 1, 6, 11]
+AUTO_BAD_LOSS = 5.0        # % strat, powyzej ktorych link uznajemy za zly
+AUTO_BAD_SECONDS = 8.0     # tyle musi byc zle, zeby ruszyc kanal
+AUTO_ACK_SECONDS = 3.0     # tyle czekamy na potwierdzenie od drugiej strony
+AUTO_SETTLE_SECONDS = 8.0  # tyle czekamy, az link wstanie na nowym kanale
+AUTO_SEARCH_DWELL = 4.0    # tyle nasluchujemy na kanale przy szukaniu drugiej strony
+
+
+def set_channel_live(channel):
+    """Przestawia wszystkie karty od razu, przez 'iw' - bez restartu uslugi.
+    Skok ma trwac milisekundy: wfb-ng nadaje i odbiera na tym, na czym akurat
+    stoi karta, wiec restart (kilka sekund ciszy) jest tu niepotrzebny."""
+    nics = wfb_nics()
+    return bool(nics) and all(set_nic_channel(nic, channel)[0] for nic in nics)
+
+
+def auto_candidates(scan_results, current, ranges=None):
+    """Kolejnosc, w ktorej probujemy kanalow: najpierw najciszsze ze skanu,
+    a bez skanu - rozsunieta czworka z 2.4 GHz. Odpadaja kanaly spoza domeny
+    regulacyjnej i ten, na ktorym wlasnie jestesmy."""
+    ranges = reg_domain_ranges()[1] if ranges is None else ranges
+    ranked = [r["channel"] for r in rank_channels(list(scan_results.values()))]
+    order = ranked + [c for c in AUTO_CANDIDATES if c not in ranked]
+    out = []
+    for channel in order:
+        if channel == current or channel in out:
+            continue
+        if channel_allowed(channel_freq(channel), ranges) is False:
+            continue
+        out.append(channel)
+    return out
+
+
+class AutoPeer:
+    """Uzgadnianie skokow kanalu z druga strona - male datagramy w tunelu wfb.
+
+    Nie szyfrujemy tego osobno: tunel jest juz szyfrowany kluczami wfb-ng,
+    a kto jest w srodku, ten i tak moze wiecej niz przestawic kanal."""
+
+    def __init__(self, port=AUTO_PORT, peer_ip=PEER_IP):
+        self.port = port
+        self.peer_ip = peer_ip
+        self.error = None
+        self._sock = None
+        self._lock = threading.Lock()
+        self._inbox = []
+        self._last_seen = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self.port))
+            self._sock.settimeout(0.2)
+        except OSError as e:
+            self.error = f"nie moge otworzyc portu {self.port}: {e}"
+            return self
+        self._thread.start()
+        return self
+
+    def close(self):
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def send(self, text):
+        if not self._sock:
+            return
+        try:
+            self._sock.sendto(text.encode(), (self.peer_ip, self.port))
+        except OSError:
+            pass  # tunel wlasnie nie dziala - o to w tym trybie chodzi
+
+    def take(self):
+        with self._lock:
+            msgs, self._inbox = self._inbox, []
+        return msgs
+
+    def peer_seen_ago(self):
+        with self._lock:
+            return time.monotonic() - self._last_seen if self._last_seen else None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                data, _addr = self._sock.recvfrom(512)
+            except (socket.timeout, OSError):
+                continue
+            text = data.decode("utf-8", "replace").strip()
+            with self._lock:
+                self._inbox.append(text)
+                self._last_seen = time.monotonic()
+                del self._inbox[32:]
+
+
+class AutoChannel:
+    """Automat trybu automatycznego: dostaje czas, stan linku i wiadomosci od
+    drugiej strony, a oddaje liste decyzji. Nie dotyka sam ani radia, ani
+    plikow - dzieki temu da sie go sprawdzic bez sprzetu, a przy skokach
+    kanalu pomylka kosztuje caly link.
+
+    Zasady, ktore z tego wynikaja:
+    - kanalu nie zmieniamy, dopoki link jest dobry;
+    - nie skaczemy bez potwierdzenia od drugiej strony (skok w ciemno to
+      pewna utrata lacznosci, a nie jej ratowanie);
+    - po skoku obie strony same wracaja na poprzedni kanal, jesli link nie
+      wstal - to ratuje sytuacje, gdy potwierdzenie doszlo, a dane juz nie;
+    - szuka tylko gs. Dron zostaje na swoim kanale, zeby bylo gdzie go
+      znalezc - gdyby szukaly obie strony, mijalyby sie w nieskonczonosc.
+
+    Decyzje to krotki: ("send", tekst), ("hop", kanal, powod),
+    ("persist", kanal), ("note", tekst)."""
+
+    def __init__(self, channel, candidates, role=ROLE, now=0.0):
+        self.channel = channel
+        self.candidates = list(candidates)
+        self.role = role
+        self.initiator = role == "gs"
+        self.state = "ok"
+        self.state_since = now
+        self.bad_since = None
+        self.prev_channel = None
+        self.target = None
+        self.tries = 0
+        self.search_order = []
+        self.search_idx = 0
+        self.blacklist = set()
+        self._waiting_noted = False
+
+    # --- pomocnicze ---
+
+    def _next_candidate(self):
+        for channel in self.candidates:
+            if channel != self.channel and channel not in self.blacklist:
+                return channel
+        self.blacklist.clear()  # wszystko juz probowane - zaczynamy od nowa
+        return next((c for c in self.candidates if c != self.channel), None)
+
+    def _hop(self, target, reason, now, out):
+        self.prev_channel = self.channel
+        self.channel = target
+        self.state, self.state_since = "settle", now
+        self.bad_since = None
+        out.append(("hop", target, reason))
+
+    # --- glowna logika ---
+
+    def tick(self, now, alive, loss, messages=()):
+        out = []
+        for text in messages:
+            self._on_message(text, now, out)
+
+        # Jesli wlasnie skoczylismy, to 'alive' opisuje jeszcze STARY kanal.
+        # Ocena na takim pomiarze konczyla sie "link wstal" tuz po skoku na
+        # martwy kanal - i automat nigdy nie wracal na dzialajacy.
+        if self.state == "settle" and self.state_since == now:
+            return out
+
+        bad = (not alive) or (loss is not None and loss >= AUTO_BAD_LOSS)
+
+        if self.state == "settle":
+            if alive:
+                self.state, self.state_since = "ok", now
+                out.append(("persist", self.channel))
+                out.append(("note", f"link wstal na kanale {self.channel}"))
+            elif now - self.state_since >= AUTO_SETTLE_SECONDS:
+                self.blacklist.add(self.channel)
+                back = self.prev_channel
+                self.channel = back
+                self.state, self.state_since = "ok", now
+                self.bad_since = now  # dalej jest zle, ale odliczamy od nowa
+                out.append(("hop", back, "brak linku po skoku - wracam"))
+            return out
+
+        if self.state == "propose":
+            if now - self.state_since >= AUTO_ACK_SECONDS:
+                self.state, self.state_since = "ok", now
+                self.bad_since = now
+                out.append(("note", "druga strona nie potwierdza - zostaje na "
+                                    f"kanale {self.channel}"))
+            elif self.tries < 6:
+                self.tries += 1
+                out.append(("send", f"SWITCH {self.target}"))
+            return out
+
+        if self.state == "search":
+            if alive:
+                self.state, self.state_since = "ok", now
+                out.append(("persist", self.channel))
+                out.append(("note", f"znalazlem druga strone na kanale {self.channel}"))
+            elif now - self.state_since >= AUTO_SEARCH_DWELL:
+                self.search_idx = (self.search_idx + 1) % max(1, len(self.search_order))
+                self.channel = self.search_order[self.search_idx]
+                self.state_since = now
+                out.append(("hop", self.channel, "szukam drugiej strony"))
+            return out
+
+        # stan "ok"
+        if not bad:
+            self.bad_since = None
+            self._waiting_noted = False
+            return out
+        if self.bad_since is None:
+            self.bad_since = now
+            out.append(("note", "link sie sypie - obserwuje"))
+            return out
+        if now - self.bad_since < AUTO_BAD_SECONDS:
+            return out
+
+        if not self.initiator:
+            if not self._waiting_noted:
+                self._waiting_noted = True
+                out.append(("note", "czekam na decyzje gs - dron kanalu nie zmienia"))
+            return out
+
+        target = self._next_candidate()
+        if target is None:
+            out.append(("note", "brak innego kanalu do sprobowania"))
+            self.bad_since = now
+            return out
+
+        if alive:
+            self.state, self.state_since = "propose", now
+            self.target, self.tries = target, 1
+            out.append(("send", f"SWITCH {target}"))
+            out.append(("note", f"proponuje drugiej stronie kanal {target}"))
+        else:
+            # Zupelna cisza - nie ma z kim sie umawiac, wiec obchodzimy kanaly
+            # i nasluchujemy. W obchodzie jest tez ten, na ktorym stoimy teraz:
+            # druga strona moze wrocic na niego w kazdej chwili.
+            self.search_order = [self.channel] + [c for c in self.candidates
+                                                  if c != self.channel]
+            self.search_idx = 1 % len(self.search_order)
+            self.state, self.state_since = "search", now
+            self.channel = self.search_order[self.search_idx]
+            out.append(("hop", self.channel, "brak lacznosci - szukam drugiej strony"))
+        return out
+
+    def _on_message(self, text, now, out):
+        parts = text.split()
+        if not parts:
+            return
+        if parts[0] == "SWITCH" and len(parts) > 1 and parts[1].isdigit():
+            target = int(parts[1])
+            out.append(("send", f"SWITCH-OK {target}"))
+            if target != self.channel:
+                self._hop(target, "prosba drugiej strony", now, out)
+        elif parts[0] == "SWITCH-OK" and self.state == "propose" and len(parts) > 1:
+            if parts[1].isdigit() and int(parts[1]) == self.target:
+                self._hop(self.target, "druga strona potwierdzila", now, out)
+        elif parts[0] == "HELLO":
+            out.append(("send", "HELLO-OK"))
+
+
 # ------------------------- instalacja (idempotentna) -------------------------
 
 def is_fully_installed():
@@ -1829,7 +2270,20 @@ def step_config():
     if not CFG_PATH.exists():
         CFG_PATH.write_text(build_config(DEFAULT_CHANNEL, DEFAULT_REGION))
     else:
-        log("    config juz istnieje, pomijam (edytuj przez menu ponizej)")
+        # Config juz jest (zwykle przynosi go pakiet wfb-ng, instalowany krok
+        # wczesniej) - nie deptamy go, ale MUSIMY dopisac to, czego w nim nie
+        # ma. Bez wifi_channel wfb-ng bierze swoja wartosc domyslna, czyli 161
+        # = 5805 MHz, i caly link wstaje na 5.8 GHz zamiast na 2.4 GHz.
+        log("    config juz istnieje, zostawiam (edytuj przez menu ponizej)")
+        has_channel, has_region = cfg_has_common()
+        if not has_channel:
+            set_cfg_option("common", "wifi_channel", DEFAULT_CHANNEL)
+            log(f"    dopisano brakujacy wifi_channel = {DEFAULT_CHANNEL}"
+                f" ({channel_freq(DEFAULT_CHANNEL)} MHz) - bez tego wfb-ng")
+            log("    uzylby swojego domyslnego kanalu 161, czyli 5.8 GHz")
+        if not has_region:
+            set_cfg_option("common", "wifi_region", f"'{DEFAULT_REGION}'")
+            log(f"    dopisano brakujacy wifi_region = '{DEFAULT_REGION}'")
 
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", f"wifibroadcast@{ROLE}"])
@@ -1886,6 +2340,17 @@ def detect_nics_startup():
         return nics
 
     release_nics_from_network_stack(nics)
+
+    channel, region = wfb_effective_common()
+    freq = channel_freq(channel)
+    log(f"    Radio: kanal {channel}" + (f" ({freq} MHz)" if freq else "") + f", region {region}")
+    source = channel_source_note(channel)
+    if source:
+        log(f"    UWAGA: {source}")
+    if freq and freq > 3000:
+        log(f"    UWAGA: link stoi na {freq / 1000:.1f} GHz, a ten skrypt jest pisany pod")
+        log(f"    2.4 GHz (kanal {DEFAULT_CHANNEL} = {channel_freq(DEFAULT_CHANNEL)} MHz).")
+        log("    Zmien w menu: 'Kanal i czestotliwosc' - i tak samo po drugiej stronie.")
 
     mode, code = key_mode()
     if mode == "sparowane":
@@ -1986,7 +2451,7 @@ def collect_checks():
         else:
             checks.append(("NetworkManager", "ok", "karty wfb sa unmanaged"))
 
-    cfg_channel = parse_common(CFG_PATH.read_text())[0] if CFG_PATH.exists() else None
+    cfg_channel = wfb_effective_common()[0] if CFG_PATH.exists() else None
     used_by_service = service_nics(set(nics))
     traffic = nic_traffic(nics) if nics else {}
 
@@ -2061,12 +2526,15 @@ def collect_checks():
         checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
 
     if CFG_PATH.exists():
-        ch, reg = parse_common(CFG_PATH.read_text())
+        ch, reg = wfb_effective_common()
         vtype = video_service_type()
         detail = f"kanal={ch} region={reg} rola={ROLE} wideo={vtype or '?'}"
+        source = channel_source_note(ch)
         if len(nics) > 1 and vtype == "udp_direct_tx":
             checks.append(("wifibroadcast.cfg", "fail",
                            detail + f" - ten tryb nie umie {len(nics)} kart, usluga bedzie sie wywalac"))
+        elif source:
+            checks.append(("wifibroadcast.cfg", "warn", detail + " - " + source))
         else:
             checks.append(("wifibroadcast.cfg", "ok", detail))
 
@@ -2229,11 +2697,16 @@ def config_overview_lines():
     row("druga strona", f"{PEER_IP}   (ping i ssh sprawdza weryfikacja)")
 
     section("Radio")
-    ch, reg = (parse_common(CFG_PATH.read_text()) if CFG_PATH.exists()
-               else (DEFAULT_CHANNEL, DEFAULT_REGION))
+    # to, czego wfb-ng NAPRAWDE uzywa - nie to, co u nas w pliku (brak wpisu
+    # oznacza kanal 161 z master.cfg, czyli 5.8 GHz, a nie nasze 13)
+    ch, reg = wfb_effective_common()
     freq = channel_freq(ch)
     span = channel_span(freq)
-    row("kanal", f"{ch}" + (f"   {freq} MHz, HT20 zajmuje {span[0]}-{span[1]} MHz" if freq else ""))
+    row("kanal", f"{ch}" + (f"   {freq} MHz, HT20 zajmuje {span[0]}-{span[1]} MHz" if freq else ""),
+        "warn" if freq and freq > 3000 else None)
+    source = channel_source_note(ch)
+    if source:
+        row("", source, "warn")
     country, ranges = reg_domain_ranges()
     in_band = bool(freq and ranges and any(lo <= span[0] and span[1] <= hi for lo, hi in ranges))
     row("region", f"{reg}   (w jadrze: {country or '?'})", "ok" if in_band else "warn")
@@ -2313,7 +2786,9 @@ def edit_config_screen(stdscr):
 
     cur_channel, cur_region = DEFAULT_CHANNEL, DEFAULT_REGION
     if CFG_PATH.exists():
-        cur_channel, cur_region = parse_common(CFG_PATH.read_text())
+        # wartosc podpowiadana w nawiasie ma byc TA, na ktorej link chodzi -
+        # inaczej samo wcisniecie Enter po cichu przestawiloby kanal
+        cur_channel, cur_region = wfb_effective_common()
     cur_tx_power = parse_tx_power()
 
     safe_addstr(stdscr, 2, 2, f"Puste pole = zostaw obecna wartosc (Enter). Rola jest stala: {ROLE}.")
@@ -2707,10 +3182,18 @@ def _stat_line(values, fmt="{:.1f}"):
             f"   max {fmt.format(max(values))}")
 
 
+# Cztery probki na sekunde. Statystyki z API wfb-ng przychodzia raz na sekunde,
+# wiec kolumny sygnalu potrafia sie powtorzyc kilka razy pod rzad - ale
+# liczniki kart i ping maja wlasne tempo, a przy szybkiej zmianie (obrot
+# anteny, przelot za przeszkoda) 4 Hz lapie to, co 1 Hz gubi.
+LOG_SAMPLE_HZ = 4
+LOG_SAMPLE_PERIOD = 1.0 / LOG_SAMPLE_HZ
+
+
 class TestRecorder:
     """Zapis przebiegu testu do pliku: naglowek z cala konfiguracja, potem
-    jeden wiersz na sekunde, na koniec podsumowanie. Plik zamyka sie z chwila
-    wyjscia z ekranu testu.
+    cztery wiersze na sekunde, na koniec podsumowanie. Plik zamyka sie
+    z chwila wyjscia z ekranu testu.
 
     Po co: przy sprawdzaniu zasiegu wyniku nie da sie ogladac na biezaco (jest
     sie kilkaset metrow od ekranu), a i tak trzeba go z czyms porownac - "przed"
@@ -2739,8 +3222,7 @@ class TestRecorder:
         return self
 
     def _header(self):
-        ch, reg = (parse_common(CFG_PATH.read_text()) if CFG_PATH.exists()
-                   else (DEFAULT_CHANNEL, DEFAULT_REGION))
+        ch, reg = wfb_effective_common()
         freq = channel_freq(ch)
         mode, code = key_mode()
         w = self._fh.write
@@ -2762,7 +3244,10 @@ class TestRecorder:
             main, extra = tx_modulation_txt(tx)
             w(f"# nadawanie {RADIO_PORT_NAMES.get(port, 'port ' + port)} (port {port}):"
               f" {main}   {extra}\n")
-        w(f"# druga strona: {PEER_NAME} {PEER_IP}\n#\n")
+        w(f"# druga strona: {PEER_NAME} {PEER_IP}\n")
+        w(f"# probkowanie: {LOG_SAMPLE_HZ} Hz (co {LOG_SAMPLE_PERIOD:.2f} s);"
+          " wfb-ng oddaje statystyki raz na sekunde,\n"
+          "#   wiec kolumny sygnalu powtarzaja sie miedzy jego aktualizacjami\n#\n")
         w(";".join(self.COLUMNS) + "\n")
         self._fh.flush()
 
@@ -2783,7 +3268,8 @@ class TestRecorder:
             return fmt.format(value) if value is not None else ""
 
         self._fh.write(";".join([
-            time.strftime("%H:%M:%S"), f"{elapsed:.0f}",
+            time.strftime("%H:%M:%S"), f"{elapsed:.2f}",  # przy 4 Hz sekundy
+                                                          # musza miec ulamek
             num(rssi, "{:.0f}"), num(snr, "{:.0f}"),
             num(metrics["mcs"], "{:.0f}"), num(metrics["bw"], "{:.0f}"), num(loss),
             f"{metrics['rx_pps']:.0f}", f"{mbit(metrics['rx_bytes']):.2f}",
@@ -2810,7 +3296,7 @@ class TestRecorder:
         w("#\n# --- podsumowanie ---\n")
         w(f"# koniec: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         w(f"# czas testu: {int(elapsed) // 60} min {int(elapsed) % 60} s"
-          f"   probek: {self.samples}\n")
+          f"   probek: {self.samples} ({LOG_SAMPLE_HZ} Hz)\n")
         w(f"# RSSI [dBm]:  {_stat_line(self._rssi, '{:.0f}')}\n")
         w(f"# straty [%]:  {_stat_line(self._loss)}\n")
         w(f"# ping [ms]:   {_stat_line(self._ping)}\n")
@@ -3081,7 +3567,7 @@ def link_test_screen(stdscr):
              ["Zapisywac przebieg tego testu do pliku?",
               "",
               f"Plik:  {path}",
-              "Jeden wiersz na sekunde: sygnal, straty, ping.",
+              f"{LOG_SAMPLE_HZ} wiersze na sekunde: sygnal, straty, ping.",
               "Zapis konczy sie w chwili wyjscia z ekranu testu."],
              buttons=("Tak", "Nie")) == 0:
         try:
@@ -3090,7 +3576,9 @@ def link_test_screen(stdscr):
             popup(stdscr, "Nie udalo sie otworzyc pliku", [str(e), "Test ruszy bez zapisu."],
                   status="fail")
 
-    stdscr.timeout(400)  # getch wraca po 0.4 s, wiec petla sama sie odswieza
+    # 0.2 s: petla musi krecic sie czesciej niz zapis do pliku (4 Hz), inaczej
+    # nie da sie utrzymac jego tempa
+    stdscr.timeout(200)
     stats = WfbStatsProbe().start()
     ping = PingProbe(PEER_IP).start()
 
@@ -3136,7 +3624,7 @@ def link_test_screen(stdscr):
                                     ping_snap, worst, elapsed)
 
             if recorder and now >= next_sample:
-                next_sample = now + 1.0
+                next_sample = now + LOG_SAMPLE_PERIOD
                 try:
                     recorder.sample(now - rec_started, metrics, ping_snap)
                 except OSError as e:
@@ -3188,7 +3676,7 @@ def link_test_screen(stdscr):
             recorder.close(worst, time.monotonic() - rec_started)
             popup(stdscr, "Zapis zakonczony",
                   [f"Plik:    {recorder.path}",
-                   f"Probek:  {recorder.samples}   (co sekunde)",
+                   f"Probek:  {recorder.samples}   ({LOG_SAMPLE_HZ} na sekunde)",
                    "",
                    f"Podglad:      less {recorder.path.name}",
                    f"Sciagniecie:  scp <user>@<ip>:{recorder.path} ."],
@@ -3198,6 +3686,394 @@ def link_test_screen(stdscr):
     elif rec_error:
         popup(stdscr, "Zapis przerwany", [rec_error, "Czesc probek moze byc w pliku:",
                                           str(path)], status="fail")
+
+
+def auto_channel_screen(stdscr, scanned):
+    """Tryb automatyczny: sam pilnuje, zeby link stal na dzialajacym kanale.
+
+    Dopoki jest dobrze, nie rusza niczego. Gdy straty rosna albo dane przestaja
+    plynac, uzgadnia z druga strona skok na nastepny kanal z listy (najciszsze
+    ze skanu na poczatku) i obie strony przeskakuja razem. Jesli po skoku link
+    nie wstanie, kazda strona sama wraca na poprzedni kanal - to ratuje sytuacje,
+    gdy potwierdzenie doszlo, a dane juz nie.
+
+    Zeby to dzialalo, ten ekran musi byc otwarty PO OBU STRONACH. Decyzje
+    podejmuje gs; dron je potwierdza i wykonuje, a przy zupelnej ciszy stoi na
+    swoim kanale, zeby bylo gdzie go szukac."""
+    nics = wfb_nics()
+    if not nics:
+        popup(stdscr, "Brak karty", ["wfb-nics nie zwraca zadnego interfejsu."], status="fail")
+        return
+
+    channel_txt, region = wfb_effective_common()
+    channel = int(channel_txt) if str(channel_txt).isdigit() else int(DEFAULT_CHANNEL)
+    candidates = auto_candidates(scanned, channel)
+
+    if popup(stdscr, "Tryb automatyczny",
+             ["Sam dobiera kanal, gdy link zaczyna sie sypac.",
+              "",
+              f"Kolejnosc prob: {', '.join(str(c) for c in candidates) or 'brak'}",
+              f"Reaguje po {AUTO_BAD_SECONDS:.0f} s strat powyzej {AUTO_BAD_LOSS:.0f}%.",
+              "",
+              "WAZNE: ten ekran musi byc otwarty po obu stronach - kanal",
+              "zmienia sie tylko po potwierdzeniu przez druga strone.",
+              "Bez potwierdzenia nic sie nie rusza."],
+             buttons=("Start", "Anuluj")) != 0:
+        return
+
+    peer = AutoPeer().start()
+    stats = WfbStatsProbe().start()
+    auto = AutoChannel(channel, candidates, now=time.monotonic())
+    events = []
+    hops = 0
+    started = time.monotonic()
+
+    def note(text, status=None):
+        events.insert(0, (time.strftime("%H:%M:%S"), text, status))
+        del events[10:]
+
+    if peer.error:
+        note(peer.error, "fail")
+
+    stdscr.timeout(500)
+    try:
+        while True:
+            now = time.monotonic()
+            metrics = link_metrics(stats.snapshot()[0], nics)
+            alive = metrics["rx_pps"] > 0
+            loss = metrics["loss"]
+
+            for action in auto.tick(now, alive, loss, peer.take()):
+                kind = action[0]
+                if kind == "send":
+                    peer.send(action[1])
+                elif kind == "note":
+                    note(action[1])
+                elif kind == "persist":
+                    save_common_config(str(action[1]), region)
+                    _common_cache["val"] = None
+                    note(f"kanal {action[1]} zapisany w configu", "ok")
+                elif kind == "hop":
+                    hops += 1
+                    ok = set_channel_live(action[1])
+                    note(f"kanal -> {action[1]} ({channel_freq(action[1])} MHz): {action[2]}"
+                         + ("" if ok else "   BLAD: karta nie przyjela kanalu"),
+                         "ok" if ok else "fail")
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - automatyczny dobor kanalu")
+
+            state_txt = {"ok": "pilnuje linku", "propose": "czekam na potwierdzenie",
+                         "settle": "sprawdzam, czy link wstal",
+                         "search": "szukam drugiej strony"}.get(auto.state, auto.state)
+            freq = channel_freq(auto.channel)
+            safe_addstr(stdscr, 2, 2, f"Kanal {auto.channel} ({freq} MHz)   {state_txt}",
+                        color_for("ok" if alive else "fail") | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2,
+                        f"Link: {'jest ruch' if alive else 'CISZA'}"
+                        + (f"   straty {loss:.1f}%" if loss is not None else "")
+                        + (f"   sygnal {metrics['best_rssi']:.0f} dBm"
+                           if metrics["best_rssi"] is not None else ""),
+                        color_for("ok" if alive and (loss or 0) < AUTO_BAD_LOSS else "warn"))
+
+            ago = peer.peer_seen_ago()
+            safe_addstr(stdscr, 4, 2,
+                        f"Druga strona ({PEER_NAME} {PEER_IP}): "
+                        + (f"odezwala sie {ago:.0f} s temu" if ago is not None
+                           else "jeszcze sie nie odezwala - czy tam tez wlaczony tryb auto?"),
+                        color_for("ok" if ago is not None and ago < 10 else "warn"))
+            safe_addstr(stdscr, 5, 2,
+                        f"Rola: {'decyduje' if auto.initiator else 'wykonuje polecenia gs'}"
+                        f"   skokow: {hops}   czas: {int(now - started) // 60:02d}:"
+                        f"{int(now - started) % 60:02d}")
+            safe_addstr(stdscr, 6, 2, "Kolejnosc prob: "
+                        + ", ".join(str(c) for c in auto.candidates)
+                        + (f"   odpadly: {', '.join(str(c) for c in sorted(auto.blacklist))}"
+                           if auto.blacklist else ""))
+
+            safe_addstr(stdscr, 8, 2, "Zdarzenia:", curses.A_BOLD)
+            for i, (stamp, text, status) in enumerate(events):
+                safe_addstr(stdscr, 9 + i, 4, f"{stamp}  {text}", color_for(status))
+
+            h, _ = stdscr.getmaxyx()
+            safe_addstr(stdscr, h - 1, 2, "q = wyjscie (kanal zostaje ten, na ktorym jestesmy)",
+                        curses.A_DIM)
+            stdscr.refresh()
+
+            if stdscr.getch() in (ord("q"), ord("Q"), 27):
+                break
+    finally:
+        peer.close()
+        stats.close()
+        stdscr.timeout(-1)
+        _nic_status_cache["val"] = None
+
+    if auto.channel != channel:
+        save_common_config(str(auto.channel), region)
+        _common_cache["val"] = None
+        popup(stdscr, "Tryb automatyczny zakonczony",
+              [f"Konczymy na kanale {auto.channel} ({channel_freq(auto.channel)} MHz).",
+               "Zapisany w configu, wiec przetrwa restart.",
+               "",
+               "Sprawdz, czy druga strona ma ten sam kanal."], status="ok")
+
+
+def channel_rows(scan_by_channel, current, ranges):
+    """Wiersze listy kanalow: numer, czestotliwosc, pasmo, czy legalny w tym
+    regionie i - po skanie - jak bardzo zajety."""
+    rows = [(None, "Automatycznie - sam dobiera kanal, gdy link sie sypie"
+                   "        (wymaga wlaczenia po obu stronach)", None, False)]
+    for channel in CHANNELS_24 + CHANNELS_5:
+        freq = channel_freq(channel)
+        allowed = channel_allowed(freq, ranges)
+        band = "2.4 GHz" if freq and freq < 3000 else "5 GHz"
+        text = f"{channel:>4}  {freq:>5} MHz  {band:<8}"
+        if allowed is False:
+            text += "poza domena  "
+            status = "fail"
+        else:
+            text += "             "
+            status = None
+
+        result = scan_by_channel.get(channel)
+        if result and "error" in result:
+            text += f"skan: {result['error']}"
+            status = status or "warn"
+        elif result:
+            busy = result.get("busy")
+            text += (f"zajete {busy:5.1f}%" if busy is not None else "zajete    ?  ")
+            if result.get("noise") is not None:
+                text += f"   szum {result['noise']:>4} dBm"
+            if result.get("pps"):
+                text += f"   obce ramki {result['pps']:.0f}/s"
+            if status is None and busy is not None:
+                status = "ok" if busy < 20 else ("warn" if busy < 50 else "fail")
+        rows.append((channel, text, status, channel == current))
+    return rows
+
+
+def channel_screen(stdscr):
+    """Wybor kanalu (czyli czestotliwosci) z podpowiedzia, ktory jest wolny.
+
+    Skan przechodzi po kanalach i mierzy przez 'iw survey', ile czasu pasmo
+    bylo zajete przez cudze transmisje - w trybie monitor to jedyny sposob,
+    bo zwyklego skanowania sieci karta w tym trybie nie zrobi.
+
+    Dwie rzeczy, o ktorych latwo zapomniec: przez caly skan karta jest poza
+    kanalem linku (czyli nie ma polaczenia), a po zmianie kanalu link wroci
+    dopiero wtedy, gdy ten sam kanal ustawi sie po DRUGIEJ stronie."""
+    nics = wfb_nics()
+    if not nics:
+        popup(stdscr, "Brak karty", ["wfb-nics nie zwraca zadnego interfejsu -",
+                                     "nie ma czym ani skanowac, ani nadawac."], status="fail")
+        return
+
+    nic = nics[0]
+    scanned = {}
+    ranges = reg_domain_ranges()[1]
+    channel, region = wfb_effective_common()
+    current = int(channel) if str(channel).isdigit() else None
+    rows = channel_rows(scanned, current, ranges)
+    idx = next((i for i, r in enumerate(rows) if r[3]), 0)
+    top = 0
+
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, f"WFB-NG [{ROLE}] - kanal i czestotliwosc")
+
+        freq = channel_freq(channel)
+        safe_addstr(stdscr, 2, 2, f"Teraz: kanal {channel}"
+                                  f"{f'  ({freq} MHz)' if freq else ''}   region {region}"
+                                  f"   karta {nic}", curses.A_BOLD)
+        note = channel_source_note(channel)
+        safe_addstr(stdscr, 3, 2, note if note else f"kanal wpisany w {CFG_PATH}",
+                    color_for("warn") if note else 0)
+
+        h, _ = stdscr.getmaxyx()
+        head, foot = 5, 4
+        view = max(3, h - head - foot)
+        top = max(0, min(top, len(rows) - view)) if len(rows) > view else 0
+        idx = max(0, min(idx, len(rows) - 1))
+        if idx < top:
+            top = idx
+        elif idx >= top + view:
+            top = idx - view + 1
+
+        for i, (_ch, text, status, is_current) in enumerate(rows[top:top + view]):
+            line = ("* " if is_current else "  ") + text
+            attr = curses.color_pair(5) if top + i == idx else (
+                color_for(status) if status else 0)
+            safe_addstr(stdscr, head + i, 2, line.ljust(76), attr)
+
+        best = rank_channels(list(scanned.values()))
+        if best:
+            b = best[0]
+            safe_addstr(stdscr, h - 3, 2,
+                        f"Najlepszy ze zmierzonych: kanal {b['channel']} ({b['freq']} MHz)"
+                        + (f", zajete {b['busy']:.1f}%" if b.get("busy") is not None else "")
+                        + "   [n] ustaw go",
+                        color_for("ok") | curses.A_BOLD)
+        else:
+            safe_addstr(stdscr, h - 3, 2, "* = kanal uzywany teraz. Skan zmierzy, "
+                                          "na ktorym kanale jest najciszej.", curses.A_DIM)
+        safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw zaznaczony, "
+                                      "s = skanuj, q = powrot", curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            idx -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx += 1
+        elif key == curses.KEY_NPAGE:
+            idx += view
+        elif key == curses.KEY_PPAGE:
+            idx -= view
+        elif key in (ord("q"), ord("Q"), 27):
+            return
+        elif key in (ord("s"), ord("S")):
+            scanned = channel_scan_screen(stdscr, nic, scanned)
+            channel, region = wfb_effective_common()
+            current = int(channel) if str(channel).isdigit() else None
+            rows = channel_rows(scanned, current, ranges)
+            best = rank_channels(list(scanned.values()))
+            if best:
+                idx = next((i for i, r in enumerate(rows) if r[0] == best[0]["channel"]), idx)
+        elif key in (10, 13, curses.KEY_ENTER, ord("n"), ord("N")):
+            if key in (ord("n"), ord("N")):
+                best = rank_channels(list(scanned.values()))
+                if not best:
+                    continue
+                target = best[0]["channel"]
+            else:
+                target = rows[idx][0]
+            if target is None:  # pierwsza pozycja listy - tryb automatyczny
+                auto_channel_screen(stdscr, scanned)
+                channel, region = wfb_effective_common()
+                current = int(channel) if str(channel).isdigit() else None
+                rows = channel_rows(scanned, current, ranges)
+                continue
+            if apply_channel(stdscr, target, region, ranges):
+                channel, region = wfb_effective_common()
+                current = int(channel) if str(channel).isdigit() else None
+                rows = channel_rows(scanned, current, ranges)
+
+
+def apply_channel(stdscr, channel, region, ranges):
+    """Zapisuje kanal, restartuje usluge i sprawdza, na czym karta faktycznie
+    stanela. Zwraca True, gdy cos zostalo zmienione."""
+    freq = channel_freq(channel)
+    allowed = channel_allowed(freq, ranges)
+    lines = [f"Ustawic kanal {channel} ({freq} MHz)?",
+             "",
+             "Kanal MUSI byc taki sam po obu stronach - dopoki nie ustawisz",
+             "tego samego na drugim urzadzeniu, linku NIE bedzie.",
+             f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana."]
+    if allowed is False:
+        lines.insert(1, f"UWAGA: {freq} MHz jest poza pasmem dozwolonym w tym regionie -")
+        lines.insert(2, "karta moze w ogole nie nadawac.")
+    if popup(stdscr, "Zmiana kanalu", lines, buttons=("Tak", "Nie")) != 0:
+        return False
+
+    if not CFG_PATH.exists():
+        CFG_PATH.write_text(build_config(str(channel), region))
+    else:
+        save_common_config(str(channel), region)
+    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+    time.sleep(3)
+    _common_cache["val"] = None
+    _nic_status_cache["val"] = None
+
+    effective = wfb_effective_common()[0]
+    on_card = [f"{n}: kanal {nic_details(n)['channel']}" for n in wfb_nics()]
+    if not service_active():
+        popup(stdscr, "Zapisano, ale usluga nie dziala",
+              [f"Status: {service_state_txt()}", "Ostatnie linie journala:"]
+              + [ln[:70] for ln in service_last_errors(4)], status="fail")
+    elif str(effective) != str(channel):
+        popup(stdscr, "Zapisano, ale wfb-ng widzi co innego",
+              [f"W configu {channel}, a wfb-ng uzywa {effective}.",
+               f"Sprawdz [common] w {CFG_PATH}."], status="warn")
+    else:
+        popup(stdscr, "Kanal ustawiony",
+              [f"Kanal {channel} ({freq} MHz)", "   ".join(on_card) or "brak kart",
+               "", "Pamietaj o tym samym kanale po drugiej stronie."], status="ok")
+    return True
+
+
+def channel_scan_screen(stdscr, nic, previous):
+    """Skan pasma z podgladem na zywo. Kanal wyjsciowy i usluga wracaja na
+    swoje miejsce w kazdym przypadku - takze gdy skan sie wysypie."""
+    choice = popup(stdscr, "Skanowanie kanalow",
+                   ["Ktore pasmo przeskanowac?",
+                    "",
+                    f"2.4 GHz to {len(CHANNELS_24)} kanalow (~{len(CHANNELS_24) * 2} s),",
+                    f"5 GHz - {len(CHANNELS_5)} kanalow bez DFS (~{len(CHANNELS_5) * 2} s).",
+                    "",
+                    "Przez caly skan karta jest poza kanalem linku, wiec obraz",
+                    "i telemetria znikna. Jesli laczysz sie po SSH przez tunel",
+                    "wfb, stracisz to polaczenie - skanuj z lokalnej konsoli."],
+                   buttons=("2.4 GHz", "5 GHz", "Oba", "Anuluj"), default=0)
+    channels = {0: CHANNELS_24, 1: CHANNELS_5, 2: CHANNELS_24 + CHANNELS_5}.get(choice)
+    if not channels:
+        return previous
+
+    before = nic_details(nic)["channel"]
+    results = dict(previous)
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - skanowanie kanalow")
+    safe_addstr(stdscr, 2, 2, f"Karta {nic}, kanalow: {len(channels)}. "
+                              "Nie przerywaj - na koncu wracam na kanal linku.",
+                curses.A_BOLD)
+    stdscr.refresh()
+
+    h, _ = stdscr.getmaxyx()
+    row_top = 4
+    done = [0]
+
+    def show(entry):
+        done[0] += 1
+        line = f"{entry['channel']:>4}  {entry['freq']:>5} MHz   "
+        if "error" in entry:
+            line += entry["error"]
+            status = "warn"
+        else:
+            busy = entry.get("busy")
+            line += (f"zajete {busy:5.1f}%" if busy is not None else "zajete    ?  ")
+            if entry.get("noise") is not None:
+                line += f"   szum {entry['noise']:>4} dBm"
+            status = ("ok" if busy is not None and busy < 20 else
+                      "warn" if busy is not None and busy < 50 else "fail")
+        y = row_top + (done[0] - 1) % max(1, h - row_top - 2)
+        safe_addstr(stdscr, y, 4, line.ljust(70), color_for(status))
+        safe_addstr(stdscr, h - 1, 2, f"{done[0]}/{len(channels)} kanalow...", curses.A_DIM)
+        stdscr.refresh()
+
+    try:
+        for entry in scan_channels(nic, channels, on_result=show):
+            results[entry["channel"]] = entry
+    finally:
+        # zawsze, nawet po bledzie: karta na swoj kanal, usluga od nowa -
+        # inaczej link zostaje na przypadkowej czestotliwosci
+        if before and before.isdigit():
+            set_nic_channel(nic, int(before))
+        run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+        time.sleep(2)
+        _nic_status_cache["val"] = None
+
+    best = rank_channels(list(results.values()))
+    lines = [f"Przeskanowano {len(channels)} kanalow.", ""]
+    for entry in best[:5]:
+        lines.append(f"kanal {entry['channel']:>4} ({entry['freq']} MHz):"
+                     + (f"  zajete {entry['busy']:.1f}%" if entry.get("busy") is not None
+                        else "  zajete ?")
+                     + (f"  szum {entry['noise']} dBm" if entry.get("noise") is not None else ""))
+    if not best:
+        lines.append("Karta nie oddala zadnych pomiarow (brak 'iw survey'?).")
+    else:
+        lines += ["", "Klawisz [n] na liscie ustawia najlepszy kanal."]
+    popup(stdscr, "Wynik skanowania", lines, status="ok" if best else "warn")
+    return results
 
 
 def live_mcs_txt(live):
@@ -3378,6 +4254,7 @@ def main_menu(stdscr):
         "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
+        "Kanal i czestotliwosc (skan pasma)",
         "Wybor modulacji (MCS)",
         "Uruchom weryfikacje",
         "Wyjdz",
@@ -3422,10 +4299,12 @@ def main_menu(stdscr):
             elif idx == 5:
                 link_test_screen(stdscr)
             elif idx == 6:
-                modulation_screen(stdscr)
+                channel_screen(stdscr)
             elif idx == 7:
-                verification_screen(stdscr)
+                modulation_screen(stdscr)
             elif idx == 8:
+                verification_screen(stdscr)
+            elif idx == 9:
                 break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
