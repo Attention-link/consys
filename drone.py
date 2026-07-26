@@ -2781,78 +2781,66 @@ def prompt_line(stdscr, y, label, default):
     return raw if raw else default
 
 
-def edit_config_screen(stdscr):
+def radio_settings_screen(stdscr):
+    """Region i moc nadawania. Kanalu sie tu NIE ustawia - jest od tego osobny
+    ekran ze skanem pasma i trybem automatycznym. Dwa miejsca do zmiany tej
+    samej rzeczy to prosta droga do tego, ze jedno pokazuje co innego niz
+    drugie. Ekran otwiera sie z listy kanalow klawiszem 'r'."""
     stdscr.clear()
-    draw_header(stdscr, f"WFB-NG [{ROLE}] - zmiana konfiguracji")
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - region i moc nadawania")
 
-    cur_channel, cur_region = DEFAULT_CHANNEL, DEFAULT_REGION
-    if CFG_PATH.exists():
-        # wartosc podpowiadana w nawiasie ma byc TA, na ktorej link chodzi -
-        # inaczej samo wcisniecie Enter po cichu przestawiloby kanal
-        cur_channel, cur_region = wfb_effective_common()
+    channel, cur_region = wfb_effective_common()
     cur_tx_power = parse_tx_power()
+    freq = channel_freq(channel)
 
-    safe_addstr(stdscr, 2, 2, f"Puste pole = zostaw obecna wartosc (Enter). Rola jest stala: {ROLE}.")
+    safe_addstr(stdscr, 2, 2, f"Puste pole = zostaw obecna wartosc (Enter). Rola: {ROLE}.")
+    safe_addstr(stdscr, 3, 2, f"Kanal {channel}" + (f" ({freq} MHz)" if freq else "")
+                + " zmienisz w ekranie 'Kanal i czestotliwosc'.", curses.A_DIM)
 
-    channel = ""
-    while not channel.isdigit():
-        channel = prompt_line(stdscr, 4, "Kanal WiFi", cur_channel)
-        if not channel.isdigit():
-            safe_addstr(stdscr, 5, 2, "Kanal musi byc liczba.", color_for("fail"))
-
-    region = prompt_line(stdscr, 7, "Region (CRDA)", cur_region)
+    region = prompt_line(stdscr, 5, "Region (CRDA)", cur_region)
 
     tx_power = ""
     while not (tx_power.isdigit() and 0 <= int(tx_power) <= 63):
-        tx_power = prompt_line(stdscr, 9, "Moc nadawania TX (0-63, 63=max)", cur_tx_power)
+        tx_power = prompt_line(stdscr, 7, "Moc nadawania TX (0-63, 63=max)", cur_tx_power)
         if not (tx_power.isdigit() and 0 <= int(tx_power) <= 63):
-            safe_addstr(stdscr, 10, 2, "Podaj liczbe 0-63 (0 = wylaczone, uzyj kalibracji EEPROM).",
+            safe_addstr(stdscr, 8, 2, "Podaj liczbe 0-63 (0 = wylaczone, uzyj kalibracji EEPROM).",
                         color_for("fail"))
 
-    freq = channel_freq(channel)
     country, ranges = reg_domain_ranges()
     span = channel_span(freq)
-    band = f" ({freq} MHz, HT20: {span[0]}-{span[1]})" if freq else ""
-    safe_addstr(stdscr, 12, 2,
-                f"Nowy kanal: {channel}{band}   region: {region}   moc TX: {tx_power}/63")
-
+    lines = [f"Region: {region}   moc TX: {tx_power}/63",
+             f"Kanal zostaje: {channel}" + (f" ({freq} MHz)" if freq else ""),
+             ""]
     # Kanal spoza pasma dozwolonego w regionie = karta w ogole nie nadaje,
     # a wyglada zdrowo. Lepiej powiedziec to PRZED zapisem niz szukac potem.
-    if freq and ranges and not any(lo <= span[0] and span[1] <= hi for lo, hi in ranges):
-        note = f"UWAGA: {span[0]}-{span[1]} MHz nie miesci sie w domenie {country}"
+    if span and ranges and not any(lo <= span[0] and span[1] <= hi for lo, hi in ranges):
+        lines.append(f"UWAGA: {span[0]}-{span[1]} MHz nie miesci sie w domenie {country}")
         if region != country:
-            note += f" (zapisujesz {region} - sprawdz po restarcie w weryfikacji)"
-        safe_addstr(stdscr, 13, 2, note[:110], color_for("warn"))
+            lines.append(f"(zapisujesz {region} - sprawdz potem w weryfikacji)")
+        lines.append("")
+    lines.append(f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana.")
 
-    safe_addstr(stdscr, 14, 2, "Zapisac i zrestartowac usluge? [t/N]: ")
-    stdscr.refresh()
-    curses.echo()
-    curses.curs_set(1)
-    ans = stdscr.getstr(14, 38, 5).decode().strip().lower()
-    curses.noecho()
-    curses.curs_set(0)
-
-    if ans != "t":
-        safe_addstr(stdscr, 16, 2, "Anulowano.", color_for("warn"))
-        pause(stdscr)
+    if popup(stdscr, "Zapisac?", lines, buttons=("Tak", "Nie")) != 0:
         return
 
     save_common_config(channel, region)
     write_modprobe_wfb(tx_power)
     live_ok = apply_tx_power_live(tx_power)
     ensure_video_service_type(wfb_nics())  # gdyby config byl jeszcze sprzed migracji
+    _common_cache["val"] = None
     run(["systemctl", "daemon-reload"])
     code2, out2 = run(["systemctl", "enable", "--now", f"wifibroadcast@{ROLE}"])
     code3, out3 = run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
 
     if code2 == 0 and code3 == 0:
-        safe_addstr(stdscr, 16, 2, f"Zapisano, wifibroadcast@{ROLE} uruchomiona.", color_for("ok"))
-        tx_note = "moc zastosowana natychmiast" if live_ok else "moc zapisana, zadziala po nast. zaladowaniu modulu"
-        safe_addstr(stdscr, 17, 2, tx_note, color_for("ok" if live_ok else "warn"))
+        popup(stdscr, "Zapisano",
+              [f"wifibroadcast@{ROLE} uruchomiona.",
+               "moc zastosowana natychmiast" if live_ok
+               else "moc zapisana, zadziala po nast. zaladowaniu modulu"],
+              status="ok" if live_ok else "warn")
     else:
-        safe_addstr(stdscr, 16, 2, "Zapisano, ale usluga zglosila blad:", color_for("fail"))
-        safe_addstr(stdscr, 17, 2, (out2 + " " + out3)[:100])
-    pause(stdscr)
+        popup(stdscr, "Zapisano, ale usluga zglosila blad",
+              [(out2 + " " + out3)[:70]], status="fail")
 
 
 def show_pairing_code_screen(stdscr, code):
@@ -3917,8 +3905,8 @@ def channel_screen(stdscr):
         else:
             safe_addstr(stdscr, h - 3, 2, "* = kanal uzywany teraz. Skan zmierzy, "
                                           "na ktorym kanale jest najciszej.", curses.A_DIM)
-        safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw zaznaczony, "
-                                      "s = skanuj, q = powrot", curses.A_DIM)
+        safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw zaznaczony, s = skanuj, "
+                                      "r = region i moc TX, q = powrot", curses.A_DIM)
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -3932,6 +3920,12 @@ def channel_screen(stdscr):
             idx -= view
         elif key in (ord("q"), ord("Q"), 27):
             return
+        elif key in (ord("r"), ord("R")):
+            radio_settings_screen(stdscr)
+            channel, region = wfb_effective_common()
+            ranges = reg_domain_ranges()[1]
+            current = int(channel) if str(channel).isdigit() else None
+            rows = channel_rows(scanned, current, ranges)
         elif key in (ord("s"), ord("S")):
             scanned = channel_scan_screen(stdscr, nic, scanned)
             channel, region = wfb_effective_common()
@@ -4250,12 +4244,11 @@ def main_menu(stdscr):
 
     items = [
         "Pokaz biezaca konfiguracje",
-        "Zmien kanal / region i zapisz",
         "Wykryj karty ponownie (naprawa)",
         "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
-        "Kanal i czestotliwosc (skan pasma)",
+        "Kanal i czestotliwosc (skan, tryb auto)",
         "Wybor modulacji (MCS)",
         "Uruchom weryfikacje",
         "Wyjdz",
@@ -4290,22 +4283,20 @@ def main_menu(stdscr):
             if idx == 0:
                 show_config_screen(stdscr)
             elif idx == 1:
-                edit_config_screen(stdscr)
-            elif idx == 2:
                 redetect_screen(stdscr)
-            elif idx == 3:
+            elif idx == 2:
                 nic_identify_screen(stdscr)
-            elif idx == 4:
+            elif idx == 3:
                 keys_screen(stdscr)
-            elif idx == 5:
+            elif idx == 4:
                 link_test_screen(stdscr)
-            elif idx == 6:
+            elif idx == 5:
                 channel_screen(stdscr)
-            elif idx == 7:
+            elif idx == 6:
                 modulation_screen(stdscr)
-            elif idx == 8:
+            elif idx == 7:
                 verification_screen(stdscr)
-            elif idx == 9:
+            elif idx == 8:
                 break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
