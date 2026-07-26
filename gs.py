@@ -64,7 +64,10 @@ TX_POWER_SYSFS = Path("/sys/module/88XXau_wfb/parameters/rtw_tx_pwr_idx_override
 CFG_PATH = Path("/etc/wifibroadcast.cfg")
 DRONE_KEY = Path("/etc/drone.key")
 GS_KEY = Path("/etc/gs.key")
-TEST_LOG_DIR = Path("/var/log/wfb-testy")  # zapisy z ekranu "Test polaczenia"
+# Zapisy z ekranu "Test polaczenia" laduja obok skryptu - tam, gdzie uzytkownik
+# go wgral i skad go uruchamia, wiec plik widac zwyklym 'ls' zaraz po wyjsciu
+# z testu. Katalog skryptu, a nie biezacy, bo sudo bywa wolane z innego miejsca.
+TEST_LOG_DIR = Path(__file__).resolve().parent
 REBOOT_MARKER = Path("/etc/.wfb-gs-reboot-attempted")
 
 # Zamiast wlanX (numer zalezy od kolejnosci wykrycia i potrafi sie zmienic
@@ -519,6 +522,21 @@ def set_cfg_option(section, key, value_txt):
     CFG_PATH.write_text(txt[:start] + body + txt[end:])
 
 
+def get_cfg_option(section, key):
+    """Wartosc klucza z sekcji albo None. Wycina sekcje dokladnie tak samo jak
+    set_cfg_option/drop_cfg_option, wiec czyta to, co same zapisuja."""
+    if not CFG_PATH.exists():
+        return None
+    txt = CFG_PATH.read_text()
+    start = txt.find(f"[{section}]")
+    if start == -1:
+        return None
+    end = txt.find("\n[", start + 1)
+    body = txt[start:len(txt) if end == -1 else end]
+    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.+?)\s*$", body, re.M)
+    return m.group(1) if m else None
+
+
 def drop_cfg_option(section, key):
     """Usuwa klucz z sekcji - sprzata po wpisie, ktory i tak nic nie robil."""
     txt = CFG_PATH.read_text()
@@ -809,9 +827,179 @@ def rx_loss_pct(msg):
     return (100.0 * lost / total) if total else None
 
 
+# 802.11n, jeden strumien przestrzenny: modulacja, sprawnosc kodowania i
+# predkosc PHY w Mbit/s dla 20 i 40 MHz przy dlugim i krotkim odstepie
+# ochronnym (GI). Im wyzszy MCS, tym gestsza modulacja: wiecej Mbit/s, ale
+# potrzeba mocniejszego sygnalu - stad ma sens ogladanie tego obok RSSI.
+MCS_TABLE = {
+    0: ("BPSK", "1/2", 6.5, 7.2, 13.5, 15.0),
+    1: ("QPSK", "1/2", 13.0, 14.4, 27.0, 30.0),
+    2: ("QPSK", "3/4", 19.5, 21.7, 40.5, 45.0),
+    3: ("16-QAM", "1/2", 26.0, 28.9, 54.0, 60.0),
+    4: ("16-QAM", "3/4", 39.0, 43.3, 81.0, 90.0),
+    5: ("64-QAM", "2/3", 52.0, 57.8, 108.0, 120.0),
+    6: ("64-QAM", "3/4", 58.5, 65.0, 121.5, 135.0),
+    7: ("64-QAM", "5/6", 65.0, 72.2, 135.0, 150.0),
+}
+
+
+def bw_mhz(value, default=20):
+    """Szerokosc kanalu w MHz. Nowsze wfb-ng podaje ja wprost, starsze surowym
+    kodem z radiotapu (0 = 20 MHz, 1 = 40 MHz, 2/3 = polowki 40 MHz). Napisy
+    tez sa w porzadku - z linii polecen wfb_tx wszystko przychodzi tekstem."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    if v >= 20:
+        return v
+    return 40 if v == 1 else 20
+
+
+def mcs_info(mcs, bandwidth=20, short_gi=False):
+    """(opis modulacji, predkosc PHY w Mbit/s). MCS 8-15 to te same modulacje
+    puszczone dwoma strumieniami przestrzennymi - wtedy predkosc sie podwaja."""
+    if mcs is None:
+        return "?", None
+    try:
+        mcs = int(mcs)
+    except (TypeError, ValueError):
+        return "?", None
+    entry = MCS_TABLE.get(mcs % 8)
+    if entry is None or mcs < 0:
+        return f"MCS {mcs}", None
+    mod, coding, r20, r20s, r40, r40s = entry
+    streams = mcs // 8 + 1
+    rate = ((r40s if short_gi else r40) if bw_mhz(bandwidth) >= 40
+            else (r20s if short_gi else r20))
+    desc = f"MCS {mcs} = {mod} {coding}"
+    if streams > 1:
+        desc += f" x{streams} strumienie"
+    return desc, rate * streams
+
+
+_tx_params_cache = {"t": 0.0, "val": None}
+
+
+def tx_radio_params(max_age=5.0):
+    """Parametry nadawania odczytane z linii polecen dzialajacych wfb_tx -
+    czyli czym NAPRAWDE nadajemy w tej chwili. Config moglby klamac: zmiana
+    w pliku dziala dopiero po restarcie uslugi. wfb_tx dostaje je flagami:
+    -M mcs, -B szerokosc, -G odstep ochronny, -S STBC, -L LDPC, -k/-n FEC,
+    -p port radiowy. Wynik cache'owany, bo przejscie po calym /proc jest
+    zbyt drogie na kazde przerysowanie ekranu."""
+    now = time.monotonic()
+    if _tx_params_cache["val"] is not None and now - _tx_params_cache["t"] < max_age:
+        return _tx_params_cache["val"]
+
+    flags = {"-M": "mcs", "-B": "bw", "-G": "gi", "-S": "stbc", "-L": "ldpc",
+             "-k": "fec_k", "-n": "fec_n", "-p": "port"}
+    out = []
+    for args in proc_cmdlines():
+        if not any("wfb_tx" in a for a in args[:2]):
+            continue
+        info = {}
+        for flag, name in flags.items():
+            if flag in args:
+                idx = args.index(flag)
+                if idx + 1 < len(args):
+                    info[name] = args[idx + 1]
+        if info:
+            out.append(info)
+    out.sort(key=lambda i: i.get("port", ""))
+    _tx_params_cache.update(t=now, val=out)
+    return out
+
+
+# Domyslne numery portow radiowych wfb-ng - sluza tylko do podpisania wiersza,
+# sam numer i tak jest obok.
+RADIO_PORT_NAMES = {"0": "video", "1": "mavlink", "2": "tunnel"}
+
+# Krotkie podpisy przy skrajnych i srodkowym MCS - reszta ustawia sie miedzy
+# nimi, nie ma po co powtarzac tego przy kazdym wierszu.
+MCS_HINTS = {
+    0: "najwiekszy zasieg, najmniej danych",
+    3: "kompromis zasieg / przepustowosc",
+    7: "najwiecej danych, najmniejszy zasieg",
+}
+
+
+def mcs_config_sections():
+    """{strumien: sekcja configu}, w ktorej ustawiamy mcs_index - tylko dla
+    strumieni, ktore ta rola NADAJE (na gs wideo jest tylko odbierane, wiec
+    ustawianie mu modulacji nic by nie dalo).
+
+    Bierzemy najbardziej szczegolowy profil strumienia (ostatni na liscie
+    'profiles'), bo ten wygrywa przy scalaniu ustawien przez wfb-ng. Gdy
+    wfb-ng nie odpowiada, wracamy do domyslnych nazw <rola>_<strumien>."""
+    out = {}
+    for s in wfb_streams() or []:
+        name, profiles = s.get("name"), s.get("profiles") or []
+        if not name or not profiles:
+            continue
+        if "stream_tx" in s and s.get("stream_tx") is None:
+            continue  # strumien tylko odbierany
+        out[name] = profiles[-1]
+    return out or {n: f"{ROLE}_{n}" for n in ("video", "mavlink", "tunnel")}
+
+
+def current_mcs_setting(sections):
+    """MCS wpisany przez nas do configu albo None, czyli "automatycznie".
+    None takze wtedy, gdy sekcje maja rozne wartosci - wtedy zadna nie opisuje
+    calosci, a i tak obok pokazujemy, czym naprawde nadaje wfb_tx."""
+    values = {get_cfg_option(section, "mcs_index") for section in set(sections.values())}
+    if len(values) != 1:
+        return None
+    value = values.pop()
+    return int(value) if value and value.isdigit() else None
+
+
+def apply_mcs_setting(mcs, sections):
+    """Zapisuje mcs_index we wszystkich nadawanych strumieniach albo - w trybie
+    automatycznym - kasuje nasz wpis, zeby zostalo to, co ustawia sam wfb-ng.
+    Zwraca liste ruszonych sekcji."""
+    if not CFG_PATH.exists():
+        return []
+    backup_config_once()
+    changed = []
+    for section in sorted(set(sections.values())):
+        if mcs is None:
+            if drop_cfg_option(section, "mcs_index"):
+                changed.append(section)
+        else:
+            set_cfg_option(section, "mcs_index", str(mcs))
+            changed.append(section)
+    return changed
+
+
+def tx_modulation_txt(tx):
+    """Opis nadawania z wpisu tx_radio_params(), rozbity na dwa kawalki: sama
+    modulacja i ustawienia kodowania. Ekran pokazuje je w dwoch wierszach, bo
+    w jednym nie mieszcza sie na 80 kolumnach; plik zapisu je skleja."""
+    short_gi = str(tx.get("gi", "")).lower().startswith("s")
+    desc, rate = mcs_info(tx.get("mcs"), tx.get("bw"), short_gi)
+    main = f"{desc}   {bw_mhz(tx.get('bw'))} MHz   GI {'krotki' if short_gi else 'dlugi'}"
+    extra = f"STBC {tx.get('stbc', '?')}  LDPC {tx.get('ldpc', '?')}"
+
+    k, n = tx.get("fec_k"), tx.get("fec_n")
+    if k and n:
+        extra += f"   FEC {k}/{n}"
+        try:
+            # z kazdych n wyslanych pakietow k niesie dane - reszta to
+            # nadmiarowosc, ktora ratuje transmisje, ale zjada pasmo
+            if rate:
+                extra += f"  ->  ~{rate * int(k) / int(n):.1f} Mbit/s uzytecznych"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    elif rate:
+        extra += f"   ~{rate:.1f} Mbit/s (PHY)"
+    return main, extra
+
+
 def antenna_rows(msg, nics):
-    """[(etykieta, pakiety/s, (rssi min,sr,max), (snr min,sr,max), MHz)] z
-    jednej wiadomosci 'rx'.
+    """Statystyki kazdej anteny z jednej wiadomosci 'rx' jako slowniki:
+    etykieta, pakiety/s, RSSI i SNR (min, sr, max), czestotliwosc, MCS
+    i szerokosc kanalu.
 
     Kluczem statystyk anteny jest u wfb-ng krotka (czestotliwosc, MCS,
     szerokosc, id anteny), w starszych wersjach samo id. Id koduje karte
@@ -827,14 +1015,19 @@ def antenna_rows(msg, nics):
         nums = [_num(x) for x in _flatten(key)]
         ant_id = int(nums[-1]) if nums else 0
         freq = int(nums[0]) if nums and nums[0] > 1000 else None
+        # (czestotliwosc, MCS, szerokosc, id) - MCS i szerokosc tylko wtedy,
+        # gdy klucz naprawde ma cztery pola; starsze wersje daja samo id
+        mcs = int(nums[1]) if len(nums) >= 4 else None
+        bw = bw_mhz(nums[2]) if len(nums) >= 4 else None
         val = list(val) if isinstance(val, (list, tuple)) else [val]
         count = _num(val[0]) if val else 0
         rssi = tuple(_num(x) for x in val[1:4]) if len(val) >= 4 else None
         snr = tuple(_num(x) for x in val[4:7]) if len(val) >= 7 else None
         idx, ant = ant_id >> 8, ant_id & 0xFF
         label = nics[idx] if 0 <= idx < len(nics) else f"karta{idx}"
-        rows.append((f"{label} ant{ant}", count, rssi, snr, freq))
-    rows.sort(key=lambda r: r[0])
+        rows.append({"label": f"{label} ant{ant}", "count": count, "rssi": rssi,
+                     "snr": snr, "freq": freq, "mcs": mcs, "bw": bw})
+    rows.sort(key=lambda r: r["label"])
     return rows
 
 
@@ -2449,16 +2642,25 @@ def nic_identify_screen(stdscr):
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
 
 
-def popup(stdscr, title, lines, question=None, status=None):
-    """Okienko na srodku ekranu. Bez 'question' tylko informuje (dowolny
-    klawisz zamyka), z 'question' pyta i zwraca True dla 't'. Rysowane wprost
-    po stdscr, jak reszta tego TUI - podokien nie uzywamy nigdzie indziej,
-    a tresc pod spodem i tak zaraz zostanie przerysowana."""
-    body = list(lines) + ([""] if question else []) + [question or "dowolny klawisz = zamknij"]
+def popup(stdscr, title, lines, buttons=("OK",), status=None, default=0):
+    """Okienko na srodku ekranu z przyciskami na dole. Wybor strzalkami
+    lewo/prawo, Enter zatwierdza, pierwsza litera przycisku dziala jak skrot,
+    Esc zawsze wybiera ostatni przycisk (czyli "Nie"). Przy jednym przycisku
+    okienko tylko informuje i zamyka sie dowolnym klawiszem. Zwraca indeks
+    wybranego przycisku.
+
+    Rysowane wprost po stdscr, jak reszta tego TUI - podokien nie uzywamy
+    nigdzie indziej, a to co pod spodem i tak zaraz zostanie przerysowane."""
+    labels = [f"[ {b} ]" for b in buttons]
+    bar = "   ".join(labels)
+    body = list(lines) + ["", " " * len(bar)]  # ostatni wiersz zajmuja przyciski
     h, w = stdscr.getmaxyx()
     inner = min(max(len(s) for s in [title] + body) + 2, max(8, w - 4))
     left = max(0, (w - inner - 2) // 2)
     top = max(0, (h - (len(body) + 4)) // 2)
+    bar_y = top + 2 + len(body)
+    bar_x = left + 1 + max(0, (inner - len(bar)) // 2)
+    sel = default
 
     def frame(y):
         safe_addstr(stdscr, y, left, "+" + "-" * inner + "+", curses.A_BOLD)
@@ -2466,16 +2668,36 @@ def popup(stdscr, title, lines, question=None, status=None):
     def line(y, text, attr=0):
         safe_addstr(stdscr, y, left, "|" + text[:inner].ljust(inner) + "|", attr)
 
-    frame(top)
-    line(top + 1, " " + title, (color_for(status) if status else 0) | curses.A_BOLD)
-    line(top + 2, "")
-    for i, text in enumerate(body):
-        line(top + 3 + i, " " + text)
-    frame(top + 3 + len(body))
-    stdscr.refresh()
+    while True:
+        frame(top)
+        line(top + 1, " " + title, (color_for(status) if status else 0) | curses.A_BOLD)
+        line(top + 2, "")
+        for i, text in enumerate(body):
+            line(top + 3 + i, " " + text)
+        frame(top + 3 + len(body))
 
-    key = stdscr.getch()
-    return key in (ord("t"), ord("T"), ord("y"), ord("Y")) if question else None
+        x = bar_x
+        for i, label in enumerate(labels):
+            safe_addstr(stdscr, bar_y, x, label,
+                        curses.color_pair(5) | curses.A_BOLD if i == sel else curses.A_BOLD)
+            x += len(label) + 3
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == curses.KEY_LEFT:
+            sel = (sel - 1) % len(labels)
+        elif key in (curses.KEY_RIGHT, 9):  # 9 = Tab
+            sel = (sel + 1) % len(labels)
+        elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+            return sel
+        elif key == 27:
+            return len(labels) - 1
+        else:
+            for i, name in enumerate(buttons):
+                if name and key in (ord(name[0].lower()), ord(name[0].upper())):
+                    return i
+            if len(labels) == 1:
+                return 0
 
 
 def _stat_line(values, fmt="{:.1f}"):
@@ -2495,9 +2717,9 @@ class TestRecorder:
     i "po" przestawieniu anteny albo zmianie kanalu. Wiersze sa rozdzielone
     srednikami, wiec plik otwiera sie tez w arkuszu."""
 
-    COLUMNS = ("czas", "sek", "rssi_best_dBm", "snr_best_dB", "straty_%", "rx_pkt_s",
-               "rx_Mbit_s", "fec_naprawil_s", "utracone_s", "ping_ms", "ping_utrata_%",
-               "anteny_rssi")
+    COLUMNS = ("czas", "sek", "rssi_best_dBm", "snr_best_dB", "rx_mcs", "rx_bw_MHz",
+               "straty_%", "rx_pkt_s", "rx_Mbit_s", "fec_naprawil_s", "utracone_s",
+               "ping_ms", "ping_utrata_%", "anteny_rssi")
 
     def __init__(self, path):
         self.path = path
@@ -2506,6 +2728,7 @@ class TestRecorder:
         self._rssi = []
         self._loss = []
         self._ping = []
+        self._mcs = {}
 
     def open(self):
         """Moze rzucic OSError - wolajacy pokazuje to w okienku i test idzie
@@ -2534,6 +2757,11 @@ class TestRecorder:
             d = nic_details(nic)
             w(f"# karta {nic}: mac={d['mac']} usb={d['usb']} tryb={d['mode']}"
               f" kanal={d['channel']}\n")
+        for tx in tx_radio_params():
+            port = str(tx.get("port", "?"))
+            main, extra = tx_modulation_txt(tx)
+            w(f"# nadawanie {RADIO_PORT_NAMES.get(port, 'port ' + port)} (port {port}):"
+              f" {main}   {extra}\n")
         w(f"# druga strona: {PEER_NAME} {PEER_IP}\n#\n")
         w(";".join(self.COLUMNS) + "\n")
         self._fh.flush()
@@ -2548,15 +2776,16 @@ class TestRecorder:
     def sample(self, elapsed, metrics, ping):
         rtt, last_loss = ping[0], ping[1]
         rssi, snr, loss = metrics["best_rssi"], metrics["best_snr"], metrics["loss"]
-        ants = " ".join(f"{label.replace(' ', ':')}={a_rssi[1]:.0f}"
-                        for label, _cnt, a_rssi, _snr, _freq in metrics["ants"] if a_rssi)
+        ants = " ".join(f"{a['label'].replace(' ', ':')}={a['rssi'][1]:.0f}"
+                        for a in metrics["ants"] if a["rssi"])
 
         def num(value, fmt="{:.1f}"):
             return fmt.format(value) if value is not None else ""
 
         self._fh.write(";".join([
             time.strftime("%H:%M:%S"), f"{elapsed:.0f}",
-            num(rssi, "{:.0f}"), num(snr, "{:.0f}"), num(loss),
+            num(rssi, "{:.0f}"), num(snr, "{:.0f}"),
+            num(metrics["mcs"], "{:.0f}"), num(metrics["bw"], "{:.0f}"), num(loss),
             f"{metrics['rx_pps']:.0f}", f"{mbit(metrics['rx_bytes']):.2f}",
             f"{metrics['fec']:.0f}", f"{metrics['lost']:.0f}",
             num(rtt[1] if rtt else None), num(last_loss, "{:.0f}"), ants,
@@ -2570,6 +2799,9 @@ class TestRecorder:
             self._loss.append(loss)
         if rtt:
             self._ping.append(rtt[1])
+        if metrics["mcs"] is not None:
+            key = (metrics["mcs"], metrics["bw"])
+            self._mcs[key] = self._mcs.get(key, 0) + 1
 
     def close(self, worst, elapsed):
         if not self._fh:
@@ -2582,6 +2814,11 @@ class TestRecorder:
         w(f"# RSSI [dBm]:  {_stat_line(self._rssi, '{:.0f}')}\n")
         w(f"# straty [%]:  {_stat_line(self._loss)}\n")
         w(f"# ping [ms]:   {_stat_line(self._ping)}\n")
+        for (mcs, bw), count in sorted(self._mcs.items(), key=lambda kv: -kv[1]):
+            desc, rate = mcs_info(mcs, bw)
+            w(f"# odbior: {desc}, {bw_mhz(bw)} MHz"
+              + (f", ~{rate:.0f} Mbit/s PHY" if rate else "")
+              + f" - w {count} z {self.samples} probek\n")
         if worst["rssi"] is not None:
             w(f"# najslabszy sygnal: {worst['rssi']:.0f} dBm ({rssi_grade(worst['rssi'])[1]})\n")
         if worst["loss"] is not None:
@@ -2622,15 +2859,28 @@ def link_metrics(msgs, nics):
         ants.extend(antenna_rows(rx_msgs[name], nics))
     main_rx = next((rx_msgs[n] for n in sorted(rx_msgs, key=stream_key)), None)
 
+    # Modulacja odbieranych ramek. Zwykle jedna dla wszystkich anten, ale przy
+    # zmianie ustawien po drugiej stronie potrafia sie chwilowo mieszac -
+    # dlatego liczymy pakiety per (MCS, szerokosc) i bierzemy przewazajaca.
+    mods = {}
+    for a in ants:
+        if a["mcs"] is not None:
+            key = (a["mcs"], a["bw"])
+            mods[key] = mods.get(key, 0) + a["count"]
+    top_mod = max(mods, key=mods.get) if mods else (None, None)
+
     return {
         "rx": rx_msgs,
         "tx": tx_msgs,
         "ants": ants,
         "main_rx": main_rx,
+        "mods": mods,
+        "mcs": top_mod[0],
+        "bw": top_mod[1],
         # Przy dywersyfikacji liczy sie NAJLEPSZA antena - wfb-ng i tak sklada
         # strumien z tej, ktora akurat slyszy lepiej.
-        "best_rssi": max((a[2][1] for a in ants if a[2]), default=None),
-        "best_snr": max((a[3][1] for a in ants if a[3]), default=None),
+        "best_rssi": max((a["rssi"][1] for a in ants if a["rssi"]), default=None),
+        "best_snr": max((a["snr"][1] for a in ants if a["snr"]), default=None),
         "loss": rx_loss_pct(main_rx) if main_rx else None,
         "rx_pps": sum(rx_packets(m, "all")[0] for m in rx_msgs.values()),
         "rx_bytes": ((rx_packets(main_rx, "out_bytes")[0]
@@ -2686,6 +2936,8 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
     parts = []
     if best_rssi is not None:
         parts.append(f"sygnal {best_rssi:.0f} dBm")
+    if metrics["mcs"] is not None:
+        parts.append(f"MCS {metrics['mcs']}")
     if loss is not None:
         parts.append(f"straty {loss:.1f}%")
     if rtt:
@@ -2702,12 +2954,40 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
         row(api_error, "warn")
         row("Ping i liczniki kart ponizej dzialaja niezaleznie od API.")
 
+    section("Modulacja")
+    mods = metrics["mods"]
+    if mods:
+        for (mcs, bw), count in sorted(mods.items(), key=lambda kv: -kv[1]):
+            desc, rate = mcs_info(mcs, bw)
+            row(f"{'odbior':<11}{desc}   {bw_mhz(bw)} MHz"
+                + (f"   ~{rate:.0f} Mbit/s (PHY)" if rate else "")
+                # licznik tylko przy kilku modulacjach naraz - jako wskazowka,
+                # ktora przewaza; osobno nie znaczy nic, bo te same ramki
+                # licza sie na kazdej antenie z osobna
+                + (f"   {count:.0f} pkt/s na antenach" if len(mods) > 1 else ""))
+    else:
+        row(f"{'odbior':<11}brak danych - nic nie przychodzi", "warn")
+    tx_params = tx_radio_params()
+    for tx in tx_params:
+        port = str(tx.get("port", "?"))
+        who = RADIO_PORT_NAMES.get(port, "port " + port)
+        main, extra = tx_modulation_txt(tx)
+        row(f"{'nadawanie':<11}{who} (port {port}): {main}")
+        row(extra, indent=13)
+    if not tx_params:
+        row(f"{'nadawanie':<11}nie widac zadnego wfb_tx - usluga nie dziala?", "warn")
+    row("(odbior = czym nadaje druga strona, nadawanie = czym nadajemy my;")
+    row(" predkosc odbioru liczona przy dlugim GI, bo ramka jej nie niesie)")
+
     if ants:
         section("Sygnal (kazda antena osobno)")
-        for label, count, rssi, snr, freq in ants:
+        for a in ants:
+            rssi, snr = a["rssi"], a["snr"]
             st, txt = rssi_grade(rssi[1] if rssi else None)
-            where = f"{freq} MHz" if freq else ""
-            row(f"{label:<16}{count:>7.0f} pkt/s   {where}", st)
+            where = f"{a['freq']} MHz" if a["freq"] else ""
+            if a["mcs"] is not None:
+                where += f"   MCS {a['mcs']}"
+            row(f"{a['label']:<16}{a['count']:>7.0f} pkt/s   {where}", st)
             if rssi:
                 row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
                     f"{meter(rssi[1], -90, -40)}  {txt}", st, indent=4)
@@ -2803,7 +3083,7 @@ def link_test_screen(stdscr):
               f"Plik:  {path}",
               "Jeden wiersz na sekunde: sygnal, straty, ping.",
               "Zapis konczy sie w chwili wyjscia z ekranu testu."],
-             "t = tak, dowolny inny klawisz = nie"):
+             buttons=("Tak", "Nie")) == 0:
         try:
             recorder = TestRecorder(path).open()
         except OSError as e:
@@ -2910,14 +3190,130 @@ def link_test_screen(stdscr):
                   [f"Plik:    {recorder.path}",
                    f"Probek:  {recorder.samples}   (co sekunde)",
                    "",
-                   "Podglad na Pi:   less " + str(recorder.path),
-                   f"Sciagniecie:     scp <user>@<ip>:{recorder.path} ."],
+                   f"Podglad:      less {recorder.path.name}",
+                   f"Sciagniecie:  scp <user>@<ip>:{recorder.path} ."],
                   status="ok")
         except OSError as e:
             popup(stdscr, "Blad przy zamykaniu pliku", [str(e)], status="fail")
     elif rec_error:
         popup(stdscr, "Zapis przerwany", [rec_error, "Czesc probek moze byc w pliku:",
                                           str(path)], status="fail")
+
+
+def live_mcs_txt(live):
+    """Czym nadaja w tej chwili procesy wfb_tx - jedna linia do naglowka."""
+    if not live:
+        return "brak dzialajacego wfb_tx"
+    parts = []
+    for tx in live:
+        port = str(tx.get("port", "?"))
+        parts.append(f"{RADIO_PORT_NAMES.get(port, 'port ' + port)} MCS {tx.get('mcs', '?')}")
+    return ", ".join(parts)
+
+
+def modulation_screen(stdscr):
+    """Wybor modulacji nadawania. "Automatycznie" nie ustawia niczego - zostaje
+    to, co wybiera sam wfb-ng, czyli tak jak po swiezej instalacji. Wyzszy MCS
+    to wiecej Mbit/s, ale potrzeba mocniejszego sygnalu, wiec zasieg krotszy.
+
+    MCS nie musi byc taki sam po obu stronach: odbiornik odczytuje modulacje
+    z naglowka kazdej ramki. Zgadzac musza sie kanal i szerokosc pasma, a tych
+    ten ekran nie rusza.
+
+    Ustawienie idzie do configu i wymaga restartu uslugi, wiec po zapisie
+    odczytujemy z powrotem, czym FAKTYCZNIE nadaje wfb_tx - gdyby wpis nie
+    zadzialal, widac to od razu, zamiast dowiadywac sie o tym w powietrzu."""
+    sections = mcs_config_sections()
+    options = [None] + sorted(MCS_TABLE)
+    saved = current_mcs_setting(sections)
+    live = tx_radio_params()
+    idx = options.index(saved) if saved in options else 0
+    note = None
+
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, f"WFB-NG [{ROLE}] - wybor modulacji (MCS)")
+
+        safe_addstr(stdscr, 2, 2, f"Teraz nadajemy:  {live_mcs_txt(live)}", curses.A_BOLD)
+        safe_addstr(stdscr, 3, 2, "W configu:       " +
+                    ("automatycznie (brak wpisu)" if saved is None else f"MCS {saved}"))
+        safe_addstr(stdscr, 4, 2, "Sekcje:          " +
+                    ", ".join(sorted(set(sections.values()))))
+
+        for i, opt in enumerate(options):
+            if opt is None:
+                text = "Automatycznie - zostawia to, co ustawia wfb-ng"
+            else:
+                desc, rate = mcs_info(opt)
+                text = f"{desc:<24}{rate:>6.1f} Mbit/s"
+                hint = MCS_HINTS.get(opt)
+                if hint:
+                    text += f"   {hint}"
+            mark = "* " if opt == saved else "  "
+            safe_addstr(stdscr, 6 + i, 2, (mark + text).ljust(70),
+                        curses.color_pair(5) if i == idx else 0)
+
+        row = 6 + len(options) + 1
+        safe_addstr(stdscr, row, 2, "(* = zapisane w configu; predkosc PHY dla 20 MHz "
+                                    "i dlugiego GI, bez narzutu FEC)", curses.A_DIM)
+        safe_addstr(stdscr, row + 1, 2, "Modulacja nie musi byc taka sama po obu stronach "
+                                        "- kanal i szerokosc juz tak.", curses.A_DIM)
+        if note:
+            safe_addstr(stdscr, row + 3, 2, note[0][:110], color_for(note[1]) | curses.A_BOLD)
+
+        h, _ = stdscr.getmaxyx()
+        safe_addstr(stdscr, h - 1, 2, "Strzalki gora/dol, Enter = ustaw i zrestartuj usluge, "
+                                      "q = powrot", curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(options)
+        elif key in (ord("q"), ord("Q"), 27):
+            return
+        elif key in (10, 13, curses.KEY_ENTER):
+            choice = options[idx]
+            what = "automatycznie (usuwamy wpis z configu)" if choice is None else mcs_info(choice)[0]
+            if popup(stdscr, "Zmiana modulacji",
+                     [f"Ustawic: {what}?",
+                      "",
+                      "Sekcje: " + ", ".join(sorted(set(sections.values()))),
+                      f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana,",
+                      "wiec na kilka sekund znikna obraz i telemetria.",
+                      "",
+                      "Druga strona NIE musi miec tej samej modulacji."],
+                     buttons=("Tak", "Nie")) != 0:
+                continue
+
+            if not CFG_PATH.exists():
+                note = (f"Brak {CFG_PATH} - nie ma gdzie tego zapisac.", "fail")
+                continue
+
+            apply_mcs_setting(choice, sections)
+            run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+            time.sleep(3)
+
+            saved = current_mcs_setting(sections)
+            _tx_params_cache["val"] = None  # po restarcie to nowe procesy
+            live = tx_radio_params()
+            idx = options.index(saved) if saved in options else 0
+
+            got = {str(tx.get("mcs")) for tx in live}
+            if not service_active():
+                lines = [f"Usluga nie wstala (status: {service_state_txt()}).",
+                         "Ostatnie linie journala:"] + [ln[:70] for ln in service_last_errors(4)]
+                popup(stdscr, "Zapisano, ale usluga nie dziala", lines, status="fail")
+            elif choice is not None and got and got != {str(choice)}:
+                popup(stdscr, "Zapisano, ale wfb_tx nadaje inaczej",
+                      [f"Chcielismy MCS {choice}, a wfb_tx uzywa: {live_mcs_txt(live)}.",
+                       "Ta wersja wfb-ng moze czytac mcs_index z innej sekcji -",
+                       f"zajrzyj do {CFG_PATH} i porownaj z master.cfg."],
+                      status="warn")
+            else:
+                popup(stdscr, "Ustawione", [f"Nadajemy teraz: {live_mcs_txt(live)}"], status="ok")
+            note = None
 
 
 def verification_screen(stdscr):
@@ -2982,6 +3378,7 @@ def main_menu(stdscr):
         "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
+        "Wybor modulacji (MCS)",
         "Uruchom weryfikacje",
         "Wyjdz",
     ]
@@ -3025,8 +3422,10 @@ def main_menu(stdscr):
             elif idx == 5:
                 link_test_screen(stdscr)
             elif idx == 6:
-                verification_screen(stdscr)
+                modulation_screen(stdscr)
             elif idx == 7:
+                verification_screen(stdscr)
+            elif idx == 8:
                 break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
