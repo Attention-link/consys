@@ -32,6 +32,7 @@ import io
 import os
 import re
 import secrets
+import signal
 import socket
 import struct
 import subprocess
@@ -3163,11 +3164,32 @@ def popup(stdscr, title, lines, buttons=("OK",), status=None, default=0):
                 return 0
 
 
-def _stat_line(values, fmt="{:.1f}"):
-    if not values:
-        return "brak danych"
-    return (f"min {fmt.format(min(values))}   srednio {fmt.format(sum(values) / len(values))}"
-            f"   max {fmt.format(max(values))}")
+class Stat:
+    """Min / srednia / max liczone na biezaco, bez trzymania probek.
+
+    Zapis w tle potrafi chodzic godzinami, a do podsumowania i tak potrzebne
+    sa tylko trzy liczby - lista wszystkich odczytow rosla by w nieskonczonosc
+    w procesie, ktorego nikt nie oglada."""
+
+    def __init__(self):
+        self.n = 0
+        self.total = 0.0
+        self.lo = None
+        self.hi = None
+
+    def add(self, value):
+        if value is None:
+            return
+        self.n += 1
+        self.total += value
+        self.lo = value if self.lo is None else min(self.lo, value)
+        self.hi = value if self.hi is None else max(self.hi, value)
+
+    def line(self, fmt="{:.1f}"):
+        if not self.n:
+            return "brak danych"
+        return (f"min {fmt.format(self.lo)}   srednio {fmt.format(self.total / self.n)}"
+                f"   max {fmt.format(self.hi)}")
 
 
 # Cztery probki na sekunde. Statystyki z API wfb-ng przychodzia raz na sekunde,
@@ -3177,11 +3199,174 @@ def _stat_line(values, fmt="{:.1f}"):
 LOG_SAMPLE_HZ = 4
 LOG_SAMPLE_PERIOD = 1.0 / LOG_SAMPLE_HZ
 
+# Zapis nie chodzi w tym procesie, tylko w osobnym, odpietym od terminala -
+# dzieki temu trwa dalej po wyjsciu z ekranu testu, a nawet po zamknieciu
+# calego programu (typowy przypadek: test zasiegu, przy ktorym Pi zostaje
+# wlaczone, a ekran sie zamyka). TUI dogaduje sie z nim przez dwa male pliki
+# obok logu: stan (ile probek, jak duzy plik) i kolejke uwag do dopisania.
+# Nazwy z kropka, zeby nie mieszaly sie z logami przy zwyklym 'ls'.
+TEST_STATE = TEST_LOG_DIR / f".test-{ROLE}.stan"
+TEST_NOTE = TEST_LOG_DIR / f".test-{ROLE}.uwagi"
+RECORDER_FLAG = "--zapis-testu"
+
+# Gorny limit rozmiaru logu. Przy 4 Hz to okolo miesiaca ciaglego zapisu, wiec
+# nie chodzi o skracanie testu, tylko o to, zeby zapomniany zapis nie zapchal
+# karty do zera - z pelna karta system przestaje dzialac, a nie tylko test.
+TEST_MAX_BYTES = 1024 ** 3
+
+
+def human_size(n):
+    n = float(n or 0)
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} kB"
+    return f"{n:.0f} B"
+
+
+def fmt_mmss(seconds):
+    seconds = int(max(0, seconds or 0))
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _pid_recording(pid):
+    """Czy pod tym PID-em siedzi naprawde nasz proces zapisu. Samo sprawdzenie,
+    ze proces zyje, nie wystarcza: numer moze juz nalezec do czegos innego."""
+    if not pid:
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return RECORDER_FLAG in cmdline
+
+
+def write_test_state(**fields):
+    """Plik stanu podmieniany w calosci (os.replace), zeby TUI czytajace go
+    kilka razy na sekunde nigdy nie trafilo na wersje zapisana w polowie."""
+    tmp = TEST_STATE.with_name(TEST_STATE.name + ".tmp")
+    try:
+        tmp.write_text("".join(f"{k}={v}\n" for k, v in fields.items()), encoding="utf-8")
+        os.replace(tmp, TEST_STATE)
+    except OSError:
+        pass  # zapisu testu nie warto przerywac przez plik pomocniczy
+
+
+def test_state():
+    """Stan zapisu w tle albo None, gdy zadnego nie ma.
+
+    "trwa" jest prawda tylko wtedy, gdy proces faktycznie zyje - inaczej po
+    zaniku zasilania albo zabiciu procesu w menu wisialby napis o trwajacym
+    tescie, ktorego niczym nie da sie zamknac."""
+    try:
+        raw = TEST_STATE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    st = {}
+    for line in raw.splitlines():
+        key, _, value = line.partition("=")
+        st[key.strip()] = value.strip()
+    if not st.get("plik"):
+        return None
+
+    for key in ("pid", "probek", "bajtow"):
+        try:
+            st[key] = int(st.get(key) or 0)
+        except ValueError:
+            st[key] = 0
+    try:
+        st["czas"] = float(st.get("czas") or 0)
+    except ValueError:
+        st["czas"] = 0.0
+
+    if st.get("stan") == "trwa" and not _pid_recording(st["pid"]):
+        st["stan"] = "przerwany"
+        st["powod"] = "proces zapisu zniknal (restart, brak zasilania?)"
+    return st
+
+
+def start_test_recorder(path):
+    """Odpala zapis jako osobny proces w NOWEJ SESJI - inaczej zginalby razem
+    z terminalem, w ktorym stoi TUI. Czeka chwile na pierwszy plik stanu, bo
+    "uruchomilem i nie wiadomo, czy zyje" jest gorsze niz czytelny blad.
+    Zwraca komunikat o bledzie albo None."""
+    for helper in (TEST_STATE, TEST_NOTE):
+        try:
+            helper.unlink()
+        except OSError:
+            pass
+
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), RECORDER_FLAG, str(path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, cwd=str(TEST_LOG_DIR))
+    except OSError as e:
+        return str(e)
+
+    for _ in range(30):  # ~3 s na otwarcie pliku i zgloszenie sie
+        time.sleep(0.1)
+        st = test_state()
+        if st and st.get("stan") == "trwa":
+            return None
+        if st and st.get("stan") == "blad":
+            try:
+                TEST_STATE.unlink()  # nie ma czego pilnowac, nic nie ruszylo
+            except OSError:
+                pass
+            return st.get("powod") or "nieznany blad"
+    return "proces zapisu nie zglosil sie w ciagu 3 s"
+
+
+def stop_test_recorder(timeout=5.0):
+    """Grzeczne zatrzymanie sygnalem: proces sam dopisuje podsumowanie
+    i zamyka plik. Zwraca stan po zatrzymaniu."""
+    st = test_state()
+    if not st or st.get("stan") != "trwa":
+        return st
+    try:
+        os.kill(st["pid"], signal.SIGTERM)
+    except OSError:
+        return test_state()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        st = test_state()
+        if not st or st.get("stan") != "trwa":
+            return st
+    return test_state()
+
+
+def note_test_recorder(text):
+    """Uwaga do dopisania w logu. TUI nie ma tego pliku otwartego, wiec zostawia
+    ja w kolejce - proces zapisu zabiera ja przy najblizszej probce."""
+    try:
+        with TEST_NOTE.open("a", encoding="utf-8") as fh:
+            fh.write(text.replace("\n", " ") + "\n")
+    except OSError:
+        pass
+
+
+def take_test_notes():
+    try:
+        text = TEST_NOTE.read_text(encoding="utf-8")
+        TEST_NOTE.unlink()
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
 
 class TestRecorder:
     """Zapis przebiegu testu do pliku: naglowek z cala konfiguracja, potem
-    cztery wiersze na sekunde, na koniec podsumowanie. Plik zamyka sie
-    z chwila wyjscia z ekranu testu.
+    cztery wiersze na sekunde, na koniec podsumowanie. Uzywa go proces zapisu
+    w tle (background_recorder), a nie ekran testu - plik zyje wlasnym zyciem
+    i konczy sie dopiero na zadanie uzytkownika albo na limicie rozmiaru.
 
     Po co: przy sprawdzaniu zasiegu wyniku nie da sie ogladac na biezaco (jest
     sie kilkaset metrow od ekranu), a i tak trzeba go z czyms porownac - "przed"
@@ -3195,10 +3380,11 @@ class TestRecorder:
     def __init__(self, path):
         self.path = path
         self.samples = 0
+        self.size = 0
         self._fh = None
-        self._rssi = []
-        self._loss = []
-        self._ping = []
+        self._rssi = Stat()
+        self._loss = Stat()
+        self._ping = Stat()
         self._mcs = {}
 
     def open(self):
@@ -3235,9 +3421,11 @@ class TestRecorder:
         w(f"# druga strona: {PEER_NAME} {PEER_IP}\n")
         w(f"# probkowanie: {LOG_SAMPLE_HZ} Hz (co {LOG_SAMPLE_PERIOD:.2f} s);"
           " wfb-ng oddaje statystyki raz na sekunde,\n"
-          "#   wiec kolumny sygnalu powtarzaja sie miedzy jego aktualizacjami\n#\n")
+          "#   wiec kolumny sygnalu powtarzaja sie miedzy jego aktualizacjami\n")
+        w(f"# limit rozmiaru: {human_size(TEST_MAX_BYTES)} - po nim zapis konczy sie sam\n#\n")
         w(";".join(self.COLUMNS) + "\n")
         self._fh.flush()
+        self.size = self._fh.tell()
 
     def note(self, text):
         """Komentarz w srodku pliku - np. o wyzerowaniu licznikow, zeby przy
@@ -3266,39 +3454,127 @@ class TestRecorder:
         ]) + "\n")
         self._fh.flush()  # zeby po Ctrl+C albo zaniku zasilania zostalo to, co juz bylo
         self.samples += 1
+        self.size = self._fh.tell()
 
-        if rssi is not None:
-            self._rssi.append(rssi)
-        if loss is not None:
-            self._loss.append(loss)
-        if rtt:
-            self._ping.append(rtt[1])
+        self._rssi.add(rssi)
+        self._loss.add(loss)
+        self._ping.add(rtt[1] if rtt else None)
         if metrics["mcs"] is not None:
             key = (metrics["mcs"], metrics["bw"])
             self._mcs[key] = self._mcs.get(key, 0) + 1
 
-    def close(self, worst, elapsed):
+    def close(self, reason, elapsed):
         if not self._fh:
             return
         w = self._fh.write
         w("#\n# --- podsumowanie ---\n")
-        w(f"# koniec: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        w(f"# koniec: {time.strftime('%Y-%m-%d %H:%M:%S')}   ({reason})\n")
         w(f"# czas testu: {int(elapsed) // 60} min {int(elapsed) % 60} s"
-          f"   probek: {self.samples} ({LOG_SAMPLE_HZ} Hz)\n")
-        w(f"# RSSI [dBm]:  {_stat_line(self._rssi, '{:.0f}')}\n")
-        w(f"# straty [%]:  {_stat_line(self._loss)}\n")
-        w(f"# ping [ms]:   {_stat_line(self._ping)}\n")
+          f"   probek: {self.samples} ({LOG_SAMPLE_HZ} Hz)"
+          f"   rozmiar: {human_size(self.size)}\n")
+        w(f"# RSSI [dBm]:  {self._rssi.line('{:.0f}')}\n")
+        w(f"# straty [%]:  {self._loss.line()}\n")
+        w(f"# ping [ms]:   {self._ping.line()}\n")
         for (mcs, bw), count in sorted(self._mcs.items(), key=lambda kv: -kv[1]):
             desc, rate = mcs_info(mcs, bw)
             w(f"# odbior: {desc}, {bw_mhz(bw)} MHz"
               + (f", ~{rate:.0f} Mbit/s PHY" if rate else "")
               + f" - w {count} z {self.samples} probek\n")
-        if worst["rssi"] is not None:
-            w(f"# najslabszy sygnal: {worst['rssi']:.0f} dBm ({rssi_grade(worst['rssi'])[1]})\n")
-        if worst["loss"] is not None:
-            w(f"# najwieksze straty: {worst['loss']:.1f}% ({loss_grade(worst['loss'])[1]})\n")
+        if self._rssi.lo is not None:
+            w(f"# najslabszy sygnal: {self._rssi.lo:.0f} dBm ({rssi_grade(self._rssi.lo)[1]})\n")
+        if self._loss.hi is not None:
+            w(f"# najwieksze straty: {self._loss.hi:.1f}% ({loss_grade(self._loss.hi)[1]})\n")
+        self._fh.flush()
+        self.size = self._fh.tell()
         self._fh.close()
         self._fh = None
+
+
+def background_recorder(path):
+    """Proces zapisu testu: wlasne sondy (statystyki wfb-ng + ping), cztery
+    probki na sekunde do pliku i raz na sekunde odswiezony plik stanu dla TUI.
+
+    Odpalany przez ekran testu z flaga RECORDER_FLAG, w nowej sesji - dlatego
+    zamkniecie ekranu testu ani calego programu go nie dotyka. Ekran testu ma
+    wlasne sondy i tylko pokazuje, co ten proces zdazyl zapisac.
+
+    Konczy sie na trzy sposoby: sygnalem (uzytkownik wybral "zakoncz"),
+    po osiagnieciu TEST_MAX_BYTES albo na bledzie zapisu - w kazdym z nich
+    dopisuje do pliku podsumowanie i zostawia powod w stanie."""
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda *_: stop.set())
+
+    started_txt = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        recorder = TestRecorder(path).open()
+    except OSError as e:
+        write_test_state(stan="blad", pid=os.getpid(), plik=path,
+                         start=started_txt, powod=str(e))
+        return 1
+
+    def save_state(stan, powod="", elapsed=0.0):
+        write_test_state(stan=stan, pid=os.getpid(), plik=recorder.path,
+                         start=started_txt, czas=f"{elapsed:.1f}",
+                         probek=recorder.samples, bajtow=recorder.size,
+                         limit=TEST_MAX_BYTES, powod=powod)
+
+    save_state("trwa")
+    stats = WfbStatsProbe().start()
+    ping = PingProbe(PEER_IP).start()
+
+    started = time.monotonic()
+    next_nic_scan = started + 2.0
+    next_state = started + 1.0
+    next_sample = started
+    nics = wfb_nics()
+    reason = "zatrzymany przez uzytkownika"
+    elapsed = 0.0
+
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
+            elapsed = now - started
+            # lista kart jest droga (wfb-nics), a zmienia sie rzadko - tak samo
+            # jak na ekranie testu odswiezamy ja co dwie sekundy
+            if now >= next_nic_scan:
+                nics = wfb_nics()
+                next_nic_scan = now + 2.0
+
+            for note in take_test_notes():
+                recorder.note(note)
+
+            metrics = link_metrics(stats.snapshot()[0], nics)
+            try:
+                recorder.sample(elapsed, metrics, ping.snapshot())
+            except OSError as e:
+                reason = f"blad zapisu: {e}"  # np. brak miejsca na karcie
+                break
+            if recorder.size >= TEST_MAX_BYTES:
+                reason = f"osiagniety limit {human_size(TEST_MAX_BYTES)}"
+                break
+
+            if now >= next_state:
+                next_state = now + 1.0
+                save_state("trwa", elapsed=elapsed)
+
+            # tempo liczone od stalej siatki, a nie "spij 0.25 s" - inaczej
+            # czas kazdej probki podjadalby sie o tyle, ile trwalo jej liczenie.
+            # Gdy siatka ucieknie o wiecej niz sekunde (zamulone wfb-nics,
+            # obciazony Pi), zaczynamy ja od nowa zamiast nadrabiac w kolko.
+            next_sample += LOG_SAMPLE_PERIOD
+            if next_sample < time.monotonic() - 1.0:
+                next_sample = time.monotonic()
+            stop.wait(max(0.0, next_sample - time.monotonic()))
+    finally:
+        stats.close()
+        ping.close()
+        try:
+            recorder.close(reason, elapsed)
+        except OSError as e:
+            reason = f"blad przy zamykaniu pliku: {e}"
+        save_state("zakonczony", reason, elapsed)
+    return 0
 
 
 def meter(value, lo, hi, width=18):
@@ -3538,6 +3814,86 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
     return lines
 
 
+def test_state_line(state, key="t"):
+    """Jedna linijka o zapisie w tle - ta sama na gorze menu i ekranu testu."""
+    name = Path(state["plik"]).name
+    size = f"{human_size(state['bajtow'])} / {human_size(TEST_MAX_BYTES)}"
+    if state["stan"] == "trwa":
+        return (f"TEST TRWA W TLE  {fmt_mmss(state['czas'])}   {name}   "
+                f"{state['probek']} probek   {size}   ({key} = zakoncz)")
+    powod = state.get("powod") or "koniec"
+    return f"ZAPIS TESTU ZAKONCZONY ({powod})   {name}   {size}   ({key} = szczegoly)"
+
+
+def test_state_attr(state):
+    return color_for("ok" if state["stan"] == "trwa" else "warn") | curses.A_BOLD
+
+
+def test_result_popup(stdscr, state):
+    """Podsumowanie zakonczonego zapisu. Sprzata przy okazji plik stanu, zeby
+    napis o nim nie wisial w menu w nieskonczonosc."""
+    if not state:
+        return
+    name = Path(state["plik"]).name
+    lines = [f"Plik:     {state['plik']}",
+             f"Probek:   {state['probek']}   ({LOG_SAMPLE_HZ} na sekunde)",
+             f"Rozmiar:  {human_size(state['bajtow'])}",
+             f"Czas:     {fmt_mmss(state['czas'])}"]
+    if state.get("powod"):
+        lines += ["", f"Powod zakonczenia: {state['powod']}"]
+    lines += ["",
+              f"Podglad:      less {name}",
+              f"Sciagniecie:  scp <user>@<ip>:{state['plik']} ."]
+    popup(stdscr, "Zapis zakonczony", lines,
+          status="ok" if state["stan"] == "zakonczony" else "warn")
+    try:
+        TEST_STATE.unlink()
+    except OSError:
+        pass
+
+
+def stop_test_popup(stdscr):
+    """Zatrzymanie zapisu w tle + pokazanie, co z niego wyszlo."""
+    state = stop_test_recorder()
+    if state and state["stan"] == "trwa":
+        popup(stdscr, "Zapis nie zatrzymal sie",
+              ["Proces zapisu nie odpowiedzial przez 5 sekund.",
+               f"PID {state['pid']},  plik: {state['plik']}",
+               "",
+               "Sprobuj jeszcze raz albo zatrzymaj go recznie:",
+               f"  sudo kill {state['pid']}"], status="fail")
+        return
+    test_result_popup(stdscr, state)
+
+
+def background_test_popup(stdscr):
+    """Okienko "co z zapisem w tle": trwajacy mozna stad zakonczyc, zakonczony
+    pokazuje podsumowanie i znika z paska. Zwraca stan po tej rozmowie."""
+    state = test_state()
+    if not state:
+        popup(stdscr, "Brak zapisu w tle",
+              ["Zaden zapis testu nie jest w tej chwili uruchomiony.",
+               "Uruchamia go ekran 'Test polaczenia'."])
+        return None
+    if state["stan"] != "trwa":
+        test_result_popup(stdscr, state)
+        return None
+
+    if popup(stdscr, "Test trwa w tle",
+             [f"Plik:     {state['plik']}",
+              f"Zapisane: {state['probek']} probek   {human_size(state['bajtow'])}"
+              f" z {human_size(TEST_MAX_BYTES)}",
+              f"Czas:     {fmt_mmss(state['czas'])}   (PID {state['pid']})",
+              "",
+              "Zapis nie zalezy od tego programu - leci dalej po jego",
+              "zamknieciu i sam stanie na limicie rozmiaru."],
+             # bezpieczna odpowiedz na koncu: Esc zostawia zapis w spokoju
+             buttons=("Przerwij zapis", "Zostaw"), status="ok", default=1) == 0:
+        stop_test_popup(stdscr)
+        return test_state()
+    return state
+
+
 def link_test_screen(stdscr):
     """Zywy test lacza: co widac po drugiej stronie, jak mocny jest sygnal,
     ile pakietow przepada i jak dlugo leci ping przez radio. Weryfikacja mowi
@@ -3546,26 +3902,47 @@ def link_test_screen(stdscr):
 
     Sam odswieza sie kilka razy na sekunde i mozna go zostawic wlaczonego -
     po restarcie uslugi podlaczy sie do niej z powrotem. Na wejsciu pyta, czy
-    zapisywac przebieg do pliku; zapis konczy sie z chwila wyjscia stad."""
+    zapisywac przebieg do pliku. Zapis idzie osobnym procesem, wiec NIE konczy
+    sie z wyjsciem stad - trwa dalej i widac go na gorze menu glownego."""
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - test polaczenia")
-    path = TEST_LOG_DIR / f"test-{ROLE}-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    recorder = None
-    if popup(stdscr, "Zapis testu do pliku",
-             ["Zapisywac przebieg tego testu do pliku?",
-              "",
-              f"Plik:  {path}",
-              f"{LOG_SAMPLE_HZ} wiersze na sekunde: sygnal, straty, ping.",
-              "Zapis konczy sie w chwili wyjscia z ekranu testu."],
-             buttons=("Tak", "Nie")) == 0:
-        try:
-            recorder = TestRecorder(path).open()
-        except OSError as e:
-            popup(stdscr, "Nie udalo sie otworzyc pliku", [str(e), "Test ruszy bez zapisu."],
-                  status="fail")
 
-    # 0.2 s: petla musi krecic sie czesciej niz zapis do pliku (4 Hz), inaczej
-    # nie da sie utrzymac jego tempa
+    state = test_state()
+    if state and state["stan"] == "trwa":
+        popup(stdscr, "Zapis testu juz trwa",
+              [f"Plik:    {state['plik']}",
+               f"Zapisane: {state['probek']} probek   {human_size(state['bajtow'])}"
+               f"   czas {fmt_mmss(state['czas'])}",
+               "",
+               "Ten ekran tylko go podglada - zapis leci wlasnym tempem.",
+               "Konczy go klawisz 't' - tutaj albo w menu glownym."],
+              status="ok")
+    else:
+        if state:
+            # poprzedni zapis skonczyl sie, gdy nikogo tu nie bylo (limit, blad,
+            # restart) - pokazujemy podsumowanie i sprzatamy, zeby nie mieszalo
+            # sie z tym, ktory zaraz ruszy
+            test_result_popup(stdscr, state)
+            state = None
+        path = TEST_LOG_DIR / f"test-{ROLE}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        if popup(stdscr, "Zapis testu do pliku",
+                 ["Zapisywac przebieg tego testu do pliku?",
+                  "",
+                  f"Plik:  {path}",
+                  f"{LOG_SAMPLE_HZ} wiersze na sekunde: sygnal, straty, ping.",
+                  "",
+                  "Zapis idzie osobnym procesem: trwa po wyjsciu z tego ekranu",
+                  "i po zamknieciu programu. Konczy go klawisz 't' (tutaj albo",
+                  f"w menu glownym); sam staje na {human_size(TEST_MAX_BYTES)}."],
+                 buttons=("Tak", "Nie")) == 0:
+            error = start_test_recorder(path)
+            if error:
+                popup(stdscr, "Nie udalo sie uruchomic zapisu",
+                      [error, "Test ruszy bez zapisu."], status="fail")
+            state = test_state()
+
+    # 0.2 s: tempo odrysowywania ekranu. Zapis do pliku ma wlasne (4 Hz)
+    # w osobnym procesie i nie zalezy od tego, co tu sie dzieje.
     stdscr.timeout(200)
     stats = WfbStatsProbe().start()
     ping = PingProbe(PEER_IP).start()
@@ -3575,10 +3952,8 @@ def link_test_screen(stdscr):
     counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in nics}
     worst = {"rssi": None, "loss": None, "lost": 0}
     started = time.monotonic()
-    rec_started = started  # nie zeruje sie klawiszem 'z', wiec czas w pliku rosnie
     next_nic_scan = started + 2.0
-    next_sample = started
-    rec_error = None
+    next_state = started + 0.5
     elapsed = 0.0
     top = 0
 
@@ -3611,15 +3986,16 @@ def link_test_screen(stdscr):
             lines = link_test_lines(metrics, api_error, nics, used, traffic,
                                     ping_snap, worst, elapsed)
 
-            if recorder and now >= next_sample:
-                next_sample = now + LOG_SAMPLE_PERIOD
-                try:
-                    recorder.sample(now - rec_started, metrics, ping_snap)
-                except OSError as e:
-                    rec_error, recorder = str(e), None  # np. brak miejsca na karcie
+            # Stan zapisu czytamy z pliku, bo pisze go inny proces. Dwa razy
+            # na sekunde wystarczy - on i tak odswieza go raz na sekunde.
+            if now >= next_state:
+                next_state = now + 0.5
+                state = test_state()
 
             stdscr.erase()
             draw_header(stdscr, f"WFB-NG [{ROLE}] - test polaczenia")
+            if state:
+                safe_addstr(stdscr, 1, 2, test_state_line(state), test_state_attr(state))
             h, _ = stdscr.getmaxyx()
             view = max(1, h - 3)
             top = max(0, min(top, max(0, len(lines) - view)))
@@ -3627,13 +4003,11 @@ def link_test_screen(stdscr):
                 safe_addstr(stdscr, 2 + i, 2, text, attr)
 
             hint = "q = powrot, z = zeruj liczniki testu"
+            if state and state["stan"] == "trwa":
+                hint += ", t = zakoncz zapis"
             if len(lines) > view:
                 hint = (f"strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}"
                         f"/{len(lines)}), " + hint)
-            if recorder:
-                hint = f"ZAPIS: {recorder.samples} probek -> {recorder.path.name} | " + hint
-            elif rec_error:
-                hint = "ZAPIS PRZERWANY (blad pliku) | " + hint
             safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
             stdscr.refresh()
 
@@ -3652,28 +4026,33 @@ def link_test_screen(stdscr):
                 worst.update(rssi=None, loss=None, lost=0)
                 ping.reset()
                 started = now
-                if recorder:
-                    recorder.note("wyzerowano liczniki testu")
+                note_test_recorder("wyzerowano liczniki testu")
+            elif key in (ord("t"), ord("T")):
+                stdscr.timeout(-1)  # okienko czeka na klawisz, nie na timeout
+                state = background_test_popup(stdscr)
+                stdscr.timeout(200)
+                stdscr.clear()
     finally:
         stats.close()
         ping.close()
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
 
-    if recorder:
-        try:
-            recorder.close(worst, time.monotonic() - rec_started)
-            popup(stdscr, "Zapis zakonczony",
-                  [f"Plik:    {recorder.path}",
-                   f"Probek:  {recorder.samples}   ({LOG_SAMPLE_HZ} na sekunde)",
-                   "",
-                   f"Podglad:      less {recorder.path.name}",
-                   f"Sciagniecie:  scp <user>@<ip>:{recorder.path} ."],
-                  status="ok")
-        except OSError as e:
-            popup(stdscr, "Blad przy zamykaniu pliku", [str(e)], status="fail")
-    elif rec_error:
-        popup(stdscr, "Zapis przerwany", [rec_error, "Czesc probek moze byc w pliku:",
-                                          str(path)], status="fail")
+    # Wyjscie z ekranu NIE konczy zapisu - o tym trzeba powiedziec wprost,
+    # bo do tej pory bylo odwrotnie.
+    state = test_state()
+    if state and state["stan"] == "trwa":
+        if popup(stdscr, "Test nadal trwa",
+                 [f"Plik:     {state['plik']}",
+                  f"Zapisane: {state['probek']} probek   {human_size(state['bajtow'])}"
+                  f"   czas {fmt_mmss(state['czas'])}",
+                  "",
+                  "Zapis leci dalej w tle - takze po zamknieciu programu.",
+                  "W menu glownym widac go na gorze; 't' konczy go w kazdej chwili."],
+                 # bezpieczna odpowiedz na koncu: Esc zostawia zapis w spokoju
+                 buttons=("Przerwij zapis", "Zostaw w tle"), status="ok", default=1) == 0:
+            stop_test_popup(stdscr)
+    elif state:
+        test_result_popup(stdscr, state)
 
 
 def auto_channel_screen(stdscr, scanned):
@@ -4255,7 +4634,9 @@ def main_menu(stdscr):
     idx = 0
 
     while True:
-        stdscr.clear()
+        # erase(), a nie clear(): przy zapisie w tle menu odrysowuje sie samo co
+        # sekunde, a pelne czyszczenie ekranu migalo by przy kazdym odswiezeniu
+        stdscr.erase()
         draw_header(stdscr, f"WFB-NG [{ROLE.upper()}] - konfigurator i weryfikator")
 
         if not (DRONE_KEY.exists() and GS_KEY.exists()):
@@ -4264,15 +4645,26 @@ def main_menu(stdscr):
         nic_status, nic_txt = nic_status_summary()
         safe_addstr(stdscr, 3, 2, nic_txt, color_for(nic_status) | curses.A_BOLD)
 
+        # Zapis testu chodzi w tle wlasnym procesem - bez tej linijki nie bylo
+        # by po nim widac, ze cos jeszcze pisze do karty.
+        state = test_state()
+        if state:
+            safe_addstr(stdscr, 4, 2, test_state_line(state), test_state_attr(state))
+
         for i, item in enumerate(items):
             attr = curses.color_pair(5) if i == idx else curses.A_NORMAL
             safe_addstr(stdscr, 5 + i, 4, item.ljust(50), attr)
 
         h, _ = stdscr.getmaxyx()
-        safe_addstr(stdscr, h - 1, 2, "Strzalki gora/dol, Enter = wybierz, r = odswiez, q = wyjscie",
-                    curses.A_DIM)
+        hint = "Strzalki gora/dol, Enter = wybierz, r = odswiez, q = wyjscie"
+        if state:
+            hint += ", t = zapis w tle"
+        safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
         stdscr.refresh()
 
+        # Przy zapisie w tle menu odswieza sie samo co sekunde, zeby licznik
+        # probek i rozmiar pliku szly do przodu; bez niego czekamy na klawisz.
+        stdscr.timeout(1000 if state and state["stan"] == "trwa" else -1)
         key = stdscr.getch()
         if key in (curses.KEY_UP, ord("k")):
             idx = (idx - 1) % len(items)
@@ -4296,14 +4688,50 @@ def main_menu(stdscr):
             elif idx == 7:
                 verification_screen(stdscr)
             elif idx == 8:
-                break
+                if confirm_exit(stdscr):
+                    break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
+        elif key in (ord("t"), ord("T")):
+            stdscr.timeout(-1)  # okienko ma czekac na klawisz, nie na timeout
+            background_test_popup(stdscr)
         elif key in (ord("q"), 27):
-            break
+            if confirm_exit(stdscr):
+                break
+
+
+def confirm_exit(stdscr):
+    """Wyjscie z programu nie zatrzymuje zapisu w tle - ale trzeba o tym
+    powiedziec, inaczej latwo zostawic proces piszacy do skutku i przypomniec
+    sobie o nim dopiero przy pelnej karcie."""
+    stdscr.timeout(-1)
+    state = test_state()
+    if not state or state["stan"] != "trwa":
+        return True
+
+    choice = popup(stdscr, "Test nadal trwa w tle",
+                   [f"Plik:     {state['plik']}",
+                    f"Zapisane: {state['probek']} probek   {human_size(state['bajtow'])}"
+                    f"   czas {fmt_mmss(state['czas'])}",
+                    "",
+                    "Zapis nie zalezy od tego programu - po wyjsciu leci dalej",
+                    f"i sam stanie na {human_size(TEST_MAX_BYTES)}.",
+                    "Zatrzymasz go, wchodzac tu ponownie i wybierajac 't'."],
+                   buttons=("Zostaw w tle", "Przerwij zapis", "Anuluj"), status="warn")
+    if choice == 2:
+        return False
+    if choice == 1:
+        stop_test_popup(stdscr)
+    return True
 
 
 def main():
+    # Tryb bez ekranu: sam zapis testu, odpalany przez ekran testu jako osobny
+    # proces (patrz background_recorder). Nie ma tu ani setupu, ani menu.
+    if len(sys.argv) >= 3 and sys.argv[1] == RECORDER_FLAG:
+        require_root()
+        sys.exit(background_recorder(Path(sys.argv[2])))
+
     require_root()
     os.environ.setdefault("DEBIAN_FRONTEND", "noninteractive")
 
