@@ -1099,6 +1099,129 @@ def apply_mcs_setting(mcs, sections):
     return changed
 
 
+# ------------------- naprawa utraconych pakietow (FEC tunelu) -------------------
+#
+# Pakietu, ktory przepadl w powietrzu, nie da sie "naprawic" po fakcie - nikt go
+# juz nie ma. Wfb-ng radzi sobie z tym z gory: do kazdych k pakietow danych
+# dokłada n-k pakietow nadmiarowych i z dowolnych k odebranych odtwarza cala
+# paczke (FEC). Utracony pakiet wraca wiec z nadmiarowosci, o ile bylo jej dosc.
+#
+# Caly ten modul jest o dobieraniu tego "dosc": im gorszy link, tym wiecej
+# nadmiarowosci trzeba wysylac, ale kazdy nadmiarowy pakiet zjada czas antenowy,
+# wiec przy czystym linku placi sie za darmo. Stad drabinka poziomow i automat,
+# ktory po niej chodzi w gore przy stratach i w dol przy ciszy.
+
+# (k, n, nazwa) - z kazdych n pakietow k niesie dane. n/k to koszt: 1/2 znaczy
+# "kazdy pakiet leci dwa razy". Kolejnosc od najtanszego do najmocniejszego -
+# indeks na tej liscie jest "poziomem naprawy", ktorym rusza AutoFec.
+FEC_LEVELS = [
+    (8, 9, "minimalna"),
+    (4, 5, "oszczedna"),
+    (2, 3, "srednia"),
+    (1, 2, "domyslna wfb-ng"),
+    (1, 3, "mocna"),
+    (1, 4, "bardzo mocna"),
+    (1, 5, "maksymalna"),
+]
+
+# Poziom, na ktory wracamy przyciskiem "domyslne" - tyle ma tunel i mavlink po
+# swiezej instalacji wfb-ng (k=1, n=2).
+FEC_DEFAULT_LEVEL = 3
+
+
+def fec_overhead(k, n):
+    """Ile razy wiecej pakietow trzeba wyslac niz danych - czyli cena naprawy."""
+    return (n / k) if k else 1.0
+
+
+def fec_level_txt(level):
+    k, n, name = FEC_LEVELS[level]
+    return f"FEC {k}/{n} ({name}, {fec_overhead(k, n):.2f}x pakietow)"
+
+
+def fec_level_of(k, n):
+    """Numer poziomu dla pary (k, n) albo None, gdy w configu siedzi cos spoza
+    drabinki - wtedy automat nie ma od czego zaczac i trzeba wybrac recznie."""
+    for i, (lk, ln, _name) in enumerate(FEC_LEVELS):
+        if (lk, ln) == (k, n):
+            return i
+    return None
+
+
+def fec_section():
+    """Sekcja configu ze strumieniem tunelu - to w niej ustawia sie fec_k/fec_n
+    dla tego, co NADAJEMY w gore/dol tunelu.
+
+    Tunel jest dwukierunkowy i kazda strona nadaje wlasnym FEC, wiec ten wpis
+    dotyczy tylko naszego kierunku. Druga strona ma swoj wlasny i moze miec
+    inny - odbiornik czyta k/n z pakietu sesyjnego, wiec nie trzeba tego
+    uzgadniac tak jak kanalu."""
+    return mcs_config_sections().get("tunnel", f"{ROLE}_tunnel")
+
+
+def current_fec_setting(section=None):
+    """(k, n) wpisane przez nas do configu albo None, gdy nie ma wpisu i zostaje
+    to, co ustawia sam wfb-ng."""
+    section = section or fec_section()
+    k, n = get_cfg_option(section, "fec_k"), get_cfg_option(section, "fec_n")
+    if not (k and n and k.isdigit() and n.isdigit()):
+        return None
+    return int(k), int(n)
+
+
+def apply_fec_setting(k, n, section=None):
+    """Zapisuje fec_k/fec_n dla tunelu albo - gdy k jest None - kasuje nasz wpis
+    i zostawia ustawienia wfb-ng. Zwraca ruszona sekcje albo None.
+
+    Samo zapisanie nie wystarczy: wfb_tx czyta config przy starcie, wiec
+    wolajacy musi zrestartowac usluge (i wie o tym, bo restart zrywa link)."""
+    if not CFG_PATH.exists():
+        return None
+    backup_config_once()
+    section = section or fec_section()
+    if k is None:
+        dropped = drop_cfg_option(section, "fec_k")
+        dropped = drop_cfg_option(section, "fec_n") or dropped
+        return section if dropped else None
+    set_cfg_option(section, "fec_k", str(k))
+    set_cfg_option(section, "fec_n", str(n))
+    return section
+
+
+def tunnel_tx_port():
+    """Port radiowy, na ktorym nadajemy tunel ('stream_tx' strumienia) albo
+    None. Sluzy do rozpoznania WLASCIWEGO procesu wfb_tx - kazdy strumien ma
+    swoj, a wideo ma zwykle zupelnie inne FEC niz tunel."""
+    for s in wfb_streams() or []:
+        if s.get("name") == "tunnel":
+            port = s.get("stream_tx")
+            return str(port) if port is not None else None
+    return None
+
+
+def live_tunnel_fec():
+    """(k, n) faktycznie uzywane przez wfb_tx tunelu albo None. Czytamy to
+    z linii polecen procesu, a nie z configu - po to, zeby bylo widac, gdy wpis
+    nie zadzialal (np. wfb-ng wzielo ustawienie z innej sekcji albo usluga
+    jeszcze nie zostala zrestartowana po zapisie)."""
+    def pair(tx):
+        k, n = tx.get("fec_k"), tx.get("fec_n")
+        if k and n and str(k).isdigit() and str(n).isdigit():
+            return int(k), int(n)
+        return None
+
+    txs = tx_radio_params()
+    port = tunnel_tx_port()
+    if port is not None:
+        for tx in txs:
+            if str(tx.get("port")) == port:
+                return pair(tx)
+        return None
+    # Bez listy strumieni nie ma po czym rozpoznac tunelu; zgadywanie po
+    # kolejnosci portow trafialo by czasem w wideo, a to zupelnie inne FEC.
+    return pair(txs[0]) if len(txs) == 1 else None
+
+
 def tx_modulation_txt(tx):
     """Opis nadawania z wpisu tx_radio_params(), rozbity na dwa kawalki: sama
     modulacja i ustawienia kodowania. Ekran pokazuje je w dwoch wierszach, bo
@@ -1491,6 +1614,27 @@ def rank_channels(results):
 # Port sterowania w tunelu wfb. Tryb automatyczny musi uzgadniac skoki
 # z druga strona, bo kanal MUSI byc po obu stronach ten sam - inaczej skok
 # to gwarantowana utrata linku, a nie jego ratowanie.
+# --- automatyczna naprawa pakietow w tunelu (dobor FEC) ---
+# Powyzej tylu procent strat NIEODRATOWANYCH dokladamy nadmiarowosci. Prog jest
+# nizszy niz AUTO_BAD_LOSS od kanalu, bo naprawa jest tania i ma zadzialac
+# ZANIM link nadaje sie tylko do ucieczki na inny kanal.
+AUTO_FEC_BAD_LOSS = 1.0
+# Ponizej tylu procent strat PRZED naprawa nadmiarowosc jest zbedna - schodzimy
+# w dol i oddajemy czas antenowy. Patrzymy na "przed", a nie na "po": po
+# naprawie zawsze jest zero i automat schodzil by w dol az do pierwszych strat.
+AUTO_FEC_GOOD_LOSS = 0.2
+AUTO_FEC_BAD_SECONDS = 6.0    # tyle musi byc zle, zeby dolozyc nadmiarowosci
+AUTO_FEC_GOOD_SECONDS = 90.0  # tyle musi byc dobrze, zeby ja zdjac
+# Kazda zmiana to restart uslugi, czyli kilka sekund bez obrazu i telemetrii -
+# wiec miedzy zmianami musi minac wyraznie wiecej czasu niz trwa sam restart.
+AUTO_FEC_COOLDOWN = 45.0
+# Co ile sekund mowimy drugiej stronie, ile od niej gubimy. To ONA na tej
+# podstawie dobiera swoje FEC - patrz AutoFec.
+AUTO_FEC_REPORT_EVERY = 2.0
+# Po tylu sekundach ciszy raporty drugiej strony sa nieaktualne i wracamy do
+# oceny po wlasnym odbiorze.
+AUTO_FEC_PEER_STALE = 12.0
+
 AUTO_PORT = 14570
 # Kanaly 2.4 GHz maksymalnie od siebie oddalone (13 pierwszy, bo to nasz
 # domyslny). Uzywane, gdy nie bylo jeszcze skanu.
@@ -1751,6 +1895,136 @@ class AutoChannel:
                 self._hop(self.target, "druga strona potwierdzila", now, out)
         elif parts[0] == "HELLO":
             out.append(("send", "HELLO-OK"))
+
+
+class AutoFec:
+    """Automat naprawy pakietow w tunelu: dobiera, ile nadmiarowosci FEC ma
+    nadawac ta strona. Tak jak AutoChannel niczego sam nie dotyka - dostaje czas
+    i pomiary, oddaje liste decyzji. Dzieki temu da sie go sprawdzic bez radia.
+
+    Rzecz, ktora latwo zrobic tu zle: straty mierzymy na ODBIORZE, a ustawiamy
+    FEC NADAWANIA. To sa dwa rozne kierunki. Nasze fec_k/fec_n decyduje o tym,
+    ile pakietow odratuje DRUGA strona, a nie my - wiec pytamy o to ja. Kazda
+    strona nadaje wiec swoj raport ("LOSS po przed") i dobiera nadmiarowosc pod
+    to, co uslyszy z powrotem. Gdy druga strona milczy (nie ma tam wlaczonego
+    tego ekranu albo tunel wlasnie lezy), wracamy do wlasnego odbioru i
+    zakladamy, ze link jest z grubsza symetryczny - to gorsze niz raport, ale
+    duzo lepsze niz nierobienie niczego.
+
+    Zasady:
+    - w gore szybko, w dol powoli. Za mala nadmiarowosc kosztuje utracone
+      pakiety od razu, za duza tylko troche czasu antenowego;
+    - patrzymy na straty PO naprawie, gdy decydujemy o dolozeniu (to one bola),
+      a na straty PRZED naprawa, gdy decydujemy o zdjeciu (po naprawie zawsze
+      jest zero, wiec automat schodzil by w dol az do pierwszej dziury);
+    - kazda zmiana to restart uslugi, czyli zerwany link na kilka sekund -
+      stad dlugi odstep miedzy zmianami.
+
+    Decyzje to krotki: ("send", tekst), ("fec", poziom, powod), ("note", tekst)."""
+
+    def __init__(self, level, role=ROLE, now=0.0):
+        self.level = level          # indeks w FEC_LEVELS albo None (spoza drabinki)
+        self.role = role
+        self.peer_loss = None       # (po, przed) - ile druga strona gubi OD NAS
+        self.peer_at = None
+        self.bad_since = None
+        self.good_since = None
+        self.changed_at = now
+        self.changes = 0
+        self.source = None          # skad wzielismy ocene - do pokazania na ekranie
+        self._last_report = None    # None, a nie 0.0: "jeszcze nie raportowalem"
+        self._stuck_noted = False   # zero znaczylo by cos innego przy kazdym
+                                    # zegarze zaczynajacym sie gdzie indziej
+
+    # --- pomocnicze ---
+
+    def peer_fresh(self, now):
+        return (self.peer_at is not None
+                and now - self.peer_at <= AUTO_FEC_PEER_STALE)
+
+    def judged(self, now, loss_after, loss_before):
+        """(po, przed, skad) - pomiar, na ktorym opieramy decyzje o WLASNYM
+        nadawaniu. Raport drugiej strony ma pierwszenstwo, bo opisuje wlasciwy
+        kierunek."""
+        if self.peer_fresh(now) and self.peer_loss is not None:
+            return self.peer_loss[0], self.peer_loss[1], "raport drugiej strony"
+        return loss_after, loss_before, "wlasny odbior (link symetryczny?)"
+
+    def _apply(self, level, reason, now, out):
+        self.level = level
+        self.changed_at = now
+        self.changes += 1
+        self.bad_since = self.good_since = None
+        out.append(("fec", level, reason))
+
+    # --- glowna logika ---
+
+    def tick(self, now, loss_after, loss_before, messages=()):
+        out = []
+        for text in messages:
+            self._on_message(text, now)
+
+        # Raport dla drugiej strony: MY mowimy, ile gubimy OD NIEJ - ona pod to
+        # dobiera swoje nadawanie. Lecimy tym samym gniazdem, co uzgadnianie
+        # kanalu, wiec to jest zwykly datagram w tunelu.
+        if loss_after is not None and (self._last_report is None
+                                       or now - self._last_report >= AUTO_FEC_REPORT_EVERY):
+            self._last_report = now
+            before = loss_before if loss_before is not None else loss_after
+            out.append(("send", f"LOSS {loss_after:.2f} {before:.2f}"))
+
+        after, before, source = self.judged(now, loss_after, loss_before)
+        self.source = source
+
+        if self.level is None:
+            if not self._stuck_noted:
+                self._stuck_noted = True
+                out.append(("note", "w configu jest FEC spoza drabinki - "
+                                    "wybierz poziom recznie, wtedy ruszy automat"))
+            return out
+        if after is None:
+            return out  # nic nie przychodzi - nie ma z czego wnioskowac
+
+        if now - self.changed_at < AUTO_FEC_COOLDOWN:
+            return out  # po restarcie uslugi liczniki i tak sa jeszcze zimne
+
+        if after >= AUTO_FEC_BAD_LOSS:
+            self.good_since = None
+            if self.bad_since is None:
+                self.bad_since = now
+            elif now - self.bad_since >= AUTO_FEC_BAD_SECONDS:
+                if self.level + 1 < len(FEC_LEVELS):
+                    self._apply(self.level + 1,
+                                f"tracimy {after:.1f}% mimo naprawy", now, out)
+                else:
+                    self.bad_since = now
+                    out.append(("note", "jestem na najmocniejszym FEC, a straty "
+                                        "zostaja - to juz na kanal albo antene"))
+            return out
+
+        self.bad_since = None
+        # W dol schodzimy tylko wtedy, gdy samo radio przestalo gubic - jesli
+        # gubi, a my tego nie widzimy, to znaczy, ze naprawa robi swoje i nie
+        # ma jej po co zabierac.
+        if before is not None and before <= AUTO_FEC_GOOD_LOSS and self.level > 0:
+            if self.good_since is None:
+                self.good_since = now
+            elif now - self.good_since >= AUTO_FEC_GOOD_SECONDS:
+                self._apply(self.level - 1,
+                            f"czysto od {AUTO_FEC_GOOD_SECONDS:.0f} s - oddaje pasmo",
+                            now, out)
+        else:
+            self.good_since = None
+        return out
+
+    def _on_message(self, text, now):
+        parts = text.split()
+        if parts and parts[0] == "LOSS" and len(parts) >= 3:
+            try:
+                self.peer_loss = (float(parts[1]), float(parts[2]))
+                self.peer_at = now
+            except ValueError:
+                pass
 
 
 # ------------------------- instalacja (idempotentna) -------------------------
@@ -3390,6 +3664,22 @@ class RunTotals:
         return (100.0 * self.totals["lost"] / seen) if seen else None
 
     @property
+    def per_before(self):
+        """PER, jaki bylby BEZ naprawy FEC - czyli ile gubi samo radio. Ta sama
+        podstawa co w 'per', wiec obie liczby stoja obok siebie uczciwie:
+        roznica miedzy nimi to zasluga naprawy."""
+        seen = self.totals["rx"] + self.totals["lost"]
+        if not seen:
+            return None
+        return 100.0 * (self.totals["lost"] + self.totals["fec"]) / seen
+
+    @property
+    def saved_pct(self):
+        """O ile punktow procentowych naprawa zbila straty na calym przebiegu."""
+        before, after = self.per_before, self.per
+        return None if before is None else before - after
+
+    @property
     def fec_pct(self):
         """Ile procent ramek trzeba bylo odtworzyc z nadmiarowych - czyli ile
         gubilo sie w powietrzu, zanim FEC to naprawil."""
@@ -3578,8 +3868,12 @@ class TestRecorder:
     i "po" przestawieniu anteny albo zmianie kanalu. Wiersze sa rozdzielone
     srednikami, wiec plik otwiera sie tez w arkuszu."""
 
+    # straty_przed_% / straty_% to ta sama chwila przed naprawa FEC i po niej,
+    # liczone na tym samym mianowniku - roznica miedzy nimi to pakiety, ktore
+    # naprawa uratowala. Tak samo per_przed_% wzgledem per_% dla calego testu.
     COLUMNS = ("czas", "sek", "rssi_best_dBm", "snr_best_dB", "rx_mcs", "rx_bw_MHz",
-               "straty_%", "per_%", "rx_pkt_s", "rx_Mbit_s", "fec_naprawil_s",
+               "straty_przed_%", "straty_%", "uratowane_%", "per_przed_%", "per_%",
+               "rx_pkt_s", "rx_Mbit_s", "fec_naprawil_s",
                "utracone_s", "ping_ms", "ping_utrata_%", "anteny_rssi")
 
     def __init__(self, path):
@@ -3589,6 +3883,7 @@ class TestRecorder:
         self._fh = None
         self._rssi = Stat()
         self._loss = Stat()
+        self._loss_before = Stat()
         self._ping = Stat()
         self._mcs = {}
         # straty_% to chwila, per_% to caly test - przy szukaniu zasiegu liczy
@@ -3624,6 +3919,12 @@ class TestRecorder:
         for tx in tx_radio_params():
             main, extra = tx_modulation_txt(tx)
             w(f"# nadawanie (port {tx.get('port', '?')}): {main}   {extra}\n")
+        fec = live_tunnel_fec()
+        if fec:
+            level = fec_level_of(*fec)
+            w(f"# naprawa pakietow w tunelu: FEC {fec[0]}/{fec[1]}"
+              f"   {fec_overhead(*fec):.2f}x pakietow"
+              + (f"   ({FEC_LEVELS[level][2]})" if level is not None else "") + "\n")
         w(f"# druga strona: {PEER_NAME} {PEER_IP}\n")
         w(f"# probkowanie: {LOG_SAMPLE_HZ} Hz (co {LOG_SAMPLE_PERIOD:.2f} s);"
           " wfb-ng oddaje statystyki raz na sekunde,\n"
@@ -3654,8 +3955,10 @@ class TestRecorder:
             time.strftime("%H:%M:%S"), f"{elapsed:.2f}",  # przy 4 Hz sekundy
                                                           # musza miec ulamek
             num(rssi, "{:.0f}"), num(snr, "{:.0f}"),
-            num(metrics["mcs"], "{:.0f}"), num(metrics["bw"], "{:.0f}"), num(loss),
-            num(self._run.per, "{:.2f}"),
+            num(metrics["mcs"], "{:.0f}"), num(metrics["bw"], "{:.0f}"),
+            num(metrics["loss_before"], "{:.2f}"), num(loss),
+            num(metrics["saved_pct"], "{:.2f}"),
+            num(self._run.per_before, "{:.2f}"), num(self._run.per, "{:.2f}"),
             f"{metrics['rx_pps']:.0f}", f"{mbit(metrics['rx_bytes']):.2f}",
             f"{metrics['fec']:.0f}", f"{metrics['lost']:.0f}",
             num(rtt[1] if rtt else None), num(last_loss, "{:.0f}"), ants,
@@ -3666,6 +3969,7 @@ class TestRecorder:
 
         self._rssi.add(rssi)
         self._loss.add(loss)
+        self._loss_before.add(metrics["loss_before"])
         self._ping.add(rtt[1] if rtt else None)
         if metrics["mcs"] is not None:
             key = (metrics["mcs"], metrics["bw"])
@@ -3681,7 +3985,8 @@ class TestRecorder:
           f"   probek: {self.samples} ({LOG_SAMPLE_HZ} Hz)"
           f"   rozmiar: {human_size(self.size)}\n")
         w(f"# RSSI [dBm]:  {self._rssi.line('{:.0f}')}\n")
-        w(f"# straty [%]:  {self._loss.line()}\n")
+        w(f"# straty przed naprawa [%]: {self._loss_before.line()}\n")
+        w(f"# straty po naprawie [%]:   {self._loss.line()}\n")
         w(f"# ping [ms]:   {self._ping.line()}\n")
 
         run, per = self._run.totals, self._run.per
@@ -3690,8 +3995,14 @@ class TestRecorder:
           + (f"{per:.2f}% - {run['lost']:.0f} utraconych z {seen:.0f}"
              if per is not None else "brak danych - nic nie przyszlo") + "\n")
         if run["rx"]:
-            w(f"# FEC naprawil: {run['fec']:.0f} ramek ({self._run.fec_pct:.2f}%)"
-              " - zgubione w powietrzu, ale odtworzone\n")
+            # To jest liczba, dla ktorej warto bylo w ogole ustawiac FEC: ile
+            # pakietow zgubilo sie w powietrzu, a mimo to doszlo.
+            w(f"# uratowane przez naprawe: {run['fec']:.0f} pakietow"
+              f" ({self._run.fec_pct:.2f}% odebranych)\n")
+            if self._run.per_before is not None:
+                w(f"# straty bez naprawy byly by {self._run.per_before:.2f}%,"
+                  f" sa {per:.2f}% - naprawa zdjela {self._run.saved_pct:.2f}"
+                  " punktu procentowego\n")
         if run["bad"]:
             w(f"# ramki bledne/nieodszyfrowane: {run['bad']:.0f}\n")
         if self._run.restarts:
@@ -3844,6 +4155,16 @@ def link_metrics(msgs, nics):
     # sekwencji. Pakiety odtworzone przez FEC nie sa strata: doszly, tylko
     # okrezna droga.
     got, lost = total("all"), total("lost")
+    fec = total("fec_rec")
+
+    # Straty PRZED naprawa i PO naprawie, liczone na tym samym mianowniku -
+    # inaczej nie dalo by sie ich zestawic na jednym wykresie. 'lost' to dziury,
+    # ktorych FEC juz nie odratowal, 'fec_rec' to te, ktore odratowal; razem
+    # daja to, co naprawde zgubilo sie w powietrzu. Roznica miedzy krzywymi to
+    # dokladnie zasluga FEC, czyli pakiety uratowane.
+    seen = got + lost
+    loss_after = (100.0 * lost / seen) if seen else None
+    loss_before = (100.0 * (lost + fec) / seen) if seen else None
 
     return {
         "rx": rx_msgs,
@@ -3856,10 +4177,14 @@ def link_metrics(msgs, nics):
         # strumien z tej, ktora akurat slyszy lepiej.
         "best_rssi": max((a["rssi"][1] for a in ants if a["rssi"]), default=None),
         "best_snr": max((a["snr"][1] for a in ants if a["snr"]), default=None),
-        "loss": (100.0 * lost / (got + lost)) if (got + lost) else None,
+        "loss": loss_after,
+        # to samo, ale gdyby FEC nie naprawil niczego - "ile gubi samo radio"
+        "loss_before": loss_before,
+        # ile punktow procentowych strat zdjal z nas FEC
+        "saved_pct": (loss_before - loss_after) if seen else None,
         "rx_pps": got,
         "rx_bytes": total("out_bytes") or total("all_bytes"),
-        "fec": total("fec_rec"),
+        "fec": fec,
         "bad": total("bad") + total("dec_err"),
         "lost": lost,
         # sumy od startu uslugi - same w sobie malo mowia, sluza do liczenia
@@ -4008,6 +4333,15 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
             f"utracone {metrics['lost_total']:.0f}", indent=4)
         row("(FEC naprawil = pakiety odtworzone z nadmiarowych - doszly, ale link sie meczy)")
 
+        # Te dwie liczby obok siebie odpowiadaja na pytanie "czy naprawa cos
+        # daje": pierwsza to straty samego radia, druga to te, ktorych nie
+        # udalo sie odratowac. Ich roznica to pakiety uratowane.
+        if metrics["loss_before"] is not None:
+            before, saved = metrics["loss_before"], metrics["saved_pct"] or 0.0
+            row(f"straty przed naprawa {before:>5.2f}%  ->  po naprawie {loss:>5.2f}%"
+                f"   (uratowane {saved:.2f} pkt proc.)",
+                loss_grade(before)[0], indent=4)
+
         # To jest odpowiedz na "ile gubimy": pojedyncza sekunda potrafi pokazac
         # 0% albo 30% zaleznie od tego, kiedy sie spojrzy, a przy nadawaniu
         # z innego programu liczy sie caly przebieg.
@@ -4020,8 +4354,12 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
             row(f"PER {per:>6.2f}%   {meter(per, 5, 0)}   "
                 f"{totals['lost']:.0f} utraconych z {seen:.0f}", loss_grade(per)[0])
             if totals["rx"]:
-                row(f"FEC naprawil {totals['fec']:.0f} ramek ({run.fec_pct:.2f}%)"
-                    " - zgubione w powietrzu, ale odtworzone", indent=4)
+                row(f"uratowane przez naprawe: {totals['fec']:.0f} pakietow "
+                    f"({run.fec_pct:.2f}%) - zgubione w powietrzu, ale odtworzone",
+                    "ok" if totals["fec"] else None, indent=4)
+                if run.per_before is not None:
+                    row(f"bez naprawy stracilibysmy {run.per_before:.2f}%, "
+                        f"tracimy {per:.2f}%", indent=4)
             if totals["bad"]:
                 row(f"bledne / nieodszyfrowane: {totals['bad']:.0f}", "warn", indent=4)
         if run.restarts:
@@ -4841,6 +5179,285 @@ def modulation_screen(stdscr):
             note = None
 
 
+def restart_wfb_service(wait=3.0):
+    """Restart uslugi + skasowanie cache parametrow nadawania. Po restarcie
+    biegna nowe procesy wfb_tx, wiec stary odczyt z /proc opisywalby juz
+    nieistniejace ustawienia."""
+    code, _out = run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+    time.sleep(wait)
+    _tx_params_cache["val"] = None
+    return code == 0
+
+
+def apply_fec_level(level, section=None):
+    """Ustawia poziom naprawy i restartuje usluge. Zwraca (ok, tekst) - ok jest
+    prawda tylko wtedy, gdy usluga po restarcie faktycznie wstala."""
+    k, n, _name = FEC_LEVELS[level]
+    section = section or fec_section()
+    if not CFG_PATH.exists():
+        return False, f"brak {CFG_PATH} - nie ma gdzie tego zapisac"
+    if apply_fec_setting(k, n, section) is None:
+        return False, f"nie udalo sie zapisac fec_k/fec_n w [{section}]"
+    restart_wfb_service()
+    if not service_active():
+        return False, f"usluga nie wstala po restarcie ({service_state_txt()})"
+    live = live_tunnel_fec()
+    if live and live != (k, n):
+        return False, f"zapisalem {k}/{n}, a wfb_tx nadaje {live[0]}/{live[1]}"
+    return True, f"tunel nadaje z {fec_level_txt(level)}"
+
+
+def fec_status_lines(metrics, saved_total=None):
+    """Wspolne wiersze o naprawie dla ekranu recznego i automatycznego:
+    ile gubi samo radio, ile z tego wraca dzieki FEC i co zostaje."""
+    before, after = metrics.get("loss_before"), metrics.get("loss")
+    if before is None:
+        return [("brak danych - nic jeszcze nie przyszlo", "warn")]
+    saved = metrics.get("saved_pct") or 0.0
+    st = loss_grade(after)[0]
+    lines = [
+        (f"gubi samo radio:   {before:>6.2f}%   {meter(before, 10, 0)}",
+         loss_grade(before)[0]),
+        (f"naprawione (FEC):  {saved:>6.2f} pkt proc.   {metrics['fec']:.0f} pkt/s "
+         "wrocilo z nadmiarowosci", "ok" if saved > 0 else None),
+        (f"zostaje utracone:  {after:>6.2f}%   {meter(after, 10, 0)}   "
+         f"{metrics['lost']:.0f} pkt/s", st),
+    ]
+    if saved_total is not None:
+        lines.append((f"od poczatku: naprawa zbila straty o {saved_total:.2f} "
+                      "punktu procentowego", None))
+    return lines
+
+
+def auto_repair_screen(stdscr, level, section):
+    """Tryb automatyczny naprawy: AutoFec dobiera nadmiarowosc sam.
+
+    Tak jak przy kanale - zeby dzialalo jak nalezy, ekran powinien byc otwarty
+    PO OBU STRONACH. Kazda strona ustawia wtedy swoje nadawanie pod raport tej
+    drugiej, czyli pod to, co naprawde do niej dociera. Przy jednej stronie
+    automat tez dziala, tylko ocenia po wlasnym odbiorze."""
+    if popup(stdscr, "Automatyczna naprawa pakietow",
+             ["Sam dobiera nadmiarowosc FEC w tunelu.",
+              "",
+              f"Dokłada, gdy mimo naprawy tracimy ponad {AUTO_FEC_BAD_LOSS:.1f}%",
+              f"przez {AUTO_FEC_BAD_SECONDS:.0f} s. Zdejmuje po "
+              f"{AUTO_FEC_GOOD_SECONDS:.0f} s czystego linku.",
+              "",
+              "KAZDA zmiana restartuje usluge, czyli na kilka sekund",
+              f"znika obraz i telemetria (nie czesciej niz co {AUTO_FEC_COOLDOWN:.0f} s).",
+              "",
+              "Najlepiej wlaczyc po obu stronach - wtedy kazda ustawia",
+              "sie pod to, co druga naprawde odbiera."],
+             buttons=("Start", "Anuluj")) != 0:
+        return level
+
+    nics = wfb_nics()
+    peer = AutoPeer().start()
+    stats = WfbStatsProbe().start()
+    auto = AutoFec(level, now=time.monotonic())
+    run_totals = RunTotals()
+    events = []
+    started = time.monotonic()
+
+    def note(text, status=None):
+        events.insert(0, (time.strftime("%H:%M:%S"), text, status))
+        del events[10:]
+
+    if peer.error:
+        note(peer.error, "fail")
+    if level is None:
+        note("start bez poziomu - FEC w configu jest spoza drabinki", "warn")
+    else:
+        note(f"start na poziomie: {fec_level_txt(level)}")
+
+    stdscr.timeout(500)
+    try:
+        while True:
+            now = time.monotonic()
+            metrics = link_metrics(stats.snapshot()[0], nics)
+            run_totals.update(metrics)
+
+            for action in auto.tick(now, metrics["loss"], metrics["loss_before"],
+                                    peer.take()):
+                kind = action[0]
+                if kind == "send":
+                    peer.send(action[1])
+                elif kind == "note":
+                    note(action[1], "warn")
+                elif kind == "fec":
+                    new_level = action[1]
+                    note(f"naprawa -> {fec_level_txt(new_level)}: {action[2]}")
+                    ok, txt = apply_fec_level(new_level, section)
+                    note(txt, "ok" if ok else "fail")
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - automatyczna naprawa pakietow")
+
+            live = live_tunnel_fec()
+            safe_addstr(stdscr, 2, 2, "Nadajemy tunel z: "
+                        + (f"FEC {live[0]}/{live[1]}" if live else "?")
+                        + (f"   (poziom {auto.level + 1}/{len(FEC_LEVELS)}: "
+                           f"{FEC_LEVELS[auto.level][2]})" if auto.level is not None else ""),
+                        curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, f"Zmian: {auto.changes}   czas: "
+                        f"{int(now - started) // 60:02d}:{int(now - started) % 60:02d}"
+                        f"   ocena wg: {auto.source or '-'}")
+
+            ago = peer.peer_seen_ago()
+            safe_addstr(stdscr, 4, 2,
+                        f"Druga strona ({PEER_NAME} {PEER_IP}): "
+                        + (f"raportuje {ago:.0f} s temu" if ago is not None
+                           else "milczy - oceniam po wlasnym odbiorze"),
+                        color_for("ok" if ago is not None and ago < AUTO_FEC_PEER_STALE
+                                  else "warn"))
+            if auto.peer_loss and auto.peer_fresh(now):
+                safe_addstr(stdscr, 5, 2, f"Ona gubi OD NAS: {auto.peer_loss[0]:.2f}% "
+                            f"po naprawie, {auto.peer_loss[1]:.2f}% przed naprawa")
+
+            safe_addstr(stdscr, 7, 2, "Nasz odbior od drugiej strony:", curses.A_BOLD)
+            for i, (text, status) in enumerate(fec_status_lines(metrics,
+                                                                run_totals.saved_pct)):
+                safe_addstr(stdscr, 8 + i, 4, text, color_for(status))
+
+            safe_addstr(stdscr, 13, 2, "Zdarzenia:", curses.A_BOLD)
+            for i, (stamp, text, status) in enumerate(events):
+                safe_addstr(stdscr, 14 + i, 4, f"{stamp}  {text}", color_for(status))
+
+            h, _ = stdscr.getmaxyx()
+            safe_addstr(stdscr, h - 1, 2, "q = wyjscie (zostaje poziom, na ktorym "
+                                          "jestesmy)", curses.A_DIM)
+            stdscr.refresh()
+
+            if stdscr.getch() in (ord("q"), ord("Q"), 27):
+                break
+    finally:
+        peer.close()
+        stats.close()
+        stdscr.timeout(-1)
+
+    return auto.level
+
+
+def repair_screen(stdscr):
+    """Naprawa pakietow utraconych w tunelu wfb-ng.
+
+    Pakietu, ktory przepadl, nikt nie odtworzy po fakcie - dlatego wfb-ng
+    zabezpiecza sie z gory: do kazdych k pakietow danych dokłada n-k
+    nadmiarowych i z dowolnych k odebranych sklada cala paczke z powrotem.
+    Ten ekran ustawia wlasnie to k/n dla tunelu i pokazuje, ile pakietow dzieki
+    temu wraca (straty przed naprawa kontra po naprawie).
+
+    Wpis idzie do sekcji tunelu w configu i wymaga restartu uslugi, wiec po
+    zapisie sprawdzamy, czym wfb_tx nadaje NAPRAWDE - gdyby wpis nie zadzialal,
+    widac to od razu.
+
+    Ustawienie dotyczy tylko NASZEGO kierunku i nie musi byc takie samo po obu
+    stronach: odbiornik czyta k/n z pakietu sesyjnego."""
+    section = fec_section()
+    saved = current_fec_setting(section)
+    level = fec_level_of(*saved) if saved else None
+    idx = level if level is not None else FEC_DEFAULT_LEVEL
+    stats = WfbStatsProbe().start()
+    nics = wfb_nics()
+    note = None
+
+    stdscr.timeout(500)
+    try:
+        while True:
+            metrics = link_metrics(stats.snapshot()[0], nics)
+            live = live_tunnel_fec()
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - naprawa utraconych pakietow (tunel)")
+
+            safe_addstr(stdscr, 2, 2, "Tunel nadaje teraz:  "
+                        + (f"FEC {live[0]}/{live[1]}   "
+                           f"{fec_overhead(live[0], live[1]):.2f}x pakietow" if live
+                           else "? (usluga nie chodzi albo brak procesu wfb_tx)"),
+                        curses.A_BOLD)
+            safe_addstr(stdscr, 3, 2, "W configu:           "
+                        + (f"fec_k = {saved[0]}, fec_n = {saved[1]}" if saved
+                           else "brak wpisu - zostaje ustawienie wfb-ng")
+                        + f"   [{section}]")
+
+            for i, (text, status) in enumerate(fec_status_lines(metrics)):
+                safe_addstr(stdscr, 5 + i, 4, text, color_for(status))
+
+            safe_addstr(stdscr, 9, 2, "Ile nadmiarowosci nadawac:", curses.A_BOLD)
+            for i, (k, n, name) in enumerate(FEC_LEVELS):
+                text = (f"FEC {k}/{n:<3}{name:<18}{fec_overhead(k, n):.2f}x pakietow"
+                        f"   przezyje utrate {n - k} z {n}")
+                mark = "* " if level == i else "  "
+                safe_addstr(stdscr, 10 + i, 2, (mark + text).ljust(72),
+                            curses.color_pair(5) if i == idx else 0)
+
+            row = 10 + len(FEC_LEVELS) + 1
+            safe_addstr(stdscr, row, 2, "(* = zapisane w configu; wiecej nadmiarowosci "
+                                        "= mniej strat, ale wiecej zajetego pasma)",
+                        curses.A_DIM)
+            safe_addstr(stdscr, row + 1, 2, "Nie musi byc takie samo po obu stronach - "
+                                            "odbiornik czyta k/n z pakietu sesyjnego.",
+                        curses.A_DIM)
+            if note:
+                safe_addstr(stdscr, row + 3, 2, note[0][:110],
+                            color_for(note[1]) | curses.A_BOLD)
+
+            h, _ = stdscr.getmaxyx()
+            safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw i zrestartuj usluge, "
+                                          "a = tryb automatyczny, d = domyslne, q = powrot",
+                        curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == -1:
+                continue  # timeout - tylko odswiezenie liczb
+            if key in (curses.KEY_UP, ord("k")):
+                idx = (idx - 1) % len(FEC_LEVELS)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                idx = (idx + 1) % len(FEC_LEVELS)
+            elif key in (ord("q"), ord("Q"), 27):
+                return
+            elif key in (ord("d"), ord("D")):
+                idx = FEC_DEFAULT_LEVEL
+            elif key in (ord("a"), ord("A")):
+                stdscr.timeout(-1)
+                level = auto_repair_screen(stdscr, level, section)
+                saved = current_fec_setting(section)
+                if level is not None:
+                    idx = level
+                stdscr.timeout(500)
+                note = None
+            elif key in (10, 13, curses.KEY_ENTER):
+                stdscr.timeout(-1)
+                k, n, name = FEC_LEVELS[idx]
+                answer = popup(stdscr, "Zmiana naprawy pakietow",
+                               [f"Ustawic {fec_level_txt(idx)}?",
+                                "",
+                                f"Sekcja: [{section}]",
+                                f"Z kazdych {n} pakietow {k} niesie dane,"
+                                f" {n - k} to nadmiarowosc.",
+                                "",
+                                f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana,",
+                                "wiec na kilka sekund znikna obraz i telemetria."],
+                               buttons=("Tak", "Nie"))
+                if answer == 0:
+                    ok, txt = apply_fec_level(idx, section)
+                    saved = current_fec_setting(section)
+                    level = fec_level_of(*saved) if saved else None
+                    if ok:
+                        popup(stdscr, "Ustawione", [txt], status="ok")
+                    else:
+                        popup(stdscr, "Nie poszlo tak, jak mialo",
+                              [txt, "", "Zajrzyj do " + str(CFG_PATH) + " i porownaj",
+                               "z master.cfg - ta wersja wfb-ng moze czytac",
+                               "fec_k/fec_n z innej sekcji."], status="fail")
+                    note = None
+                stdscr.timeout(500)
+    finally:
+        stats.close()
+        stdscr.timeout(-1)
+
+
 def verification_screen(stdscr):
     stdscr.clear()
     draw_header(stdscr, f"WFB-NG [{ROLE}] - weryfikacja")
@@ -4904,6 +5521,7 @@ def main_menu(stdscr):
         "Test polaczenia (sygnal, straty, ping)",
         "Kanal i czestotliwosc (skan, tryb auto)",
         "Wybor modulacji (MCS)",
+        "Naprawa utraconych pakietow (FEC tunelu)",
         "Uruchom weryfikacje",
         "Wyjdz",
     ]
@@ -4962,8 +5580,10 @@ def main_menu(stdscr):
             elif idx == 6:
                 modulation_screen(stdscr)
             elif idx == 7:
-                verification_screen(stdscr)
+                repair_screen(stdscr)
             elif idx == 8:
+                verification_screen(stdscr)
+            elif idx == 9:
                 if confirm_exit(stdscr):
                     break
         elif key in (ord("r"), ord("R")):

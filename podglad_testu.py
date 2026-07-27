@@ -8,6 +8,11 @@ kazdej anteny osobno, SNR, modulacje, straty (chwilowe i PER narastajacy od
 poczatku testu) oraz ping. Naglowek testu (kanal, region, moc, modulacja
 nadawania, karty) i podsumowanie ida do panelu obok.
 
+Straty sa na wykresie DWIE: przed naprawa FEC i po niej. Pole miedzy krzywymi
+to pakiety, ktore zgubilo radio, a wfb-ng odtworzyl z nadmiarowosci - osobny
+panel pokazuje ich tempo, a panel obok laczna liczbe. Bez tej pary z samego
+wykresu strat nie widac, czy link jest czysty, czy tylko dobrze latany.
+
 Potrzebny jest tylko Python - zadnych bibliotek do doinstalowania.
 
 Uzycie na Windowsie:
@@ -154,6 +159,24 @@ class TestLog:
             return None
         return min(values), sum(values) / len(values), max(values)
 
+    def integral(self, column):
+        """Ile tego bylo LACZNIE z kolumny podanej "na sekunde" - np. ile
+        pakietow w sumie naprawil FEC przez caly test. Liczone po odstepach
+        miedzy probkami, a nie przez pomnozenie przez ich liczbe: zapis potrafi
+        chodzic z innym tempem, niz deklaruje naglowek.
+
+        Dluzsze przerwy pomijamy - po przerwie w zapisie ostatnia znana wartosc
+        nie opisuje juz tego, co dzialo sie w miedzyczasie."""
+        points = self.series(column)
+        if len(points) < 2:
+            return None
+        total = 0.0
+        for (t0, value), (t1, _next) in zip(points, points[1:]):
+            gap = t1 - t0
+            if 0 < gap <= 5:
+                total += value * gap
+        return total
+
 
 # ------------------------- rysowanie -------------------------
 
@@ -286,12 +309,23 @@ class ChartArea:
                 ("mcs", "Modulacja (MCS odbioru)", 1, "rx_mcs", {"step": True}),
                 ("loss", "Straty pakietow [%]", 2, "straty_%",
                  {"unit": "%", "bands": LOSS_BANDS, "y_fmt": "{:.1f}", "y_floor": 0}),
+                ("loss_before", "Straty przed naprawa FEC [%]", 2, "straty_przed_%",
+                 {"unit": "%", "bands": LOSS_BANDS, "y_fmt": "{:.1f}", "y_floor": 0}),
+                ("uratowane", "Uratowane przez naprawe [pkt/s]", 2, "fec_naprawil_s",
+                 {"unit": "pkt/s", "y_fmt": "{:.0f}", "y_floor": 0}),
                 ("mbit", "Przeplyw odbioru [Mbit/s]", 2, "rx_Mbit_s",
                  {"unit": "Mbit/s", "y_fmt": "{:.1f}", "y_floor": 0}),
                 ("ping", "Ping przez tunel [ms]", 2, "ping_ms",
                  {"unit": "ms", "y_floor": 0})):
+            # Przy JEDNYM pliku straty przed naprawa i po naprawie leza na
+            # wspolnym panelu - o to w tym chodzi, zeby odleglosc miedzy
+            # krzywymi bylo widac na pierwszy rzut oka. Przy porownywaniu
+            # plikow osobny panel, bo kolor oznacza wtedy plik.
+            if key == "loss_before" and not multi:
+                continue
             default_color = {"snr": SERIES_COLORS[2], "mcs": SERIES_COLORS[1],
-                             "loss": SERIES_COLORS[5], "mbit": SERIES_COLORS[4],
+                             "loss": SERIES_COLORS[0], "loss_before": SERIES_COLORS[5],
+                             "uratowane": SERIES_COLORS[2], "mbit": SERIES_COLORS[4],
                              "ping": SERIES_COLORS[3]}[key]
             series = []
             for i, log in enumerate(self.logs):
@@ -303,14 +337,25 @@ class ChartArea:
             if series:
                 panels.append(Panel(key, title, weight, series, **opts))
 
-        # PER (blad pakietow narastajaco od poczatku testu) dorysowany do panelu
-        # strat: chwilowe straty skacza z sekundy na sekunde, a PER pokazuje, co
-        # z tego zostaje na calym przebiegu. Przy porownywaniu plikow tego nie
-        # robimy - kolor oznacza wtedy plik i dwie krzywe na plik zlewaly by sie.
         loss_panel = next((p for p in panels if p.key == "loss"), None)
-        if loss_panel and not multi and self.logs[0].has("per_%"):
-            loss_panel.series.append(("PER od poczatku", SERIES_COLORS[0],
-                                      self.logs[0].series("per_%")))
+        if loss_panel and not multi:
+            log = self.logs[0]
+            # Straty PRZED naprawa nad krzywa strat POZOSTALYCH: pole miedzy
+            # nimi to dokladnie te pakiety, ktore zgubilo radio, a FEC odtworzyl
+            # z nadmiarowosci. Bez tej pary z wykresu strat nie da sie odczytac,
+            # czy link jest czysty, czy tylko dobrze lataany.
+            if log.has("straty_przed_%"):
+                loss_panel.title = "Straty pakietow [%] - przed naprawa i po naprawie"
+                loss_panel.weight = 3
+                loss_panel.series.insert(0, ("przed naprawa", SERIES_COLORS[5],
+                                             log.series("straty_przed_%")))
+                loss_panel.series[1] = ("po naprawie",) + loss_panel.series[1][1:]
+            # PER (blad pakietow narastajaco od poczatku testu): chwilowe straty
+            # skacza z sekundy na sekunde, a PER pokazuje, co z tego zostaje na
+            # calym przebiegu.
+            if log.has("per_%"):
+                loss_panel.series.append(("PER od poczatku", SERIES_COLORS[3],
+                                          log.series("per_%")))
         return panels
 
     # --- rysowanie ---
@@ -484,7 +529,12 @@ class ChartArea:
     READOUT = (("rssi_best_dBm", "najlepszy sygnal", "{:.0f} dBm", "{:.0f} dBm"),
                ("snr_best_dB", "SNR", "{:.0f} dB", "SNR {:.0f}"),
                ("rx_mcs", "MCS", "{:.0f}", "MCS {:.0f}"),
-               ("straty_%", "straty", "{:.1f} %", "straty {:.1f}%"),
+               ("straty_przed_%", "straty przed naprawa", "{:.2f} %", "przed {:.2f}%"),
+               ("straty_%", "straty po naprawie", "{:.2f} %", "po {:.2f}%"),
+               ("uratowane_%", "uratowane", "{:.2f} pkt proc.", "urat. {:.2f}"),
+               ("fec_naprawil_s", "naprawione pakiety", "{:.0f} pkt/s", "{:.0f} napr./s"),
+               ("utracone_s", "utracone pakiety", "{:.0f} pkt/s", "{:.0f} utr./s"),
+               ("per_przed_%", "PER bez naprawy", "{:.2f} %", "PER bez {:.2f}%"),
                ("per_%", "PER od poczatku", "{:.2f} %", "PER {:.2f}%"),
                ("rx_Mbit_s", "przeplyw", "{:.2f} Mbit/s", "{:.2f} Mbit/s"),
                ("ping_ms", "ping", "{:.1f} ms", "ping {:.1f} ms"))
@@ -719,7 +769,9 @@ class App(tk.Tk):
 
     STAT_ROWS = (("rssi_best_dBm", "RSSI dBm", "{:.0f}"),
                  ("snr_best_dB", "SNR dB", "{:.0f}"),
-                 ("straty_%", "straty %", "{:.1f}"),
+                 ("straty_przed_%", "przed %", "{:.2f}"),
+                 ("straty_%", "po napr.%", "{:.2f}"),
+                 ("fec_naprawil_s", "napr.pkt/s", "{:.0f}"),
                  ("rx_Mbit_s", "Mbit/s", "{:.2f}"),
                  ("ping_ms", "ping ms", "{:.1f}"))
 
@@ -766,12 +818,33 @@ class App(tk.Tk):
                              f"{fmt.format(hi):>7}")
         if lines:
             lines.insert(0, f"{'':<9}{'min':>7} /{'srednio':>7} /{'max':>7}")
-        per = self._final(log, "per_%")
-        if per is not None:
-            lines.append(f"PER      {per:.2f} % - blad pakietow z calego testu")
+        lines.extend(self._repair_lines(log))
         mcs = sorted({int(v) for _, v in log.series("rx_mcs")})
         if mcs:
             lines.append("MCS      " + ", ".join(str(m) for m in mcs))
+        return lines
+
+    def _repair_lines(self, log):
+        """Ile pakietow uratowala naprawa - liczbowo, bo z samego wykresu da sie
+        odczytac tylko tempo. Tu jest odpowiedz na "ile w sumie zostalo
+        naprawionych" i czy bez naprawy test w ogole by sie udal."""
+        lines = []
+        saved = log.integral("fec_naprawil_s")
+        lost = log.integral("utracone_s")
+        if saved is not None:
+            lines.append(f"NAPRAWIONE {saved:,.0f} pakietow".replace(",", " "))
+        if lost is not None:
+            lines.append(f"UTRACONE   {lost:,.0f} pakietow".replace(",", " "))
+        if saved and lost is not None and (saved + lost) > 0:
+            lines.append(f"           uratowane {100.0 * saved / (saved + lost):.1f}%"
+                         " zgubionych w powietrzu")
+
+        per_before, per = self._final(log, "per_przed_%"), self._final(log, "per_%")
+        if per is not None:
+            lines.append(f"PER        {per:.2f} % - blad pakietow z calego testu")
+        if per_before is not None and per is not None:
+            lines.append(f"           bez naprawy byloby {per_before:.2f} %"
+                         f" (naprawa zdjela {per_before - per:.2f} pkt proc.)")
         return lines
 
     def _comparison_lines(self):
@@ -786,12 +859,22 @@ class App(tk.Tk):
                 stat = log.stat(column)
                 cells.append((fmt.format(stat[1]) if stat else "-").rjust(width))
             lines.append(f"{label:<10}" + "".join(cells))
+        # Laczne liczby pakietow: "ile naprawa uratowala" to jedyna kolumna,
+        # ktora wprost mowi, czy podniesienie FEC bylo cos warte.
+        for column, label in (("fec_naprawil_s", "naprawione"),
+                              ("utracone_s", "utracone")):
+            cells = [log.integral(column) for log in self.logs]
+            if any(v is not None for v in cells):
+                lines.append(f"{label:<10}" + "".join(
+                    (f"{v:.0f}" if v is not None else "-").rjust(width) for v in cells))
+
         # PER na koniec, a nie srednio - to jest liczba, ktora odpowiada na
         # "czy po tej zmianie gubimy mniej pakietow"
-        per_cells = [self._final(log, "per_%") for log in self.logs]
-        if any(v is not None for v in per_cells):
-            lines.append(f"{'PER %':<10}" + "".join(
-                (f"{v:.2f}" if v is not None else "-").rjust(width) for v in per_cells))
+        for column, label in (("per_przed_%", "PER bez %"), ("per_%", "PER %")):
+            per_cells = [self._final(log, column) for log in self.logs]
+            if any(v is not None for v in per_cells):
+                lines.append(f"{label:<10}" + "".join(
+                    (f"{v:.2f}" if v is not None else "-").rjust(width) for v in per_cells))
         lines.append(f"{'czas':<10}" + "".join(
             fmt_time(log.duration()).rjust(width) for log in self.logs))
         lines.append(f"{'probek':<10}" + "".join(
