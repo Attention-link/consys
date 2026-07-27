@@ -4,8 +4,9 @@
 Log z testu to zwykly plik tekstowy rozdzielony srednikami, wiec otworzy sie
 i w notatniku, i w arkuszu - ale z samych liczb nie widac, jak zachowywal sie
 link w czasie. Ten program rysuje to na wykresach na wspolnej osi czasu: RSSI
-kazdej anteny osobno, SNR, modulacje, straty i ping. Naglowek testu (kanal,
-region, moc, modulacja nadawania, karty) i podsumowanie ida do panelu obok.
+kazdej anteny osobno, SNR, modulacje, straty (chwilowe i PER narastajacy od
+poczatku testu) oraz ping. Naglowek testu (kanal, region, moc, modulacja
+nadawania, karty) i podsumowanie ida do panelu obok.
 
 Potrzebny jest tylko Python - zadnych bibliotek do doinstalowania.
 
@@ -301,6 +302,15 @@ class ChartArea:
                                log.series(column)))
             if series:
                 panels.append(Panel(key, title, weight, series, **opts))
+
+        # PER (blad pakietow narastajaco od poczatku testu) dorysowany do panelu
+        # strat: chwilowe straty skacza z sekundy na sekunde, a PER pokazuje, co
+        # z tego zostaje na calym przebiegu. Przy porownywaniu plikow tego nie
+        # robimy - kolor oznacza wtedy plik i dwie krzywe na plik zlewaly by sie.
+        loss_panel = next((p for p in panels if p.key == "loss"), None)
+        if loss_panel and not multi and self.logs[0].has("per_%"):
+            loss_panel.series.append(("PER od poczatku", SERIES_COLORS[0],
+                                      self.logs[0].series("per_%")))
         return panels
 
     # --- rysowanie ---
@@ -475,6 +485,7 @@ class ChartArea:
                ("snr_best_dB", "SNR", "{:.0f} dB", "SNR {:.0f}"),
                ("rx_mcs", "MCS", "{:.0f}", "MCS {:.0f}"),
                ("straty_%", "straty", "{:.1f} %", "straty {:.1f}%"),
+               ("per_%", "PER od poczatku", "{:.2f} %", "PER {:.2f}%"),
                ("rx_Mbit_s", "przeplyw", "{:.2f} Mbit/s", "{:.2f} Mbit/s"),
                ("ping_ms", "ping", "{:.1f} ms", "ping {:.1f} ms"))
 
@@ -738,6 +749,13 @@ class App(tk.Tk):
 
         self.info.configure(state="disabled")
 
+    @staticmethod
+    def _final(log, column):
+        """Ostatnia wartosc kolumny. PER liczy sie narastajaco, wiec to jest
+        wynik calego testu - srednia z takiej krzywej nie znaczylaby nic."""
+        points = log.series(column)
+        return points[-1][1] if points else None
+
     def _stat_lines(self, log):
         lines = []
         for column, label, fmt in self.STAT_ROWS:
@@ -748,6 +766,9 @@ class App(tk.Tk):
                              f"{fmt.format(hi):>7}")
         if lines:
             lines.insert(0, f"{'':<9}{'min':>7} /{'srednio':>7} /{'max':>7}")
+        per = self._final(log, "per_%")
+        if per is not None:
+            lines.append(f"PER      {per:.2f} % - blad pakietow z calego testu")
         mcs = sorted({int(v) for _, v in log.series("rx_mcs")})
         if mcs:
             lines.append("MCS      " + ", ".join(str(m) for m in mcs))
@@ -765,6 +786,12 @@ class App(tk.Tk):
                 stat = log.stat(column)
                 cells.append((fmt.format(stat[1]) if stat else "-").rjust(width))
             lines.append(f"{label:<10}" + "".join(cells))
+        # PER na koniec, a nie srednio - to jest liczba, ktora odpowiada na
+        # "czy po tej zmianie gubimy mniej pakietow"
+        per_cells = [self._final(log, "per_%") for log in self.logs]
+        if any(v is not None for v in per_cells):
+            lines.append(f"{'PER %':<10}" + "".join(
+                (f"{v:.2f}" if v is not None else "-").rjust(width) for v in per_cells))
         lines.append(f"{'czas':<10}" + "".join(
             fmt_time(log.duration()).rjust(width) for log in self.logs))
         lines.append(f"{'probek':<10}" + "".join(

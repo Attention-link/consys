@@ -877,16 +877,6 @@ def rx_packets(msg, name):
     return _num(value), _num(value)
 
 
-def rx_loss_pct(msg):
-    """Procent pakietow, ktore przepadly bezpowrotnie. 'all' to wszystko, co
-    dotarlo, 'lost' - dziury wykryte po numerach sekwencji. Pakiety odtworzone
-    przez FEC nie sa strata: doszly, tylko okrezna droga."""
-    got = rx_packets(msg, "all")[0]
-    lost = rx_packets(msg, "lost")[0]
-    total = got + lost
-    return (100.0 * lost / total) if total else None
-
-
 # 802.11n, jeden strumien przestrzenny: modulacja, sprawnosc kodowania i
 # predkosc PHY w Mbit/s dla 20 i 40 MHz przy dlugim i krotkim odstepie
 # ochronnym (GI). Im wyzszy MCS, tym gestsza modulacja: wiecej Mbit/s, ale
@@ -970,10 +960,6 @@ def tx_radio_params(max_age=5.0):
     _tx_params_cache.update(t=now, val=out)
     return out
 
-
-# Domyslne numery portow radiowych wfb-ng - sluza tylko do podpisania wiersza,
-# sam numer i tak jest obok.
-RADIO_PORT_NAMES = {"0": "video", "1": "mavlink", "2": "tunnel"}
 
 # Krotkie podpisy przy skrajnych i srodkowym MCS - reszta ustawia sie miedzy
 # nimi, nie ma po co powtarzac tego przy kazdym wierszu.
@@ -3192,6 +3178,58 @@ class Stat:
                 f"   max {fmt.format(self.hi)}")
 
 
+class RunTotals:
+    """Ile pakietow przeszlo i ile przepadlo OD POCZATKU TESTU - razem ze
+    wspolczynnikiem bledu pakietow (PER).
+
+    wfb-ng podaje sumy od startu uslugi, a nie od chwili, w ktorej zaczelismy
+    patrzec. Typowy przypadek: test wlacza sie pierwszy, a nadawanie (np. wideo
+    z innego programu) rusza chwile pozniej - liczniki uslugi maja wtedy juz
+    jakas historie, ktora nie ma nic wspolnego z tym, co wlasnie mierzymy.
+    Dlatego zapamietujemy stan z pierwszej probki i liczymy przyrost.
+
+    Gdy usluga sie zrestartuje, jej liczniki lecą od zera i roznica wyszla by
+    ujemna - wtedy zapamietujemy dotychczasowy dorobek i liczymy od nowego zera,
+    zeby PER z calego przelotu sie nie zgubil."""
+
+    FIELDS = {"rx": "rx_total", "lost": "lost_total",
+              "fec": "fec_total", "bad": "bad_total"}
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._base = None
+        self._carry = {k: 0.0 for k in self.FIELDS}
+        self.totals = {k: 0.0 for k in self.FIELDS}
+        self.restarts = 0
+
+    def update(self, metrics):
+        now = {k: metrics.get(src) or 0.0 for k, src in self.FIELDS.items()}
+        if self._base is None:
+            self._base = now
+        elif any(now[k] < self._base[k] for k in now):
+            self._carry = dict(self.totals)
+            self._base = {k: 0.0 for k in now}
+            self.restarts += 1
+        self.totals = {k: self._carry[k] + now[k] - self._base[k] for k in now}
+        return self.totals
+
+    @property
+    def per(self):
+        """Procent pakietow, ktore przepadly bezpowrotnie (po naprawie FEC).
+        None, dopoki nic nie przyszlo - zero bylo by tu klamstwem."""
+        seen = self.totals["rx"] + self.totals["lost"]
+        return (100.0 * self.totals["lost"] / seen) if seen else None
+
+    @property
+    def fec_pct(self):
+        """Ile procent ramek trzeba bylo odtworzyc z nadmiarowych - czyli ile
+        gubilo sie w powietrzu, zanim FEC to naprawil."""
+        rx = self.totals["rx"]
+        return (100.0 * self.totals["fec"] / rx) if rx else None
+
+
 # Cztery probki na sekunde. Statystyki z API wfb-ng przychodzia raz na sekunde,
 # wiec kolumny sygnalu potrafia sie powtorzyc kilka razy pod rzad - ale
 # liczniki kart i ping maja wlasne tempo, a przy szybkiej zmianie (obrot
@@ -3374,8 +3412,8 @@ class TestRecorder:
     srednikami, wiec plik otwiera sie tez w arkuszu."""
 
     COLUMNS = ("czas", "sek", "rssi_best_dBm", "snr_best_dB", "rx_mcs", "rx_bw_MHz",
-               "straty_%", "rx_pkt_s", "rx_Mbit_s", "fec_naprawil_s", "utracone_s",
-               "ping_ms", "ping_utrata_%", "anteny_rssi")
+               "straty_%", "per_%", "rx_pkt_s", "rx_Mbit_s", "fec_naprawil_s",
+               "utracone_s", "ping_ms", "ping_utrata_%", "anteny_rssi")
 
     def __init__(self, path):
         self.path = path
@@ -3386,6 +3424,9 @@ class TestRecorder:
         self._loss = Stat()
         self._ping = Stat()
         self._mcs = {}
+        # straty_% to chwila, per_% to caly test - przy szukaniu zasiegu liczy
+        # sie to drugie, bo pojedyncza sekunda potrafi klamac w obie strony
+        self._run = RunTotals()
 
     def open(self):
         """Moze rzucic OSError - wolajacy pokazuje to w okienku i test idzie
@@ -3414,10 +3455,8 @@ class TestRecorder:
             w(f"# karta {nic}: mac={d['mac']} usb={d['usb']} tryb={d['mode']}"
               f" kanal={d['channel']}\n")
         for tx in tx_radio_params():
-            port = str(tx.get("port", "?"))
             main, extra = tx_modulation_txt(tx)
-            w(f"# nadawanie {RADIO_PORT_NAMES.get(port, 'port ' + port)} (port {port}):"
-              f" {main}   {extra}\n")
+            w(f"# nadawanie (port {tx.get('port', '?')}): {main}   {extra}\n")
         w(f"# druga strona: {PEER_NAME} {PEER_IP}\n")
         w(f"# probkowanie: {LOG_SAMPLE_HZ} Hz (co {LOG_SAMPLE_PERIOD:.2f} s);"
           " wfb-ng oddaje statystyki raz na sekunde,\n"
@@ -3439,6 +3478,7 @@ class TestRecorder:
         rssi, snr, loss = metrics["best_rssi"], metrics["best_snr"], metrics["loss"]
         ants = " ".join(f"{a['label'].replace(' ', ':')}={a['rssi'][1]:.0f}"
                         for a in metrics["ants"] if a["rssi"])
+        self._run.update(metrics)
 
         def num(value, fmt="{:.1f}"):
             return fmt.format(value) if value is not None else ""
@@ -3448,6 +3488,7 @@ class TestRecorder:
                                                           # musza miec ulamek
             num(rssi, "{:.0f}"), num(snr, "{:.0f}"),
             num(metrics["mcs"], "{:.0f}"), num(metrics["bw"], "{:.0f}"), num(loss),
+            num(self._run.per, "{:.2f}"),
             f"{metrics['rx_pps']:.0f}", f"{mbit(metrics['rx_bytes']):.2f}",
             f"{metrics['fec']:.0f}", f"{metrics['lost']:.0f}",
             num(rtt[1] if rtt else None), num(last_loss, "{:.0f}"), ants,
@@ -3475,6 +3516,19 @@ class TestRecorder:
         w(f"# RSSI [dBm]:  {self._rssi.line('{:.0f}')}\n")
         w(f"# straty [%]:  {self._loss.line()}\n")
         w(f"# ping [ms]:   {self._ping.line()}\n")
+
+        run, per = self._run.totals, self._run.per
+        seen = run["rx"] + run["lost"]
+        w(f"# blad pakietow (PER) z calego testu: "
+          + (f"{per:.2f}% - {run['lost']:.0f} utraconych z {seen:.0f}"
+             if per is not None else "brak danych - nic nie przyszlo") + "\n")
+        if run["rx"]:
+            w(f"# FEC naprawil: {run['fec']:.0f} ramek ({self._run.fec_pct:.2f}%)"
+              " - zgubione w powietrzu, ale odtworzone\n")
+        if run["bad"]:
+            w(f"# ramki bledne/nieodszyfrowane: {run['bad']:.0f}\n")
+        if self._run.restarts:
+            w(f"# usluga wfb-ng restartowala sie w trakcie: {self._run.restarts}x\n")
         for (mcs, bw), count in sorted(self._mcs.items(), key=lambda kv: -kv[1]):
             desc, rate = mcs_info(mcs, bw)
             w(f"# odbior: {desc}, {bw_mhz(bw)} MHz"
@@ -3590,24 +3644,21 @@ def meter(value, lo, hi, width=18):
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
-STREAM_ORDER = ("video", "mavlink", "tunnel")
-
-
-def stream_key(name):
-    base = (name or "").split()[0]
-    return (STREAM_ORDER.index(base) if base in STREAM_ORDER else len(STREAM_ORDER), name or "")
-
-
 def link_metrics(msgs, nics):
     """Liczby wyluskane z wiadomosci API. Osobno od rysowania, bo dokladnie te
-    same wartosci ida na ekran i do pliku z zapisem testu - liczymy je raz."""
+    same wartosci ida na ekran i do pliku z zapisem testu - liczymy je raz.
+
+    Strumieni (wideo, mavlink, tunel) nie rozdzielamy. Przez to lacze idzie
+    zwykly ruch IP i to, ktory strumien akurat go niesie, nic nie mowi o jakosci
+    radia - a liczenie strat z jednego wybranego strumienia potrafilo pokazywac
+    zero tylko dlatego, ze nikt nim nie nadawal. Liczniki sumujemy po wszystkich,
+    bo dla radia to i tak jeden strumien ramek."""
     rx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "rx"}
     tx_msgs = {name: m for (kind, name), m in msgs.items() if kind == "tx"}
 
     ants = []
-    for name in sorted(rx_msgs, key=stream_key):
+    for name in sorted(rx_msgs):
         ants.extend(antenna_rows(rx_msgs[name], nics))
-    main_rx = next((rx_msgs[n] for n in sorted(rx_msgs, key=stream_key)), None)
 
     # Modulacja odbieranych ramek. Zwykle jedna dla wszystkich anten, ale przy
     # zmianie ustawien po drugiej stronie potrafia sie chwilowo mieszac -
@@ -3619,11 +3670,18 @@ def link_metrics(msgs, nics):
             mods[key] = mods.get(key, 0) + a["count"]
     top_mod = max(mods, key=mods.get) if mods else (None, None)
 
+    def total(name, idx=0):
+        return sum(rx_packets(m, name)[idx] for m in rx_msgs.values())
+
+    # 'all' to wszystko, co dotarlo, 'lost' - dziury wykryte po numerach
+    # sekwencji. Pakiety odtworzone przez FEC nie sa strata: doszly, tylko
+    # okrezna droga.
+    got, lost = total("all"), total("lost")
+
     return {
         "rx": rx_msgs,
         "tx": tx_msgs,
         "ants": ants,
-        "main_rx": main_rx,
         "mods": mods,
         "mcs": top_mod[0],
         "bw": top_mod[1],
@@ -3631,19 +3689,25 @@ def link_metrics(msgs, nics):
         # strumien z tej, ktora akurat slyszy lepiej.
         "best_rssi": max((a["rssi"][1] for a in ants if a["rssi"]), default=None),
         "best_snr": max((a["snr"][1] for a in ants if a["snr"]), default=None),
-        "loss": rx_loss_pct(main_rx) if main_rx else None,
-        "rx_pps": sum(rx_packets(m, "all")[0] for m in rx_msgs.values()),
-        "rx_bytes": ((rx_packets(main_rx, "out_bytes")[0]
-                      or rx_packets(main_rx, "all_bytes")[0]) if main_rx else 0),
-        "fec": rx_packets(main_rx, "fec_rec")[0] if main_rx else 0,
-        "lost": rx_packets(main_rx, "lost")[0] if main_rx else 0,
-        "lost_total": rx_packets(main_rx, "lost")[1] if main_rx else 0,
+        "loss": (100.0 * lost / (got + lost)) if (got + lost) else None,
+        "rx_pps": got,
+        "rx_bytes": total("out_bytes") or total("all_bytes"),
+        "fec": total("fec_rec"),
+        "bad": total("bad") + total("dec_err"),
+        "lost": lost,
+        # sumy od startu uslugi - same w sobie malo mowia, sluza do liczenia
+        # przyrostu od poczatku testu (RunTotals)
+        "rx_total": total("all", 1),
+        "lost_total": total("lost", 1),
+        "fec_total": total("fec_rec", 1),
+        "bad_total": total("bad", 1) + total("dec_err", 1),
     }
 
 
-def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapsed):
+def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, elapsed):
     """Cala tresc ekranu testu jako lista (tekst, atrybut) - budowana od nowa
-    przy kazdym odswiezeniu, bo wszystkie liczby sa chwilowe."""
+    przy kazdym odswiezeniu, bo wszystkie liczby sa chwilowe. Wyjatkiem sa
+    'worst' i 'run' - one pamietaja caly przebieg testu."""
     lines = []
 
     def blank():
@@ -3667,7 +3731,6 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
         worst["rssi"] = min(worst["rssi"], best_rssi) if worst["rssi"] is not None else best_rssi
     if loss is not None:
         worst["loss"] = max(worst["loss"], loss) if worst["loss"] is not None else loss
-    worst["lost"] = max(worst["lost"], metrics["lost_total"])
 
     rssi_st, rssi_txt = rssi_grade(best_rssi)
     loss_st, loss_txt = loss_grade(loss)
@@ -3690,6 +3753,8 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
         parts.append(f"MCS {metrics['mcs']}")
     if loss is not None:
         parts.append(f"straty {loss:.1f}%")
+    if run.per is not None:
+        parts.append(f"PER {run.per:.2f}%")
     if rtt:
         parts.append(f"ping {rtt[1]:.1f} ms")
     parts.append(f"czas testu {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
@@ -3718,11 +3783,14 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
     else:
         row(f"{'odbior':<11}brak danych - nic nie przychodzi", "warn")
     tx_params = tx_radio_params()
+    by_mod = {}
     for tx in tx_params:
-        port = str(tx.get("port", "?"))
-        who = RADIO_PORT_NAMES.get(port, "port " + port)
-        main, extra = tx_modulation_txt(tx)
-        row(f"{'nadawanie':<11}{who} (port {port}): {main}")
+        by_mod.setdefault(tx_modulation_txt(tx), []).append(str(tx.get("port", "?")))
+    for (main, extra), ports in by_mod.items():
+        # numery gniazd tylko wtedy, gdy nadajniki roznia sie ustawieniami -
+        # przy jednakowych to zbedny szum, bo nadajemy wszystkim tak samo
+        where = f"   (porty {', '.join(ports)})" if len(by_mod) > 1 else ""
+        row(f"{'nadawanie':<11}{main}{where}")
         row(extra, indent=13)
     if not tx_params:
         row(f"{'nadawanie':<11}nie widac zadnego wfb_tx - usluga nie dziala?", "warn")
@@ -3730,55 +3798,92 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
     row(" predkosc odbioru liczona przy dlugim GI, bo ramka jej nie niesie)")
 
     if ants:
-        section("Sygnal (kazda antena osobno)")
-        for a in ants:
-            rssi, snr = a["rssi"], a["snr"]
-            st, txt = rssi_grade(rssi[1] if rssi else None)
-            where = f"{a['freq']} MHz" if a["freq"] else ""
-            if a["mcs"] is not None:
-                where += f"   MCS {a['mcs']}"
-            row(f"{a['label']:<16}{a['count']:>7.0f} pkt/s   {where}", st)
-            if rssi:
-                row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
-                    f"{meter(rssi[1], -90, -40)}  {txt}", st, indent=4)
+        # Jedna linia zamiast wiersza na kazdy tor odbiorczy karty. RSSI
+        # pojedynczego toru nie mowi nic o jakosci lacza: wfb-ng sklada strumien
+        # z tego, ktory akurat slyszy lepiej, i tak samo liczona jest ocena na
+        # gorze ekranu. Rozbicie na anteny zostaje w zapisie do pliku (kolumna
+        # anteny_rssi) - tam przydaje sie przy ustawianiu anten.
+        section(f"Sygnal odbierany z {PEER_NAME}")
+        best = max((a for a in ants if a["rssi"]), key=lambda a: a["rssi"][1],
+                   default=None)
+        if not best:
+            row("brak danych o sygnale - ramki przychodza bez statystyk anten", "warn")
+        else:
+            rssi, snr = best["rssi"], best["snr"]
+            st, txt = rssi_grade(rssi[1])
+            row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
+                f"{meter(rssi[1], -90, -40)}  {txt}", st)
             if snr:
                 sst, stxt = snr_grade(snr[1])
                 row(f"SNR  {snr[0]:>5.0f}/{snr[1]:>5.0f}/{snr[2]:>5.0f} dB   "
-                    f"{meter(snr[1], 0, 40)}  {stxt}", sst, indent=4)
-        row("(min / srednia / max w ostatniej sekundzie)")
+                    f"{meter(snr[1], 0, 40)}  {stxt}", sst)
+            # bez licznika ramek: statystyki anten przychodza osobno dla kazdego
+            # strumienia, wiec liczba z jednego wiersza nie jest calym ruchem -
+            # ten jest ponizej, w sekcji odbioru
+            where = f"{best['freq']} MHz" if best["freq"] else ""
+            if best["mcs"] is not None:
+                where += ("   " if where else "") + f"MCS {best['mcs']}"
+            if where:
+                row(f"kanal  {where}")
+            row("(min / srednia / max w ostatniej sekundzie)")
 
+    # Bez podzialu na wideo / mavlink / tunel: to jedno lacze IP i moze nim isc
+    # cokolwiek, wiec liczy sie suma. Nazwa strumienia mowi tylko, ktorym
+    # gniazdem szedl pakiet, a nie jak zachowuje sie radio.
     if rx_msgs:
         section("Odbior (RX)")
-        for name in sorted(rx_msgs, key=stream_key):
-            m = rx_msgs[name]
-            got, got_all = rx_packets(m, "all")
-            fec = rx_packets(m, "fec_rec")[0]
-            lost, lost_all = rx_packets(m, "lost")
-            bad = rx_packets(m, "bad")[0] + rx_packets(m, "dec_err")[0]
-            bytes_s = rx_packets(m, "out_bytes")[0] or rx_packets(m, "all_bytes")[0]
-            pct = rx_loss_pct(m)
-            st = loss_grade(pct)[0]
-            row(f"{name:<16}{got:>7.0f} pkt/s   {mbit(bytes_s):>7.2f} Mbit/s", st)
-            row(f"FEC naprawil {fec:.0f}/s   utracone {lost:.0f}/s"
-                + (f" ({pct:.1f}%)" if pct is not None else "")
-                + f"   bledne {bad:.0f}/s", st, indent=4)
-            row(f"od startu uslugi: odebrane {got_all:.0f}, utracone {lost_all:.0f}", indent=4)
+        row(f"{'odebrane':<16}{rx_pps_total:>7.0f} pkt/s   "
+            f"{mbit(metrics['rx_bytes']):>7.2f} Mbit/s", loss_st)
+        row(f"FEC naprawil {metrics['fec']:.0f}/s   utracone {metrics['lost']:.0f}/s"
+            + (f" ({loss:.1f}%)" if loss is not None else "")
+            + f"   bledne {metrics['bad']:.0f}/s", loss_st, indent=4)
+        row(f"od startu uslugi: odebrane {metrics['rx_total']:.0f}, "
+            f"utracone {metrics['lost_total']:.0f}", indent=4)
         row("(FEC naprawil = pakiety odtworzone z nadmiarowych - doszly, ale link sie meczy)")
+
+        # To jest odpowiedz na "ile gubimy": pojedyncza sekunda potrafi pokazac
+        # 0% albo 30% zaleznie od tego, kiedy sie spojrzy, a przy nadawaniu
+        # z innego programu liczy sie caly przebieg.
+        section("Blad pakietow (PER) od poczatku testu")
+        totals, per = run.totals, run.per
+        seen = totals["rx"] + totals["lost"]
+        if per is None:
+            row("nic jeszcze nie doszlo - PER policzy sie, gdy ruszy nadawanie", "warn")
+        else:
+            row(f"PER {per:>6.2f}%   {meter(per, 5, 0)}   "
+                f"{totals['lost']:.0f} utraconych z {seen:.0f}", loss_grade(per)[0])
+            if totals["rx"]:
+                row(f"FEC naprawil {totals['fec']:.0f} ramek ({run.fec_pct:.2f}%)"
+                    " - zgubione w powietrzu, ale odtworzone", indent=4)
+            if totals["bad"]:
+                row(f"bledne / nieodszyfrowane: {totals['bad']:.0f}", "warn", indent=4)
+        if run.restarts:
+            row(f"usluga wfb-ng restartowala sie {run.restarts}x - liczymy dalej",
+                "warn", indent=4)
+        row("(PER = pakiety, ktorych nie odratowal FEC, wzgledem wszystkich wyslanych;")
+        row(" liczone od wejscia na ten ekran, klawisz 'z' zeruje)")
 
     if tx_msgs:
         section("Nadawanie (TX)")
-        for name in sorted(tx_msgs, key=stream_key):
-            m = tx_msgs[name]
-            inj = rx_packets(m, "injected")[0]
-            dropped = rx_packets(m, "dropped")[0]
-            bytes_s = rx_packets(m, "injected_bytes")[0]
-            st = "warn" if dropped > 0 else None
-            row(f"{name:<16}{inj:>7.0f} pkt/s   {mbit(bytes_s):>7.2f} Mbit/s   "
-                f"odrzucone {dropped:.0f}/s", st)
+        inj = sum(rx_packets(m, "injected")[0] for m in tx_msgs.values())
+        dropped = sum(rx_packets(m, "dropped")[0] for m in tx_msgs.values())
+        tx_bytes = sum(rx_packets(m, "injected_bytes")[0] for m in tx_msgs.values())
+        row(f"{'nadane':<16}{inj:>7.0f} pkt/s   {mbit(tx_bytes):>7.2f} Mbit/s   "
+            f"odrzucone {dropped:.0f}/s", "warn" if dropped > 0 else None)
+
+        # liczniki kart tez sumujemy po strumieniach - karta jest jedna, nawet
+        # gdy nadaje przez nia kilka gniazd naraz
+        cards = {}
+        for m in tx_msgs.values():
             for label, w_inj, w_drop, lat in tx_wlan_rows(m, nics):
-                extra = f"   wstrzykiwanie {lat:.1f} ms" if lat else ""
-                row(f"{label:<14}nadane {w_inj:.0f}   odrzucone {w_drop:.0f}{extra}",
-                    "warn" if w_drop else None, indent=4)
+                prev = cards.get(label, (0.0, 0.0, None))
+                cards[label] = (prev[0] + w_inj, prev[1] + w_drop,
+                                max(lat or 0.0, prev[2] or 0.0) or None)
+        for label in sorted(cards):
+            w_inj, w_drop, lat = cards[label]
+            extra = f"   wstrzykiwanie {lat:.1f} ms" if lat else ""
+            row(f"{label:<14}nadane {w_inj:.0f}   odrzucone {w_drop:.0f}{extra}",
+                "warn" if w_drop else None, indent=4)
 
     section(f"Tunel do {PEER_NAME} ({PEER_IP}) - ping leci przez radio")
     if rtt:
@@ -3808,8 +3913,6 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, elapse
         rssi_grade(worst["rssi"])[0])
     row(f"straty {worst['loss']:.1f}%" if worst["loss"] is not None else "straty ?",
         loss_grade(worst["loss"])[0])
-    if worst["lost"]:
-        row(f"pakietow utraconych lacznie (od startu uslugi): {worst['lost']:.0f}")
 
     return lines
 
@@ -3950,7 +4053,8 @@ def link_test_screen(stdscr):
     nics = wfb_nics()
     used = service_nics(set(nics))
     counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in nics}
-    worst = {"rssi": None, "loss": None, "lost": 0}
+    worst = {"rssi": None, "loss": None}
+    run = RunTotals()  # PER i sumy od poczatku testu, nie od startu uslugi
     started = time.monotonic()
     next_nic_scan = started + 2.0
     next_state = started + 0.5
@@ -3982,9 +4086,10 @@ def link_test_screen(stdscr):
             msgs, api_error = stats.snapshot()
             ping_snap = ping.snapshot()
             metrics = link_metrics(msgs, nics)
+            run.update(metrics)
             elapsed = now - started
             lines = link_test_lines(metrics, api_error, nics, used, traffic,
-                                    ping_snap, worst, elapsed)
+                                    ping_snap, worst, run, elapsed)
 
             # Stan zapisu czytamy z pliku, bo pisze go inny proces. Dwa razy
             # na sekunde wystarczy - on i tak odswieza go raz na sekunde.
@@ -4023,8 +4128,9 @@ def link_test_screen(stdscr):
             elif key == curses.KEY_PPAGE:
                 top -= view
             elif key in (ord("z"), ord("Z")):
-                worst.update(rssi=None, loss=None, lost=0)
+                worst.update(rssi=None, loss=None)
                 ping.reset()
+                run.reset()
                 started = now
                 note_test_recorder("wyzerowano liczniki testu")
             elif key in (ord("t"), ord("T")):
@@ -4450,14 +4556,17 @@ def channel_scan_screen(stdscr, nic, previous):
 
 
 def live_mcs_txt(live):
-    """Czym nadaja w tej chwili procesy wfb_tx - jedna linia do naglowka."""
+    """Czym nadaja w tej chwili procesy wfb_tx - jedna linia do naglowka.
+    Numery gniazd wychodza na wierzch dopiero wtedy, gdy nie wszystkie nadaja
+    tak samo; w normalnej sytuacji jest to jedna wartosc dla calego radia."""
     if not live:
         return "brak dzialajacego wfb_tx"
-    parts = []
+    by_mcs = {}
     for tx in live:
-        port = str(tx.get("port", "?"))
-        parts.append(f"{RADIO_PORT_NAMES.get(port, 'port ' + port)} MCS {tx.get('mcs', '?')}")
-    return ", ".join(parts)
+        by_mcs.setdefault(str(tx.get("mcs", "?")), []).append(str(tx.get("port", "?")))
+    if len(by_mcs) == 1:
+        return f"MCS {next(iter(by_mcs))}"
+    return ", ".join(f"MCS {mcs} (porty {', '.join(ports)})" for mcs, ports in by_mcs.items())
 
 
 def modulation_screen(stdscr):
