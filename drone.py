@@ -13,9 +13,9 @@ karty faktycznie sa widoczne, przepiete pod nasz sterownik i przepuszczaja
 ruch.
 
 Karty dostaja stale nazwy (NIC_NAMES: drone_RX, drone_TX) zamiast wlanX -
-przypiete regula udev do gniazda USB, wiec ta sama karta w tym samym porcie
-ma zawsze te sama nazwe. To sa etykiety portow, a nie podzial rol: obie
-karty i odbieraja, i nadaja.
+przypiete regula udev do MAC-a karty, wiec ta sama karta ma zawsze te sama
+nazwe, niezaleznie od portu USB. To sa na razie tylko etykiety, a nie podzial
+rol: obie karty i odbieraja, i nadaja.
 
 Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec link wstaje
 od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
@@ -75,9 +75,10 @@ REBOOT_MARKER = Path("/etc/.wfb-drone-reboot-attempted")
 
 # Zamiast wlan1/wlan2 (numer zalezy od kolejnosci wykrycia i potrafi sie zamienic
 # miedzy bootami) dajemy kartom stale, czytelne nazwy. Nazwa jest przypieta do
-# GNIAZDA USB, wiec po restarcie ta sama karta w tym samym porcie ma ta sama
-# nazwe. UWAGA: to sa etykiety fizycznych portow - wfb-ng i tak odbiera z obu
-# kart i przez obie nadaje, RX/TX nie oznacza podzialu rol.
+# MAC-a karty, wiec jedzie razem z donglem takze po przelozeniu go do innego
+# portu USB - istotne, gdy do konkretnej karty przykrecony jest wzmacniacz.
+# UWAGA: wfb-ng nadal odbiera z obu kart i przez obie nadaje - sama nazwa
+# NIE dzieli rol, rozdzial trzeba wymusic w konfiguracji uslugi.
 NIC_NAMES = ["drone_RX", "drone_TX"]
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
@@ -158,10 +159,22 @@ def usb_rtl_dongles():
 
 def nic_usb_slot(nic):
     """Gniazdo USB karty, np. '1-1:1.0'. Stale dla danego portu niezaleznie od
-    tego, ktory dongiel w nim siedzi - dlatego to na nim wieszamy nazwy."""
+    tego, ktory dongiel w nim siedzi - uzywane jako zapasowa kotwica nazwy,
+    gdy MAC-a nie da sie odczytac albo dwie karty maja ten sam."""
     dev = Path("/sys/class/net") / nic / "device"
     try:
         return dev.resolve().name if dev.exists() else ""
+    except OSError:
+        return ""
+
+
+def nic_mac(nic):
+    """MAC karty, malymi literami. To na nim wieszamy nazwy: MAC jedzie razem
+    z dongla, wiec karta przelozona do innego portu zachowuje swoja nazwe -
+    a przy sprzecie przykreconym do konkretnej karty (wzmacniacz, antena) to
+    wlasnie karta, a nie gniazdo, musi trzymac tozsamosc."""
+    try:
+        return (Path("/sys/class/net") / nic / "address").read_text().strip().lower()
     except OSError:
         return ""
 
@@ -172,10 +185,7 @@ def nic_details(nic):
     base = Path("/sys/class/net") / nic
     info = {"driver": "?", "mac": "?", "usb": "?", "mode": "?", "channel": "?"}
 
-    try:
-        info["mac"] = (base / "address").read_text().strip()
-    except OSError:
-        pass
+    info["mac"] = nic_mac(nic) or "?"
 
     drv = base / "device" / "driver"
     if drv.exists():
@@ -2097,58 +2107,100 @@ def release_nics_from_network_stack(nics):
 
 # ------------------------- stale nazwy kart -------------------------
 
+EMPTY_MACS = ("", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+
+
 def parse_name_rules():
-    """{gniazdo USB: nazwa} z naszego pliku regul udev - czyli przypisania,
-    ktore juz kiedys ustalilismy."""
+    """{kotwica: nazwa} z naszego pliku regul udev - czyli przypisania, ktore
+    juz kiedys ustalilismy. Kotwica to ("mac", adres) albo ("slot", gniazdo);
+    starsze wersje skryptu pisaly wylacznie reguly na gniazdo, wiec czytamy
+    oba warianty."""
     mapping = {}
     if not UDEV_NAMES.exists():
         return mapping
     for line in UDEV_NAMES.read_text().splitlines():
-        m = re.search(r'KERNELS=="([^"]+)".*NAME="([^"]+)"', line)
-        if m:
-            mapping[m.group(1)] = m.group(2)
+        name = re.search(r'NAME="([^"]+)"', line)
+        if not name:
+            continue
+        mac = re.search(r'ATTR\{address\}=="([^"]+)"', line)
+        slot = re.search(r'KERNELS=="([^"]+)"', line)
+        if mac:
+            mapping[("mac", mac.group(1).lower())] = name.group(1)
+        elif slot:
+            mapping[("slot", slot.group(1))] = name.group(1)
     return mapping
 
 
+def nic_anchors(nics):
+    """{interfejs: kotwica nazwy}. Domyslnie MAC - jedzie razem z dongla, wiec
+    karta przelozona do innego portu zostaje soba (istotne, gdy do konkretnej
+    karty przykrecony jest wzmacniacz albo antena kierunkowa). Gniazdo USB
+    zostaje awaryjnie: dla kart bez czytelnego MAC-a i dla tanich klonow, ktore
+    potrafia miec fabrycznie ten sam adres - tam MAC nie rozroznia niczego."""
+    macs = {nic: nic_mac(nic) for nic in nics}
+    seen = list(macs.values())
+    out = {}
+    for nic in nics:
+        mac = macs[nic]
+        if mac not in EMPTY_MACS and seen.count(mac) == 1:
+            out[nic] = ("mac", mac)
+        else:
+            slot = nic_usb_slot(nic)
+            out[nic] = ("slot", slot) if slot else None
+    return out
+
+
 def plan_nic_names(nics):
-    """Przydziela nazwy kartom. Raz ustalone przypisanie gniazdo->nazwa zostaje
-    (lezy w regulach udev), nowe gniazdo dostaje pierwsza wolna nazwe. Dzieki
+    """Przydziela nazwy kartom. Raz ustalone przypisanie karta->nazwa zostaje
+    (lezy w regulach udev), nowa karta dostaje pierwsza wolna nazwe. Dzieki
     temu przy jednej wypietej karcie druga NIE przejmuje jej nazwy - inaczej po
     kazdym przepieciu dongla nazwy mowilyby co innego niz poprzednio.
-    Zwraca (mapa gniazdo->nazwa, mapa interfejs->nazwa)."""
-    by_slot = parse_name_rules()
+    Zwraca (mapa kotwica->nazwa, mapa interfejs->nazwa)."""
+    by_anchor = parse_name_rules()
+    anchors = nic_anchors(nics)
     slots = {nic: nic_usb_slot(nic) for nic in nics}
-    live = {s for s in slots.values() if s}
+    live = {a for a in anchors.values() if a}
 
-    # Puste gniazdo nie moze w nieskonczonosc trzymac nazwy - inaczej dongiel
-    # przelozony do innego portu zostawaly przy wlanX. Ale zwalniamy je TYLKO
-    # gdy jest jakas karta bez nazwy, czyli jest komu te nazwe oddac: sam
-    # chwilowy brak dongla (zly kabel, port nie wstal po boocie) niczego nie
-    # przestawia i po ponownym wpieciu karta wraca do swojej nazwy.
-    if any(s not in by_slot for s in live):
-        for slot in [s for s in by_slot if s not in live]:
-            del by_slot[slot]
+    # Przejscie ze starych regul (na gniazdo) na nowe (na MAC): karta, ktora ma
+    # juz nazwe z gniazda, zabiera ja ze soba na swoj MAC. Bez tego pierwsze
+    # uruchomienie nowej wersji przetasowalo by nazwy.
+    for nic, anchor in anchors.items():
+        old = ("slot", slots[nic])
+        if anchor and anchor[0] == "mac" and anchor not in by_anchor and old in by_anchor:
+            by_anchor[anchor] = by_anchor.pop(old)
 
-    free = [n for n in NIC_NAMES if n not in by_slot.values()]
+    # Nieobecna karta nie moze w nieskonczonosc trzymac nazwy - inaczej po
+    # wymianie dongla nowy zostawalby przy wlanX. Ale zwalniamy ja TYLKO gdy
+    # jest jakas karta bez nazwy, czyli jest komu te nazwe oddac: sam chwilowy
+    # brak dongla (zly kabel, port nie wstal po boocie) niczego nie przestawia
+    # i po ponownym wpieciu karta wraca do swojej nazwy.
+    if any(a not in by_anchor for a in live):
+        for anchor in [a for a in by_anchor if a not in live]:
+            del by_anchor[anchor]
+
+    free = [n for n in NIC_NAMES if n not in by_anchor.values()]
     per_nic = {}
-    for nic in sorted(nics, key=lambda n: slots[n]):
-        slot = slots[nic]
-        if not slot:
-            continue  # karta bez gniazda USB - nie ma czego zakotwiczyc w regule
-        if slot not in by_slot:
+    for nic in sorted(nics, key=lambda n: (slots[n], n)):
+        anchor = anchors[nic]
+        if not anchor:
+            continue  # nie ma czego zakotwiczyc w regule
+        if anchor not in by_anchor:
             if not free:
                 continue  # wiecej kart niz nazw - reszta zostaje przy wlanX
-            by_slot[slot] = free.pop(0)
-        per_nic[nic] = by_slot[slot]
-    return by_slot, per_nic
+            by_anchor[anchor] = free.pop(0)
+        per_nic[nic] = by_anchor[anchor]
+    return by_anchor, per_nic
 
 
-def write_name_rules(by_slot):
+def write_name_rules(by_anchor):
     txt = ("# generowane przez skrypt wfb - nie edytuj recznie\n"
-           "# stale nazwy kart RTL88xx; nazwa jest przypieta do GNIAZDA USB,\n"
-           "# wiec zamiana dwoch dongli miejscami zamienia tez ich nazwy\n")
-    for slot, name in sorted(by_slot.items()):
-        txt += f'SUBSYSTEM=="net", ACTION=="add", KERNELS=="{slot}", NAME="{name}"\n'
+           "# stale nazwy kart RTL88xx; nazwa jest przypieta do MAC-a karty,\n"
+           "# wiec jedzie razem z donglem niezaleznie od portu USB.\n"
+           "# Reguly na KERNELS== to zapasowe kotwiczenie na gniezdzie USB -\n"
+           "# dla kart bez czytelnego MAC-a albo z powtorzonym adresem.\n")
+    for (kind, value), name in sorted(by_anchor.items()):
+        match = f'ATTR{{address}}=="{value}"' if kind == "mac" else f'KERNELS=="{value}"'
+        txt += f'SUBSYSTEM=="net", ACTION=="add", {match}, NAME="{name}"\n'
     if UDEV_NAMES.exists() and UDEV_NAMES.read_text() == txt:
         return False
     UDEV_NAMES.parent.mkdir(parents=True, exist_ok=True)
@@ -2193,8 +2245,8 @@ def ensure_nic_names():
     if not nics:
         return nics
 
-    by_slot, per_nic = plan_nic_names(nics)
-    write_name_rules(by_slot)  # zeby przetrwalo reboot i ponowne wpiecie dongla
+    by_anchor, per_nic = plan_nic_names(nics)
+    write_name_rules(by_anchor)  # zeby przetrwalo reboot i ponowne wpiecie dongla
     todo = [(nic, name) for nic, name in per_nic.items() if nic != name]
     if not todo:
         return nics
