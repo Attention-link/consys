@@ -80,6 +80,15 @@ REBOOT_MARKER = Path("/etc/.wfb-drone-reboot-attempted")
 # UWAGA: wfb-ng nadal odbiera z obu kart i przez obie nadaje - sama nazwa
 # NIE dzieli rol, rozdzial trzeba wymusic w konfiguracji uslugi.
 NIC_NAMES = ["drone_RX", "drone_TX"]
+
+# Karty wylaczone z NADAWANIA. wfb-ng ma na to wartosc wifi_txpower = 'off'
+# (w master.cfg opisana jako "special value for RX only cards"): taka karta
+# jest inicjowana i odbiera, ale nie trafia na liste interfejsow wfb_tx.
+# Potrzebne, gdy do jednej karty przykrecony jest JEDNOKIERUNKOWY wzmacniacz -
+# nadawac ma wylacznie ona, a druga ma tylko sluchac. Bez tego wfb_tx rozklada
+# pakiety miedzy obie karty (mirror jest domyslnie wylaczony), wiec czesc
+# wideo wychodzilaby torem bez wzmacniacza.
+RX_ONLY_NICS = ["drone_RX"]
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
 
@@ -660,6 +669,79 @@ def build_config(channel, region):
         f"wifi_region = '{region}'\n\n"
         f"{ROLE_SECTION}"
     )
+
+
+def txpower_cfg_value(nics):
+    """Tresc wpisu wifi_txpower dla sekcji [common] albo None, gdy nie ma czego
+    rozdzielac. 'off' = karta tylko do odbioru, None = moc wedlug sterownika
+    (ustawiamy ja parametrem modulu, a nie tutaj - patrz TX_POWER_SYSFS)."""
+    rx_only = [n for n in RX_ONLY_NICS if n in nics]
+    if not rx_only or len(nics) < 2 or len(rx_only) >= len(nics):
+        return None  # jedna karta albo same rx-only: nie bylo by czym nadawac
+    entries = ", ".join(f"'{n}': " + ("'off'" if n in rx_only else "None")
+                        for n in sorted(nics))
+    return "{" + entries + "}"
+
+
+def ensure_tx_split(nics):
+    """Wymusza rozdzial rol kart: nadaje tylko karta spoza RX_ONLY_NICS.
+    Zwraca True, gdy config zostal zmieniony - wolajacy restartuje usluge
+    i sprawdza, czy wstala (patrz apply_tx_split)."""
+    if not CFG_PATH.exists():
+        return False
+    want = txpower_cfg_value(nics)
+    current = get_cfg_option("common", "wifi_txpower")
+
+    if want is None:
+        # Padla karta nadawcza i zostala sama rx-only: wpis 'off' odebralby
+        # dronowi nadawanie W OGOLE. Kasujemy go - lepiej nadawac torem bez
+        # wzmacniacza niz nie nadawac wcale. Ruszamy tylko wpis w formie
+        # slownika, czyli ten, ktory sami piszemy.
+        if (RX_ONLY_NICS and nics and current
+                and current.startswith("{") and "'off'" in current):
+            backup_config_once()
+            return drop_cfg_option("common", "wifi_txpower")
+        return False
+
+    if current == want:
+        return False
+    backup_config_once()
+    set_cfg_option("common", "wifi_txpower", want)
+    return True
+
+
+def apply_tx_split(nics, say):
+    """Rozdzial rol + restart uslugi z wycofaniem, gdy usluga nie wstanie.
+    Dron w powietrzu nie ma jak zglosic, ze config jest nie do przyjecia dla
+    tej wersji wfb-ng - wiec jesli po zmianie usluga nie zyje, wracamy do
+    poprzedniego stanu i mowimy o tym wprost. Zwraca True, gdy cos zmieniono."""
+    if not ensure_tx_split(nics):
+        return False
+
+    rx_only = ", ".join(n for n in RX_ONLY_NICS if n in nics)
+    say(f"config: {rx_only} tylko do odbioru (wifi_txpower = 'off')", "warn")
+    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+    time.sleep(3)
+    if service_active():
+        return True
+
+    drop_cfg_option("common", "wifi_txpower")
+    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+    time.sleep(3)
+    say("ta wersja wfb-ng nie przyjela rozdzialu RX/TX - wycofano zmiane", "fail")
+    return True
+
+
+def service_wlans(kind, known):
+    """Interfejsy, ktore dostaly procesy wfb_tx albo wfb_rx (kind = 'tx'/'rx').
+    Karty stoja na koncu linii polecen, po flagach - bierzemy z niej te, ktore
+    znamy z wfb-nics."""
+    out = set()
+    for args in proc_cmdlines():
+        if not any(f"wfb_{kind}" in a for a in args[:2]):
+            continue
+        out.update(a for a in args if a in known)
+    return out
 
 
 def save_common_config(channel, region):
@@ -2411,6 +2493,8 @@ def detect_nics_startup():
         run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
         time.sleep(3)
 
+    apply_tx_split(nics, lambda msg, _status=None: log(f"    {msg}"))
+
     # Dongiel wpiety po starcie uslugi nie zostanie uzyty sam z siebie.
     unused = set(nics) - service_nics(set(nics))
     if unused:
@@ -2564,6 +2648,24 @@ def collect_checks():
                        f"{live_tx}/63 - bardzo nisko, zasieg bedzie zaden (max = 63)"))
     else:
         checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
+
+    # Rozdzial rol kart sprawdzamy na dzialajacych procesach, a nie w configu:
+    # wpis w pliku dziala dopiero po restarcie uslugi, a przy wzmacniaczu
+    # jednokierunkowym "nadaje nie ta karta" to zepsuty lot, nie kosmetyka.
+    rx_only = {n for n in RX_ONLY_NICS if n in nics}
+    if rx_only:
+        tx_used = service_wlans("tx", set(nics))
+        wrong = tx_used & rx_only
+        if not tx_used:
+            checks.append(("Rozdzial RX/TX", "warn", "nie widac zadnego wfb_tx - usluga nie dziala?"))
+        elif wrong:
+            checks.append(("Rozdzial RX/TX", "fail",
+                           f"nadaje takze {', '.join(sorted(wrong))}, a ta karta ma tylko odbierac"
+                           " - sprawdz wifi_txpower w [common]"))
+        else:
+            checks.append(("Rozdzial RX/TX", "ok",
+                           f"nadaje: {', '.join(sorted(tx_used))}   tylko odbiera: "
+                           f"{', '.join(sorted(rx_only))}"))
 
     if CFG_PATH.exists():
         ch, reg = wfb_effective_common()
@@ -2866,6 +2968,7 @@ def radio_settings_screen(stdscr):
     write_modprobe_wfb(tx_power)
     live_ok = apply_tx_power_live(tx_power)
     ensure_video_service_type(wfb_nics())  # gdyby config byl jeszcze sprzed migracji
+    ensure_tx_split(wfb_nics())            # restart uslugi i tak jest ponizej
     _common_cache["val"] = None
     run(["systemctl", "daemon-reload"])
     code2, out2 = run(["systemctl", "enable", "--now", f"wifibroadcast@{ROLE}"])
@@ -3018,6 +3121,7 @@ def redetect_screen(stdscr):
             say(f"config: wideo -> udp_proxy (domyslny tryb nie umie {len(nics)} kart)", "warn")
             run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
             time.sleep(3)
+        apply_tx_split(nics, say)
         unused = set(nics) - service_nics(set(nics))
         if unused:
             say(f"usluga nie uzywa: {' '.join(sorted(unused))} - restartuje...", "warn")
