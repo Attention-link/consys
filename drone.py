@@ -2860,7 +2860,8 @@ def config_overview_lines():
     for nic in nics:
         d = nic_details(nic)
         rx_pps, tx_pps = traffic.get(nic, (0.0, 0.0))
-        row(nic, f"{d['driver']} mac={d['mac']} usb={d['usb']} {d['mode']} kan={d['channel']}",
+        row(nic, f"mac={d['mac']}  usb={d['usb']}  {d['driver']} {d['mode']} "
+                 f"kan={d['channel']}{nic_role_txt(nic)}",
             "ok" if nic in used else "fail")
         row("", f"rx={rx_pps:.0f}/s tx={tx_pps:.0f}/s   w usludze={'tak' if nic in used else 'NIE'}"
                 f"{'   <- przez ta karte leci nadawanie' if tx_pps > 0 else ''}",
@@ -3143,6 +3144,15 @@ def redetect_screen(stdscr):
     pause(stdscr)
 
 
+def nic_role_txt(nic):
+    """Dopisek o roli karty - pusty, gdy rol nie rozdzielamy (gs). Na dronie
+    mowi, ktora karta nadaje: to do niej idzie wzmacniacz i to jej MAC trzeba
+    znac, zeby nie pomylic dongli."""
+    if not RX_ONLY_NICS:
+        return ""
+    return "   [tylko odbior]" if nic in RX_ONLY_NICS else "   [nadaje]"
+
+
 def nic_snapshot():
     """{nazwa: (gniazdo USB, mac)} - lekko, bez wolania 'iw', bo ten ekran
     odpytuje karty dwa razy na sekunde."""
@@ -3218,7 +3228,11 @@ def nic_identify_screen(stdscr):
                     rx_pps = tx_pps = 0.0  # karta dopiero co wpieta, brak odniesienia
                 counters[nic] = (rx, tx, now)
 
-                safe_addstr(stdscr, row, 2, f"{nic:<12} gniazdo={slot:<10} mac={mac}",
+                # MAC na przodzie, bo to on jest teraz tozsamoscia karty (na nim
+                # wisi nazwa) - a przy dwoch identycznych donglach to jedyna
+                # rzecz, po ktorej odroznisz je w rece od tej w drugim porcie
+                safe_addstr(stdscr, row, 2,
+                            f"{nic:<12} mac={mac}   gniazdo={slot}{nic_role_txt(nic)}",
                             color_for("ok" if nic in used else "warn") | curses.A_BOLD)
                 safe_addstr(stdscr, row + 1, 4,
                             f"rx={rx_pps:6.0f}/s  tx={tx_pps:6.0f}/s   w usludze="
