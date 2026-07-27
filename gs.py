@@ -1109,7 +1109,13 @@ def apply_mcs_setting(mcs, sections):
 # (k, n, nazwa) - z kazdych n pakietow k niesie dane. n/k to koszt: 1/2 znaczy
 # "kazdy pakiet leci dwa razy". Kolejnosc od najtanszego do najmocniejszego -
 # indeks na tej liscie jest "poziomem naprawy", ktorym rusza AutoFec.
+#
+# Poziom 0 to naprawa WYLACZONA: n = k, czyli zero pakietow nadmiarowych. Nic
+# nie wraca, za to nic nie zjada czasu antenowego. Przydaje sie do zmierzenia,
+# ile gubi samo radio (na wykresie obie krzywe strat leza wtedy na sobie) i przy
+# bardzo czystym linku, gdzie nadmiarowosc to czysty koszt.
 FEC_LEVELS = [
+    (1, 1, "wylaczona"),
     (8, 9, "minimalna"),
     (4, 5, "oszczedna"),
     (2, 3, "srednia"),
@@ -1119,9 +1125,17 @@ FEC_LEVELS = [
     (1, 5, "maksymalna"),
 ]
 
+FEC_OFF_LEVEL = 0
+
 # Poziom, na ktory wracamy przyciskiem "domyslne" - tyle ma tunel i mavlink po
 # swiezej instalacji wfb-ng (k=1, n=2).
-FEC_DEFAULT_LEVEL = 3
+FEC_DEFAULT_LEVEL = 4
+
+# Najnizszy poziom, na ktory wolno ZEJSC AUTOMATOWI. Wylaczyc naprawe mozna
+# recznie, ale automat sam tego nie zrobi: zdjecie calej ochrony zamienia kazda
+# nastepna dziure w bezpowrotna strate, a w powietrzu nie ma jak tego cofnac
+# szybciej niz przez restart uslugi. W gore z zera automat wyjdzie normalnie.
+AUTO_FEC_MIN_LEVEL = 1
 
 
 def fec_overhead(k, n):
@@ -1129,8 +1143,16 @@ def fec_overhead(k, n):
     return (n / k) if k else 1.0
 
 
+def fec_off(level):
+    """Czy ten poziom to "bez naprawy" - n rowne k, czyli zero nadmiarowosci."""
+    k, n, _name = FEC_LEVELS[level]
+    return n <= k
+
+
 def fec_level_txt(level):
     k, n, name = FEC_LEVELS[level]
+    if fec_off(level):
+        return f"FEC {k}/{n} ({name} - nic nie dokladamy, nic nie wroci)"
     return f"FEC {k}/{n} ({name}, {fec_overhead(k, n):.2f}x pakietow)"
 
 
@@ -2000,8 +2022,10 @@ class AutoFec:
         self.bad_since = None
         # W dol schodzimy tylko wtedy, gdy samo radio przestalo gubic - jesli
         # gubi, a my tego nie widzimy, to znaczy, ze naprawa robi swoje i nie
-        # ma jej po co zabierac.
-        if before is not None and before <= AUTO_FEC_GOOD_LOSS and self.level > 0:
+        # ma jej po co zabierac. Nigdy ponizej AUTO_FEC_MIN_LEVEL: naprawe
+        # wylacza sie recznie, automat nie zdejmuje calej ochrony sam.
+        if (before is not None and before <= AUTO_FEC_GOOD_LOSS
+                and self.level > AUTO_FEC_MIN_LEVEL):
             if self.good_since is None:
                 self.good_since = now
             elif now - self.good_since >= AUTO_FEC_GOOD_SECONDS:
@@ -5184,22 +5208,66 @@ def restart_wfb_service(wait=3.0):
     return code == 0
 
 
-def apply_fec_level(level, section=None):
-    """Ustawia poziom naprawy i restartuje usluge. Zwraca (ok, tekst) - ok jest
-    prawda tylko wtedy, gdy usluga po restarcie faktycznie wstala."""
-    k, n, _name = FEC_LEVELS[level]
+def _write_fec_choice(choice, section):
+    """Zapis wyboru do configu. 'choice' to numer poziomu albo None, czyli
+    "usun nasz wpis i zostaw to, co ustawia wfb-ng"."""
+    if choice is None:
+        return apply_fec_setting(None, None, section)
+    k, n, _name = FEC_LEVELS[choice]
+    return apply_fec_setting(k, n, section)
+
+
+def fec_choice_txt(choice):
+    if choice is None:
+        return "ustawienie wfb-ng (bez naszego wpisu)"
+    return fec_level_txt(choice)
+
+
+def apply_fec_choice(choice, section=None):
+    """Ustawia naprawe (numer poziomu albo None = usun wpis) i restartuje
+    usluge. Zwraca (ok, tekst).
+
+    Przy niepowodzeniu WYCOFUJE sie do poprzedniego ustawienia i restartuje
+    jeszcze raz. Bez tego jedna wartosc, ktorej ta wersja wfb-ng nie przyjmuje,
+    zostawialaby martwa usluge - a na dronie oznacza to link do odzyskania
+    dopiero na ziemi. Wycofanie jest do surowej pary (k, n), a nie do numeru
+    poziomu, bo w configu moglo siedziec cos spoza drabinki."""
     section = section or fec_section()
     if not CFG_PATH.exists():
         return False, f"brak {CFG_PATH} - nie ma gdzie tego zapisac"
-    if apply_fec_setting(k, n, section) is None:
+
+    previous = current_fec_setting(section)
+    if _write_fec_choice(choice, section) is None and choice is not None:
         return False, f"nie udalo sie zapisac fec_k/fec_n w [{section}]"
     restart_wfb_service()
+
+    problem = None
     if not service_active():
-        return False, f"usluga nie wstala po restarcie ({service_state_txt()})"
-    live = live_tunnel_fec()
-    if live and live != (k, n):
-        return False, f"zapisalem {k}/{n}, a wfb_tx nadaje {live[0]}/{live[1]}"
-    return True, f"tunel nadaje z {fec_level_txt(level)}"
+        problem = f"usluga nie wstala ({service_state_txt()})"
+    elif choice is not None:
+        k, n, _name = FEC_LEVELS[choice]
+        live = live_tunnel_fec()
+        if live and live != (k, n):
+            problem = f"zapisalem {k}/{n}, a wfb_tx nadaje {live[0]}/{live[1]}"
+
+    if problem is None:
+        if choice is None:
+            live = live_tunnel_fec()
+            return True, ("tunel nadaje z ustawieniem wfb-ng"
+                          + (f": FEC {live[0]}/{live[1]}" if live else ""))
+        return True, f"tunel nadaje z {fec_level_txt(choice)}"
+
+    # --- wycofanie ---
+    if previous is None:
+        apply_fec_setting(None, None, section)
+        back = "ustawienia wfb-ng"
+    else:
+        apply_fec_setting(previous[0], previous[1], section)
+        back = f"FEC {previous[0]}/{previous[1]}"
+    restart_wfb_service()
+    if service_active():
+        return False, f"{problem} - wycofalem sie do {back}"
+    return False, f"{problem}; wrocilem do {back}, ale usluga NADAL nie wstala"
 
 
 def fec_status_lines(metrics, saved_total=None):
@@ -5282,7 +5350,7 @@ def auto_repair_screen(stdscr, level, section):
                 elif kind == "fec":
                     new_level = action[1]
                     note(f"naprawa -> {fec_level_txt(new_level)}: {action[2]}")
-                    ok, txt = apply_fec_level(new_level, section)
+                    ok, txt = apply_fec_choice(new_level, section)
                     note(txt, "ok" if ok else "fail")
 
             stdscr.erase()
@@ -5347,11 +5415,25 @@ def repair_screen(stdscr):
     widac to od razu.
 
     Ustawienie dotyczy tylko NASZEGO kierunku i nie musi byc takie samo po obu
-    stronach: odbiornik czyta k/n z pakietu sesyjnego."""
+    stronach: odbiornik czyta k/n z pakietu sesyjnego.
+
+    Naprawe da sie wylaczyc na dwa sposoby i to sa DWIE ROZNE rzeczy:
+    - poziom "wylaczona" (n = k) wpisuje do configu zero nadmiarowosci, czyli
+      swiadomie nadajemy bez ochrony;
+    - "zostaw ustawienie wfb-ng" kasuje nasz wpis, wiec wraca to, co wfb-ng
+      ustawia samo (dla tunelu 1/2) - to jest wycofanie sie z ustawiania,
+      a nie wylaczenie naprawy."""
     section = fec_section()
     saved = current_fec_setting(section)
     level = fec_level_of(*saved) if saved else None
-    idx = level if level is not None else FEC_DEFAULT_LEVEL
+    # None na poczatku listy to "bez naszego wpisu"; reszta to numery poziomow
+    options = [None] + list(range(len(FEC_LEVELS)))
+    if not saved:
+        idx = options.index(None)          # nie mamy wpisu - kursor na tej pozycji
+    elif level is not None:
+        idx = options.index(level)         # wpis z drabinki
+    else:
+        idx = options.index(FEC_DEFAULT_LEVEL)  # wpis spoza drabinki - nie ma co zaznaczyc
     stats = WfbStatsProbe().start()
     nics = wfb_nics()
     note = None
@@ -5378,28 +5460,37 @@ def repair_screen(stdscr):
             for i, (text, status) in enumerate(fec_status_lines(metrics)):
                 safe_addstr(stdscr, 5 + i, 4, text, color_for(status))
 
-            safe_addstr(stdscr, 9, 2, "Ile nadmiarowosci nadawac:", curses.A_BOLD)
-            for i, (k, n, name) in enumerate(FEC_LEVELS):
-                text = (f"FEC {k}/{n:<3}{name:<18}{fec_overhead(k, n):.2f}x pakietow"
-                        f"   przezyje utrate {n - k} z {n}")
-                mark = "* " if level == i else "  "
-                safe_addstr(stdscr, 10 + i, 2, (mark + text).ljust(72),
+            # Lista ma 9 pozycji, a nad nia stoja jeszcze trzy wiersze stanu -
+            # na 24-wierszowym terminalu wychodzi co do wiersza, wiec pozycje sa
+            # liczone od zmiennej, a nie wpisane na sztywno.
+            top = 10
+            safe_addstr(stdscr, top - 1, 2, "Ile nadmiarowosci nadawac:", curses.A_BOLD)
+            for i, opt in enumerate(options):
+                if opt is None:
+                    text = "bez wpisu   zostaw ustawienie wfb-ng (kasuje nasz wpis)"
+                    chosen = saved is None
+                else:
+                    k, n, name = FEC_LEVELS[opt]
+                    text = (f"FEC {k}/{n:<3}{name:<18}{fec_overhead(k, n):.2f}x pakietow"
+                            + ("   nic nie wroci" if fec_off(opt)
+                               else f"   przezyje utrate {n - k} z {n}"))
+                    chosen = level == opt
+                mark = "* " if chosen else "  "
+                safe_addstr(stdscr, top + i, 2, (mark + text).ljust(76),
                             curses.color_pair(5) if i == idx else 0)
 
-            row = 10 + len(FEC_LEVELS) + 1
-            safe_addstr(stdscr, row, 2, "(* = zapisane w configu; wiecej nadmiarowosci "
-                                        "= mniej strat, ale wiecej zajetego pasma)",
-                        curses.A_DIM)
-            safe_addstr(stdscr, row + 1, 2, "Nie musi byc takie samo po obu stronach - "
-                                            "odbiornik czyta k/n z pakietu sesyjnego.",
+            row = top + len(options) + 1
+            safe_addstr(stdscr, row, 2, "(* = w configu; wiecej nadmiarowosci = mniej "
+                                        "strat, ale wiecej pasma)", curses.A_DIM)
+            safe_addstr(stdscr, row + 1, 2, "Nie musi byc takie samo po obu stronach.",
                         curses.A_DIM)
             if note:
-                safe_addstr(stdscr, row + 3, 2, note[0][:110],
+                safe_addstr(stdscr, row + 2, 2, note[0][:74],
                             color_for(note[1]) | curses.A_BOLD)
 
             h, _ = stdscr.getmaxyx()
-            safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw i zrestartuj usluge, "
-                                          "a = tryb automatyczny, d = domyslne, q = powrot",
+            safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw, a = automat, "
+                                          "d = domyslne, w = wylacz, q = powrot",
                         curses.A_DIM)
             stdscr.refresh()
 
@@ -5407,36 +5498,65 @@ def repair_screen(stdscr):
             if key == -1:
                 continue  # timeout - tylko odswiezenie liczb
             if key in (curses.KEY_UP, ord("k")):
-                idx = (idx - 1) % len(FEC_LEVELS)
+                idx = (idx - 1) % len(options)
             elif key in (curses.KEY_DOWN, ord("j")):
-                idx = (idx + 1) % len(FEC_LEVELS)
+                idx = (idx + 1) % len(options)
             elif key in (ord("q"), ord("Q"), 27):
                 return
             elif key in (ord("d"), ord("D")):
-                idx = FEC_DEFAULT_LEVEL
+                idx = options.index(FEC_DEFAULT_LEVEL)
+            elif key in (ord("w"), ord("W")):
+                idx = options.index(FEC_OFF_LEVEL)
             elif key in (ord("a"), ord("A")):
                 stdscr.timeout(-1)
-                level = auto_repair_screen(stdscr, level, section)
+                # Automat musi od czegos zaczac. Gdy nie mamy wpisu w configu,
+                # bierzemy poziom z tego, czym wfb_tx NADAJE w tej chwili.
+                start = level if level is not None else fec_level_of(*(live or (0, 0)))
+                level = auto_repair_screen(stdscr, start, section)
                 saved = current_fec_setting(section)
                 if level is not None:
-                    idx = level
+                    idx = options.index(level)
                 stdscr.timeout(500)
                 note = None
             elif key in (10, 13, curses.KEY_ENTER):
                 stdscr.timeout(-1)
-                k, n, name = FEC_LEVELS[idx]
-                answer = popup(stdscr, "Zmiana naprawy pakietow",
-                               [f"Ustawic {fec_level_txt(idx)}?",
-                                "",
-                                f"Sekcja: [{section}]",
-                                f"Z kazdych {n} pakietow {k} niesie dane,"
-                                f" {n - k} to nadmiarowosc.",
-                                "",
-                                f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana,",
-                                "wiec na kilka sekund znikna obraz i telemetria."],
-                               buttons=("Tak", "Nie"))
-                if answer == 0:
-                    ok, txt = apply_fec_level(idx, section)
+                choice = options[idx]
+                if choice is None:
+                    lines = ["Usunac nasz wpis fec_k/fec_n?",
+                             "",
+                             f"Sekcja: [{section}]",
+                             "Zostanie to, co wfb-ng ustawia samo",
+                             "(dla tunelu zwykle FEC 1/2).",
+                             "",
+                             "To NIE jest wylaczenie naprawy, tylko wycofanie",
+                             "sie z jej ustawiania."]
+                elif fec_off(choice):
+                    k, n, _name = FEC_LEVELS[choice]
+                    lines = ["WYLACZYC naprawe pakietow?",
+                             "",
+                             f"Sekcja: [{section}]",
+                             f"fec_k = {k}, fec_n = {n} - zero nadmiarowosci.",
+                             "",
+                             "Kazdy pakiet zgubiony w powietrzu bedzie stracony",
+                             "BEZPOWROTNIE - nie ma z czego go odtworzyc.",
+                             "Na wykresie obie krzywe strat pokryja sie.",
+                             "",
+                             "Ma sens do pomiaru, ile gubi samo radio."]
+                else:
+                    k, n, _name = FEC_LEVELS[choice]
+                    lines = [f"Ustawic {fec_level_txt(choice)}?",
+                             "",
+                             f"Sekcja: [{section}]",
+                             f"Z kazdych {n} pakietow {k} niesie dane,"
+                             f" {n - k} to nadmiarowosc."]
+                lines += ["",
+                          f"Usluga wifibroadcast@{ROLE} zostanie zrestartowana,",
+                          "wiec na kilka sekund znikna obraz i telemetria."]
+
+                title = ("Wylaczenie naprawy" if choice is not None and fec_off(choice)
+                         else "Zmiana naprawy pakietow")
+                if popup(stdscr, title, lines, buttons=("Tak", "Nie")) == 0:
+                    ok, txt = apply_fec_choice(choice, section)
                     saved = current_fec_setting(section)
                     level = fec_level_of(*saved) if saved else None
                     if ok:
@@ -5445,7 +5565,8 @@ def repair_screen(stdscr):
                         popup(stdscr, "Nie poszlo tak, jak mialo",
                               [txt, "", "Zajrzyj do " + str(CFG_PATH) + " i porownaj",
                                "z master.cfg - ta wersja wfb-ng moze czytac",
-                               "fec_k/fec_n z innej sekcji."], status="fail")
+                               "fec_k/fec_n z innej sekcji albo nie przyjmowac",
+                               "tej wartosci."], status="fail")
                     note = None
                 stdscr.timeout(500)
     finally:
