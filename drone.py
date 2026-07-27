@@ -732,18 +732,6 @@ def apply_tx_split(nics, say):
     return True
 
 
-def service_wlans(kind, known):
-    """Interfejsy, ktore dostaly procesy wfb_tx albo wfb_rx (kind = 'tx'/'rx').
-    Karty stoja na koncu linii polecen, po flagach - bierzemy z niej te, ktore
-    znamy z wfb-nics."""
-    out = set()
-    for args in proc_cmdlines():
-        if not any(f"wfb_{kind}" in a for a in args[:2]):
-            continue
-        out.update(a for a in args if a in known)
-    return out
-
-
 def save_common_config(channel, region):
     """Zapis kanalu i regionu BEZ deptania reszty pliku. Ekran zmiany
     konfiguracji przepisywal go wczesniej od zera z build_config(), przez co
@@ -2649,23 +2637,31 @@ def collect_checks():
     else:
         checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
 
-    # Rozdzial rol kart sprawdzamy na dzialajacych procesach, a nie w configu:
-    # wpis w pliku dziala dopiero po restarcie uslugi, a przy wzmacniaczu
-    # jednokierunkowym "nadaje nie ta karta" to zepsuty lot, nie kosmetyka.
+    # Rozdzial rol sprawdzamy na LICZNIKACH KARTY, a nie w configu ani w linii
+    # polecen wfb_tx: wfb-ng podaje procesowi wszystkie interfejsy i dopiero
+    # w srodku pomija te oznaczone jako rx-only (rx_only_wlan_ids). Jedynym
+    # wiarygodnym dowodem jest wiec to, czy z karty cokolwiek wychodzi -
+    # a przy wzmacniaczu jednokierunkowym "nadaje nie ta karta" to zepsuty lot.
     rx_only = {n for n in RX_ONLY_NICS if n in nics}
     if rx_only:
-        tx_used = service_wlans("tx", set(nics))
-        wrong = tx_used & rx_only
-        if not tx_used:
-            checks.append(("Rozdzial RX/TX", "warn", "nie widac zadnego wfb_tx - usluga nie dziala?"))
-        elif wrong:
+        traffic = nic_traffic(nics)
+        sending = {n: traffic[n][1] for n in rx_only if traffic.get(n, (0, 0))[1] > 0}
+        tx_pps = {n: traffic[n][1] for n in nics if n not in rx_only and traffic.get(n, (0, 0))[1] > 0}
+        cfg_ok = (get_cfg_option("common", "wifi_txpower") or "").count("'off'") == len(rx_only)
+        if sending:
             checks.append(("Rozdzial RX/TX", "fail",
-                           f"nadaje takze {', '.join(sorted(wrong))}, a ta karta ma tylko odbierac"
-                           " - sprawdz wifi_txpower w [common]"))
+                           "nadaje takze " + ", ".join(f"{n} ({pps:.0f} pkt/s)"
+                                                       for n, pps in sorted(sending.items()))
+                           + " - ta karta ma tylko odbierac"
+                           + ("" if cfg_ok else "; brak wpisu wifi_txpower w [common]")))
+        elif not tx_pps:
+            checks.append(("Rozdzial RX/TX", "warn",
+                           "zadna karta nic nie nadaje - nie da sie tego teraz sprawdzic"))
         else:
             checks.append(("Rozdzial RX/TX", "ok",
-                           f"nadaje: {', '.join(sorted(tx_used))}   tylko odbiera: "
-                           f"{', '.join(sorted(rx_only))}"))
+                           "nadaje: " + ", ".join(f"{n} ({pps:.0f} pkt/s)"
+                                                  for n, pps in sorted(tx_pps.items()))
+                           + f"   cisza na: {', '.join(sorted(rx_only))}"))
 
     if CFG_PATH.exists():
         ch, reg = wfb_effective_common()
