@@ -13,6 +13,11 @@ to pakiety, ktore zgubilo radio, a wfb-ng odtworzyl z nadmiarowosci - osobny
 panel pokazuje ich tempo, a panel obok laczna liczbe. Bez tej pary z samego
 wykresu strat nie widac, czy link jest czysty, czy tylko dobrze latany.
 
+Os czasu przybliza sie kolkiem myszy (wokol kursora), przesuwa przeciaganiem
+albo Shift+kolko, a podwojny klik / Home wraca do calego testu. Ctrl+kolko
+przewija panele w pionie. Bez tego przy dluzszym locie jedna sekunda zajmuje
+mniej niz piksel i nie da sie obejrzec pojedynczego zalamania sygnalu.
+
 Potrzebny jest tylko Python - zadnych bibliotek do doinstalowania.
 
 Uzycie na Windowsie:
@@ -48,6 +53,11 @@ PAD_L, PAD_R, PAD_T, PAD_B = 74, 18, 26, 34
 PANEL_GAP = 26
 PANEL_MIN_H = 62
 TITLE_DY = 9
+
+# Zoom osi czasu kolkiem myszy. Jeden zab kolka to jeden krok - 1.25 daje
+# plynne dochodzenie do interesujacego fragmentu, a nie skok o pol testu.
+ZOOM_STEP = 1.25
+MIN_SPAN = 2.0  # ponizej dwoch sekund w oknie zostaja dwie-trzy probki
 
 
 # ------------------------- czytanie logu -------------------------
@@ -193,6 +203,15 @@ def nice_step(span, target=5):
     return mag * 10
 
 
+def point_at_time(a, b, t, hold=False):
+    """Punkt na odcinku a-b w chwili t. Przy wykresie schodkowym (MCS) wartosc
+    sie nie interpoluje, tylko trzyma az do nastepnej probki."""
+    if hold or b[0] == a[0]:
+        return (t, a[1])
+    frac = (t - a[0]) / (b[0] - a[0])
+    return (t, a[1] + (b[1] - a[1]) * frac)
+
+
 def as_paths(value):
     """Jedna sciezka albo kilka - zawsze lista. Bez tego pojedynczy napis
     rozsypalby sie na pojedyncze znaki, bo str tez jest iterowalny."""
@@ -262,15 +281,34 @@ class ChartArea:
         self.canvas = canvas
         self.logs = []
         self.panels = []
-        self.t0, self.t1 = 0.0, 1.0
+        self.t0, self.t1 = 0.0, 1.0      # widoczny wycinek osi czasu
+        self.full_t1 = 1.0               # caly test - zoom nigdy poza to nie wyjdzie
+        self.view = None                 # None = caly zakres, inaczej (od, do)
+        self.drag = None
+        self.on_view_change = None       # okno wypisuje zoom na pasku narzedzi
         self.x0, self.x1 = PAD_L, PAD_L + 1
         self.top, self.bottom = PAD_T, PAD_T
         canvas.bind("<Configure>", lambda e: self.redraw())
         canvas.bind("<Motion>", self._on_motion)
         canvas.bind("<Leave>", lambda e: self.canvas.delete("kursor"))
+        canvas.bind("<MouseWheel>", self._on_wheel)          # Windows
+        canvas.bind("<Button-4>", self._on_wheel)            # X11
+        canvas.bind("<Button-5>", self._on_wheel)
+        canvas.bind("<ButtonPress-1>", self._on_press)
+        canvas.bind("<B1-Motion>", self._on_drag)
+        canvas.bind("<ButtonRelease-1>", self._on_release)
+        canvas.bind("<Double-Button-1>", lambda e: self.reset_zoom())
+        canvas.bind("<Button-3>", lambda e: self.reset_zoom())
 
     def set_logs(self, logs):
-        self.logs = list(logs)
+        logs = list(logs)
+        # Odswiezenie (F5) tych samych plikow zostawia zoom - log rosnie w
+        # trakcie testu i po kazdym odswiezeniu trzeba by go zoomowac od nowa.
+        # Inne pliki to inny test, wiec pokazujemy je w calosci.
+        same = [log.path for log in self.logs] == [log.path for log in logs]
+        self.logs = logs
+        if not same:
+            self.view = None
         self.redraw()
 
     def log_color(self, index):
@@ -358,6 +396,67 @@ class ChartArea:
                                           log.series("per_%")))
         return panels
 
+    # --- zoom i przesuwanie osi czasu ---
+
+    def set_view(self, t0, t1):
+        """Ustawia widoczny wycinek czasu, przycinajac go do dlugosci testu -
+        zeby zoomem nie dalo sie wyjechac w pustke przed startem albo za koniec."""
+        full = self.full_t1
+        span = min(max(t1 - t0, min(MIN_SPAN, full)), full)
+        t0 = min(max(t0, 0.0), full - span)
+        view = None if span >= full - 1e-9 else (t0, t0 + span)
+        if view != self.view:
+            self.view = view
+            self.redraw()
+
+    def zoom_at(self, x, factor):
+        """Zoom wokol punktu pod kursorem: chwila, na ktora patrzymy, zostaje
+        pod myszka. Przy zoomie od srodka ekranu fragment, ktory ogladamy,
+        uciekalby za krawedz i trzeba by go szukac."""
+        span = self.t1 - self.t0
+        frac = (min(max(x, self.x0), self.x1) - self.x0) / max(1.0, self.x1 - self.x0)
+        anchor = self.t0 + frac * span
+        new_span = span / factor
+        new_span = min(max(new_span, min(MIN_SPAN, self.full_t1)), self.full_t1)
+        self.set_view(anchor - frac * new_span, anchor - frac * new_span + new_span)
+
+    def pan_by(self, seconds):
+        self.set_view(self.t0 + seconds, self.t1 + seconds)
+
+    def reset_zoom(self):
+        if self.view is not None:
+            self.view = None
+            self.redraw()
+
+    def _on_wheel(self, event):
+        steps = 1 if getattr(event, "num", 0) == 4 else (
+            -1 if getattr(event, "num", 0) == 5 else
+            (1 if event.delta > 0 else -1))
+        if event.state & 0x0004:  # Ctrl - przewijanie paneli w pionie
+            self.canvas.yview_scroll(-steps, "units")
+        elif event.state & 0x0001:  # Shift - jazda po osi czasu
+            self.pan_by(-steps * (self.t1 - self.t0) * 0.15)
+        else:
+            self.zoom_at(self.canvas.canvasx(event.x), ZOOM_STEP ** steps)
+        return "break"
+
+    def _on_press(self, event):
+        self.drag = (self.canvas.canvasx(event.x), self.t0, self.t1 - self.t0)
+        if self.view is not None:
+            self.canvas.configure(cursor="fleur")
+
+    def _on_drag(self, event):
+        if not self.drag:
+            return
+        x, t0, span = self.drag
+        per_px = span / max(1.0, self.x1 - self.x0)
+        start = t0 - (self.canvas.canvasx(event.x) - x) * per_px
+        self.set_view(start, start + span)
+
+    def _on_release(self, _event):
+        self.drag = None
+        self.canvas.configure(cursor="")
+
     # --- rysowanie ---
 
     def redraw(self):
@@ -394,8 +493,18 @@ class ChartArea:
         total = max(height, need)
         c.configure(scrollregion=(0, 0, width, total))
 
-        # wspolna os: od zera do najdluzszego z porownywanych testow
-        self.t0, self.t1 = 0.0, max(log.duration() for log in usable_logs) or 1.0
+        # wspolna os: od zera do najdluzszego z porownywanych testow, a po
+        # zoomie kolkiem tylko jej wycinek (przyciety, bo plik mogl sie zmienic
+        # po odswiezeniu i byc krotszy niz w chwili powiekszania)
+        self.full_t1 = max(log.duration() for log in usable_logs) or 1.0
+        if self.view is None:
+            self.t0, self.t1 = 0.0, self.full_t1
+        else:
+            span = min(max(self.view[1] - self.view[0], min(MIN_SPAN, self.full_t1)),
+                       self.full_t1)
+            start = min(max(self.view[0], 0.0), self.full_t1 - span)
+            self.view = (start, start + span)
+            self.t0, self.t1 = self.view
         self.x0, self.x1 = PAD_L, max(PAD_L + 10, width - PAD_R)
         usable = total - PAD_T - PAD_B - gaps
         self.top, self.bottom = PAD_T, total - PAD_B
@@ -407,6 +516,9 @@ class ChartArea:
             panel.compute_range()
             self._draw_panel(panel, last=(i == len(self.panels) - 1))
             y += h + PANEL_GAP
+
+        if self.on_view_change:
+            self.on_view_change()
 
     def x_at(self, t):
         return self.x0 + (t - self.t0) / (self.t1 - self.t0) * (self.x1 - self.x0)
@@ -446,7 +558,10 @@ class ChartArea:
         # z kilku testow zlewaja sie w plot i nie wiadomo, czyja jest ktora.
         if len(self.logs) == 1:
             for sec, _text in self.logs[0].events:
-                x = self.x_at(sec - self.logs[0].t0)
+                rel = sec - self.logs[0].t0
+                if not (self.t0 <= rel <= self.t1):
+                    continue  # po zoomie kreska z poza widoku spadlaby obok panelu
+                x = self.x_at(rel)
                 c.create_line(x, y0, x, y1, fill="#b0b6c0", dash=(3, 3))
 
         c.create_rectangle(x0, y0, x1, y1, outline=AXIS)
@@ -477,10 +592,28 @@ class ChartArea:
             c.create_text((x0 + x1) / 2, y1 + 28, text="czas testu [min:s]",
                           fill=MUTED, font=("Segoe UI", 8))
 
+    def _visible_points(self, points, step=False):
+        """Obcina krzywa do widocznego zakresu czasu. Plotno Tk nie przycina
+        rysowania samo, wiec po zoomie linia wyszlaby poza ramke panelu na
+        sasiednie wykresy i na opisy osi. Punkty na krawedziach dokladamy z
+        interpolacji, zeby krzywa dochodzila do brzegu, a nie urywala sie
+        kawalek przed nim."""
+        out = []
+        prev = None
+        for point in points:
+            if prev is not None:
+                for edge in (self.t0, self.t1):
+                    if (prev[0] < edge) != (point[0] < edge):
+                        out.append(point_at_time(prev, point, edge, hold=step))
+            if self.t0 <= point[0] <= self.t1:
+                out.append(point)
+            prev = point
+        return out
+
     def _line_coords(self, panel, points):
         coords = []
         prev_y = None
-        for t, value in points:
+        for t, value in self._visible_points(points, panel.step):
             x, y = self.x_at(t), panel.y_at(value)
             if panel.step and prev_y is not None:
                 coords.extend([x, prev_y])  # schodek: najpierw w bok, potem w gore
@@ -615,6 +748,8 @@ class App(tk.Tk):
                          command=self.ask_add)
         plik.add_command(label="Zostaw tylko pierwszy", command=self.clear_extra)
         plik.add_separator()
+        plik.add_command(label="Caly zakres wykresu", accelerator="Home",
+                         command=lambda: self.chart.reset_zoom())
         plik.add_command(label="Odswiez", accelerator="F5", command=self.reload)
         plik.add_separator()
         plik.add_command(label="Zamknij", command=self.destroy)
@@ -623,6 +758,22 @@ class App(tk.Tk):
         self.bind("<Control-o>", lambda e: self.ask_open())
         self.bind("<Control-d>", lambda e: self.ask_add())
         self.bind("<F5>", lambda e: self.reload())
+        # zoom takze z klawiatury - na touchpadzie kolko bywa nieporeczne
+        self.bind("<Home>", lambda e: self.chart.reset_zoom())
+        self.bind("<Escape>", lambda e: self.chart.reset_zoom())
+        self.bind("<plus>", lambda e: self.chart.zoom_at(self._chart_mid(), ZOOM_STEP))
+        self.bind("<KP_Add>", lambda e: self.chart.zoom_at(self._chart_mid(), ZOOM_STEP))
+        self.bind("<minus>", lambda e: self.chart.zoom_at(self._chart_mid(), 1 / ZOOM_STEP))
+        self.bind("<KP_Subtract>",
+                  lambda e: self.chart.zoom_at(self._chart_mid(), 1 / ZOOM_STEP))
+        self.bind("<Left>", lambda e: self.chart.pan_by(
+            -(self.chart.t1 - self.chart.t0) * 0.15))
+        self.bind("<Right>", lambda e: self.chart.pan_by(
+            (self.chart.t1 - self.chart.t0) * 0.15))
+
+    def _chart_mid(self):
+        """Klawiatura nie ma kursora nad wykresem - zoomujemy wtedy od srodka."""
+        return (self.chart.x0 + self.chart.x1) / 2
 
     def _build_widgets(self):
         self.configure(bg=BG)
@@ -641,6 +792,13 @@ class App(tk.Tk):
         ttk.Button(bar, text="Odswiez", command=self.reload).pack(side="left", padx=6)
         self.file_label = ttk.Label(bar, text="(brak pliku)", foreground=MUTED)
         self.file_label.pack(side="left", padx=12)
+        # Stan zoomu na pasku, a nie na plotnie - pod osia czasu w waskim oknie
+        # napis wchodzil na podpis "czas testu".
+        self.zoom_label = ttk.Label(bar, text="", foreground=MUTED)
+        self.zoom_label.pack(side="right")
+        self.zoom_button = ttk.Button(bar, text="Caly zakres", state="disabled",
+                                      command=lambda: self.chart.reset_zoom())
+        self.zoom_button.pack(side="right", padx=8)
 
         # pasek stanu pakowany przed trescia, inaczej rozciagajaca sie ramka
         # z wykresami zabiera mu miejsce i tekst zostaje przyciety
@@ -676,6 +834,20 @@ class App(tk.Tk):
         vbar.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.chart = ChartArea(self.canvas)
+        self.chart.on_view_change = self._show_zoom
+        self._show_zoom()
+
+    def _show_zoom(self):
+        chart = self.chart
+        if chart.view is None:
+            self.zoom_label.configure(text="kolko myszy = zoom osi czasu")
+            self.zoom_button.configure(state="disabled")
+            return
+        self.zoom_label.configure(
+            text=f"zoom x{chart.full_t1 / (chart.t1 - chart.t0):.1f}"
+                 f"   {fmt_time(chart.t0)}-{fmt_time(chart.t1)}"
+                 f" z {fmt_time(chart.full_t1)}")
+        self.zoom_button.configure(state="normal")
 
     # --- dane ---
 
