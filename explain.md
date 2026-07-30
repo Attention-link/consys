@@ -154,8 +154,11 @@ uratowane             =  przed − po                        ← zasługa FEC
 | `TX_POWER_SYSFS` | parametr modułu do zmiany mocy na żywo |
 | `UDEV_NAMES` | `/etc/udev/rules.d/70-wfb-names.rules` — stałe nazwy kart |
 | `WFB_DEFAULTS` | `/etc/default/wifibroadcast` |
+| `SCRIPT_PATH` | ten plik po `resolve()` — wchodzi do jednostki autostartu |
 | `TEST_LOG_DIR` | katalog skryptu — tam lądują logi testu |
 | `REBOOT_MARKER` | znacznik „próbowałem już restartu", żeby nie zapętlić |
+| `AUTOSTART_UNIT` | `/etc/systemd/system/wfb-<rola>-autostart.service` |
+| `AUTOSTART_UNIT_NAME`, `AUTOSTART_FLAG` | nazwa jednostki i flaga `--autostart` |
 
 ### Klucze wbudowane
 `DRONE_KEY_B64` / `GS_KEY_B64` — stała para kluczy, **identyczna w obu plikach**.
@@ -610,6 +613,22 @@ zrobiony. Można ją puszczać wielokrotnie.
 | `ensure_dhcpcd_deny(nics)` | to samo dla dhcpcd, **per interfejs** |
 | `release_nics_from_network_stack(nics)` | zbiorczo: zdejmij karty spod czegokolwiek, co zarządza siecią |
 
+### Autostart po reboocie
+
+`wifibroadcast@<rola>` wstaje sama, ale **nikt** poza tym skryptem nie przepnie
+kart spod sterownika z jądra, nie nada im stałych nazw i nie zrestartuje usługi,
+gdy ta ich nie widzi. Dlatego skrypt wpisuje **sam siebie** do systemd.
+
+| Funkcja | Co robi |
+|---|---|
+| `autostart_unit_text()` | treść jednostki: `Type=oneshot`, `RemainAfterExit=yes` (żeby dało się odróżnić „zrobione" od „nigdy nie ruszyło"), `After/Wants=wifibroadcast@<rola>`, `ExecStart="<python>" "<skrypt>" --autostart` |
+| `install_autostart()` | idempotentnie zapisuje jednostkę i ją włącza; wołane przy **każdym** starcie z ręki, i to **przed** setupem — `step_driver()` potrafi zrestartować Pi w połowie instalacji |
+| `autostart_enabled()` | `systemctl is-enabled` |
+| `autostart_status()` | `(status, szczegół)` do weryfikacji: brak jednostki = `fail`, wpis na **inną kopię** skryptu = `warn`, nieudany ostatni przebieg = `warn` |
+| `setup_artifacts_present()` | ślady instalacji (sterownik zbudowany, wfb-ng, klucze, config) — **bez** `wfb-nics`. `is_fully_installed()` żąda żywych kart, a to jest dokładnie ten stan, który autostart ma naprawiać: gdyby pilnował go tam, tryb `--autostart` poddawałby się zawsze wtedy, gdy jest najbardziej potrzebny |
+| `wait_for_dongles(timeout=30)` | `multi-user.target` nie czeka na USB — czekamy, aż dongle pokażą się w `lsusb`, zamiast sztywnego `sleep` |
+| `autostart_run()` | tryb `--autostart`: bez TUI i bez `input()` — czekanie na dongle, `modprobe 88XXau_wfb` (jądra 6.x przechwytują kartę wbudowanym `rtw88_8812au`), potem `detect_nics_startup()`. **Setupu tu nie ma** — apt-get i budowanie sterownika w trakcie bootu (często jeszcze bez sieci) to proszenie się o kłopoty. Niedokończony setup = wyjście kodem 1, czyli jednostka widoczna jako `failed` |
+
 ---
 
 ## 18. Klucze i parowanie
@@ -659,7 +678,14 @@ przełożeniu do innego portu USB.
 | Funkcja | Co robi |
 |---|---|
 | `detect_nics_startup()` | odpalane przy **każdym** starcie, przed TUI: czy są wszystkie karty, czy pod właściwym sterownikiem, czy usługa je widzi. Potrafi przepiąć sterownik i zrestartować usługę; `REBOOT_MARKER` pilnuje, żeby nie zapętlić restartów |
-| `collect_checks()` | lista `(nazwa, status, szczegół)` — dongle w `lsusb`, zasilanie USB, sterownik, tryb monitor, kanał, usługa, klucze, ruch na kartach, tunel, ping do drugiej strony |
+| `collect_checks()` | lista `(nazwa, status, szczegół)` — dongle w `lsusb`, zasilanie USB, sterownik, tryb monitor, kanał, usługa, autostart, klucze, ruch na kartach, tunel, ping do drugiej strony |
+
+**Podpowiedź o parowaniu.** Jeśli w liście jest choć jeden `fail`, na jej
+**początek** trafia blok „Zanim zaczniesz szukać: PAROWANIE" z odciskiem kluczy
+tej strony. Powód: źle sparowane klucze **nigdy** nie zapalą się tu na czerwono
+— każda strona widzi swoje pliki jako poprawne i dopiero porównanie odcisków
+między dronem a gs cokolwiek mówi. Bez tej podpowiedzi usterki szuka się
+w kartach, kanale i configu, a wystarczy porównać osiem znaków kodu.
 | `config_overview_lines()` | wszystko, co warto mieć pod ręką na jednym ekranie: adresy IP, kanał, region, moc, klucze, karty, stan usługi |
 
 ---

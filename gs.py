@@ -20,8 +20,13 @@ od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
 8-znakowy kod, na drugiej sie go wpisuje i obie licza z niego te sama, prywatna
 pare kluczy.
 
+Pierwsze uruchomienie wpisuje skrypt do autostartu (wfb-gs-autostart.service),
+wiec po kazdym reboocie powtarza sie to samo wykrywanie i te same naprawy kart -
+bez wchodzenia na Pi. Weryfikacja pokazuje, czy ten autostart jest wlaczony.
+
 Uzycie:
-    sudo python3 gs.py
+    sudo python3 gs.py              # setup + konfigurator/weryfikator
+    sudo python3 gs.py --autostart  # tryb dla systemd: same naprawy, bez menu
 """
 
 import ast
@@ -68,8 +73,18 @@ GS_KEY = Path("/etc/gs.key")
 # Zapisy z ekranu "Test polaczenia" laduja obok skryptu - tam, gdzie uzytkownik
 # go wgral i skad go uruchamia, wiec plik widac zwyklym 'ls' zaraz po wyjsciu
 # z testu. Katalog skryptu, a nie biezacy, bo sudo bywa wolane z innego miejsca.
-TEST_LOG_DIR = Path(__file__).resolve().parent
+SCRIPT_PATH = Path(__file__).resolve()
+TEST_LOG_DIR = SCRIPT_PATH.parent
 REBOOT_MARKER = Path("/etc/.wfb-gs-reboot-attempted")
+
+# Autostart: skrypt wpisuje sam siebie do systemd, zeby po KAZDYM restarcie Pi
+# powtorzylo sie to, co robi uruchomienie z reki - przepiecie kart pod nasz
+# sterownik, stale nazwy, rozdzial RX/TX i dopilnowanie, ze usluga faktycznie
+# tych kart uzywa. Sama wifibroadcast@ tego nie robi, wiec bez tej jednostki
+# link po zwyklym reboocie potrafi nie wstac, chociaz "usluga dziala".
+AUTOSTART_UNIT_NAME = f"wfb-{ROLE}-autostart.service"
+AUTOSTART_UNIT = Path("/etc/systemd/system") / AUTOSTART_UNIT_NAME
+AUTOSTART_FLAG = "--autostart"
 
 # Zamiast wlanX (numer zalezy od kolejnosci wykrycia i potrafi sie zmienic
 # miedzy bootami) dajemy karcie stala, czytelna nazwe. Nazwa jest przypieta do
@@ -2060,6 +2075,22 @@ def is_fully_installed():
     )
 
 
+def setup_artifacts_present():
+    """Czy setup w ogole sie odbyl - po SLADACH instalacji, a nie po zywych
+    kartach. Roznica jest istotna przy autostarcie: is_fully_installed() zada
+    dzialajacego wfb-nics, a to jest dokladnie ten stan, ktory po boocie bywa
+    zepsuty i ktory autostart ma naprawiac. Gdyby pilnowal go ten warunek,
+    tryb --autostart poddawalby sie zawsze wtedy, gdy jest najbardziej
+    potrzebny."""
+    return (
+        driver_built()
+        and wfb_ng_installed()
+        and DRONE_KEY.exists()
+        and GS_KEY.exists()
+        and CFG_PATH.exists()
+    )
+
+
 def step_packages():
     log("==> [1/7] Pakiety podstawowe")
     run(["apt-get", "update", "-qq"])
@@ -2707,6 +2738,127 @@ def full_setup():
     log("=== Instalacja zakonczona ===")
 
 
+# ------------------------- autostart po reboocie -------------------------
+
+def autostart_unit_text():
+    """Jednostka systemd odpalajaca TEN plik z flaga --autostart. Sciezki
+    (python i skrypt) wchodza do niej na sztywno, wiec po przeniesieniu pliku
+    trzeba ja przepisac - robi to install_autostart() przy kazdym starcie
+    z reki. Cudzyslowy, bo skrypt moze lezec w katalogu ze spacja."""
+    return (
+        "[Unit]\n"
+        f"Description=WFB-NG {ROLE}: wykrywanie i naprawa kart po starcie systemu\n"
+        f"After=wifibroadcast@{ROLE}.service\n"
+        f"Wants=wifibroadcast@{ROLE}.service\n"
+        "\n"
+        "[Service]\n"
+        # oneshot + RemainAfterExit: to nie demon, tylko jednorazowa robota po
+        # boocie. Bez RemainAfterExit systemd pokazywalby ja jako "inactive",
+        # czyli nie do odroznienia od "w ogole sie nie uruchomila".
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        f'ExecStart="{sys.executable}" "{SCRIPT_PATH}" {AUTOSTART_FLAG}\n'
+        # Przepiecie sterownika, udev i restart uslugi to kilkanascie sekund,
+        # a przy niewykrytej karcie dochodzi jeszcze druga proba - domyslny
+        # limit 90 s potrafi tu wejsc w droge.
+        "TimeoutStartSec=300\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def autostart_enabled():
+    code, out = run(["systemctl", "is-enabled", AUTOSTART_UNIT_NAME])
+    return code == 0 and out.strip() == "enabled"
+
+
+def install_autostart():
+    """Idempotentne: pisze jednostke tylko wtedy, gdy jej nie ma albo gdy
+    wskazuje na inna kopie skryptu. Zwraca (ok, opis)."""
+    want = autostart_unit_text()
+    try:
+        have = AUTOSTART_UNIT.read_text() if AUTOSTART_UNIT.exists() else None
+    except OSError:
+        have = None
+
+    if have != want:
+        try:
+            AUTOSTART_UNIT.write_text(want)
+        except OSError as e:
+            return False, f"nie moge zapisac {AUTOSTART_UNIT}: {e}"
+        run(["systemctl", "daemon-reload"])
+
+    if not autostart_enabled():
+        code, out = run(["systemctl", "enable", AUTOSTART_UNIT_NAME])
+        if code != 0:
+            return False, f"systemctl enable {AUTOSTART_UNIT_NAME}: {out.strip()[:90]}"
+
+    return True, f"{AUTOSTART_UNIT_NAME} -> {SCRIPT_PATH}"
+
+
+def autostart_status():
+    """(status, szczegol) dla weryfikacji: czy po nastepnym reboocie ktokolwiek
+    przepnie karty i poprawi usluge."""
+    if not AUTOSTART_UNIT.exists():
+        return "fail", (f"brak {AUTOSTART_UNIT_NAME} - po restarcie Pi nikt nie przepnie "
+                        "kart ani nie poprawi uslugi")
+    try:
+        txt = AUTOSTART_UNIT.read_text()
+    except OSError:
+        txt = ""
+    if str(SCRIPT_PATH) not in txt:
+        return "warn", (f"{AUTOSTART_UNIT_NAME} uruchamia inna kopie skryptu niz ta "
+                        f"({SCRIPT_PATH}) - uruchom ten plik raz z reki, przepisze wpis")
+    if not autostart_enabled():
+        return "fail", (f"{AUTOSTART_UNIT_NAME} istnieje, ale jest wylaczony - "
+                        f"sudo systemctl enable {AUTOSTART_UNIT_NAME}")
+
+    code, out = run(["systemctl", "show", AUTOSTART_UNIT_NAME, "-p", "Result", "--value"])
+    result = out.strip() if code == 0 else ""
+    if result and result != "success":
+        return "warn", (f"wlaczony, ale ostatnie uruchomienie skonczylo sie na '{result}' - "
+                        f"journalctl -u {AUTOSTART_UNIT_NAME}")
+    return "ok", f"{AUTOSTART_UNIT_NAME} wlaczony -> {SCRIPT_PATH}"
+
+
+def wait_for_dongles(timeout=30):
+    """Po boocie USB bywa jeszcze niepoliczone - multi-user.target nie czeka na
+    dongle, a dwa 8812AU na zasilaniu przez hub potrafia zglosic sie kilkanascie
+    sekund pozniej. Zamiast sztywnego sleepa czekamy, az pokaza sie w lsusb."""
+    deadline = time.monotonic() + timeout
+    while True:
+        dongles = usb_rtl_dongles()
+        if len(dongles) >= EXPECTED_NICS or time.monotonic() >= deadline:
+            return dongles
+        time.sleep(2)
+
+
+def autostart_run():
+    """Tryb bez TUI, odpalany przez systemd po kazdym boocie: to samo
+    wykrywanie i te same naprawy, co przy starcie z reki. Setupu tu NIE
+    puszczamy - apt-get i budowanie sterownika w trakcie bootu (czesto jeszcze
+    bez sieci) to ostatnia rzecz, jakiej sie tu chce."""
+    log(f"==> Autostart {ROLE} ({AUTOSTART_UNIT_NAME})")
+    if not setup_artifacts_present():
+        log("    Setup nie jest skonczony - uruchom recznie:")
+        log(f"    sudo python3 {SCRIPT_PATH}")
+        return 1
+
+    dongles = wait_for_dongles()
+    log(f"    lsusb po starcie: {len(dongles)} z {EXPECTED_NICS} dongli")
+
+    # Jadra 6.x maja WBUDOWANY rtw88_8812au i przy kazdym boocie potrafia
+    # przejac karte, zanim ktokolwiek zaladuje nasz modul. Modprobe tutaj, zeby
+    # detect_nics_startup mialo pod co przepinac.
+    if not driver_loaded():
+        log("    Modul 88XXau_wfb niezaladowany - modprobe")
+        run(["modprobe", "88XXau_wfb"])
+
+    detect_nics_startup()
+    return 0
+
+
 # ------------------------- wykrywanie kart przy starcie -------------------------
 
 def detect_nics_startup():
@@ -3001,6 +3153,12 @@ def collect_checks():
         for ln in service_last_errors(5):
             checks.append(("  journal", "fail", ln[:110]))
 
+    # Wszystko powyzej opisuje TERAZ - a po reboocie karty potrafia wrocic pod
+    # sterownik z jadra i link nie wstaje. Ten check pilnuje, ze jest kto to
+    # naprawic bez wchodzenia na Pi.
+    status, detail = autostart_status()
+    checks.append(("Autostart po restarcie Pi", status, detail))
+
     code, out = run(["ip", "-brief", "addr", "show", f"{ROLE}-wfb"])
     if code == 0 and out.strip():
         checks.append((f"Interfejs {ROLE}-wfb", "ok", out.strip()))
@@ -3018,6 +3176,31 @@ def collect_checks():
         checks.append((f"SSH do {PEER_NAME} ({PEER_IP}:{SSH_PORT})", "ok", "port otwarty, SSH odpowiada"))
     else:
         checks.append((f"SSH do {PEER_NAME} ({PEER_IP}:{SSH_PORT})", "warn", "brak polaczenia na porcie 22"))
+
+    # Zle sparowane klucze NIE zapalaja sie tu na czerwono: kazda strona widzi
+    # swoje pliki jako poprawne i dopiero porownanie odciskow miedzy dronem
+    # a gs cokolwiek mowi. Dlatego przy kazdym bledzie piszemy o tym wprost,
+    # i to na samej gorze listy - inaczej szuka sie usterki w kartach, kanale
+    # i konfigu, a wystarczy porownac osiem znakow kodu.
+    if any(st == "fail" for _, st, _ in checks):
+        kmode, kcode = key_mode()
+        if kmode == "sparowane":
+            here = f"sparowane kodem {format_pairing_code(kcode)}, odcisk {key_fingerprint(DRONE_KEY)}"
+        elif kmode == "wbudowane":
+            here = f"wbudowane, odcisk {key_fingerprint(DRONE_KEY)}"
+        elif kmode == "wlasne":
+            here = f"wlasne, odcisk {key_fingerprint(DRONE_KEY)}"
+        else:
+            here = "brak plikow kluczy - link nie ma prawa dzialac"
+        checks[:0] = [
+            ("Zanim zaczniesz szukac: PAROWANIE", "warn",
+             "cos ponizej jest na czerwono - to moze byc zwyczajnie zle parowanie"),
+            ("  parowanie", "warn", f"tutaj ({ROLE}): {here}"),
+            ("  parowanie", "warn",
+             f"na {PEER_NAME} odcisk MUSI byc taki sam - menu -> Klucze i parowanie"),
+            ("  parowanie", "warn",
+             "kazda strona widzi swoje klucze jako OK, wiec latwo o tym zapomniec"),
+        ]
 
     return checks
 
@@ -5744,11 +5927,29 @@ def main():
         require_root()
         sys.exit(background_recorder(Path(sys.argv[2])))
 
+    # Tryb autostartu: odpala go systemd po kazdym boocie. Bez menu i bez
+    # czekania na Enter - wszystko idzie do journala.
+    if len(sys.argv) >= 2 and sys.argv[1] == AUTOSTART_FLAG:
+        require_root()
+        sys.exit(autostart_run())
+
     require_root()
     os.environ.setdefault("DEBIAN_FRONTEND", "noninteractive")
 
+    # Autostart wpisujemy PRZED setupem: step_driver() potrafi zrestartowac Pi
+    # w polowie instalacji i wtedy jednostka jest juz na miejscu. Kazde
+    # uruchomienie z reki odswieza ten wpis, wiec wgranie skryptu w inne
+    # miejsce naprawia sie samo i nie trzeba pamietac o systemd.
+    ok, msg = install_autostart()
+    log(("==> Autostart po reboocie: wlaczony, " if ok else "==> Autostart po reboocie NIE dziala: ") + msg)
+
     if not is_fully_installed():
         full_setup()
+        # Jesli w trakcie instalacji byl restart, autostart odpalil sie na
+        # niedokonczonym systemie i systemd zapamietal go jako failed. Setup
+        # wlasnie sie skonczyl, wiec ten slad jest juz nieaktualny - bez tego
+        # weryfikacja swiecilaby na zolto az do nastepnego bootu.
+        run(["systemctl", "reset-failed", AUTOSTART_UNIT_NAME])
 
     detect_nics_startup()
     print()
