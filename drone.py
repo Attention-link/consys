@@ -924,28 +924,82 @@ def check_ssh(ip, port=SSH_PORT, timeout=3):
 # jaki jest sygnal, ile pakietow poszlo w kosmos, ile uratowal FEC - wie
 # wylacznie wfb-ng. Wystawia te dane na lokalnym porcie TCP; to samo zrodlo,
 # z ktorego korzysta wfb-cli. Format: ramka = 4 bajty dlugosci (big-endian)
-# + slownik msgpack, komplet raz na sekunde. Port stoi w configu wfb-ng,
-# 8003 to wartosc domyslna.
+# + slownik msgpack, komplet raz na sekunde.
+#
+# UWAGA: port jest INNY DLA KAZDEGO PROFILU (dron 8002, gs 8003). Pytanie
+# o settings.common.cli_port zwracalo jedna wspolna wartosc, wiec na dronie
+# ekran testu pukal pod port stacji naziemnej, dostawal "connection refused"
+# i pokazywal "brak sygnalu" mimo dzialajacego lacza. Stad ta stala jest tylko
+# ostatnia deska ratunku, a nie zrodlem prawdy.
 WFB_CLI_PORT_DEFAULT = 8003
+# Porty, ktore wfb-ng rozdaje profilom. Sluza wylacznie jako lista do
+# sprawdzenia sonda, gdy ani journal, ani config nie daja odpowiedzi - bez nich
+# zle podana wartosc z configu nie mialaby czym zostac nadpisana.
+WFB_CLI_PORT_CANDIDATES = (8002, 8003)
 _cli_port_cache = {"val": None}
 
 
+def _cli_port_from_journal():
+    """Port, ktory usluga NAPRAWDE otworzyla - wypisuje go do journala przy
+    kazdym starcie. To jedyne zrodlo, ktore nie zalezy od tego, jak dana wersja
+    wfb-ng liczy porty z configu."""
+    code, out = run(["journalctl", "-u", f"wifibroadcast@{ROLE}", "-b",
+                     "--no-pager", "-o", "cat"], timeout=15)
+    if code != 0:
+        return None
+    found = re.findall(r"MsgPackAPIFactory starting on (\d+)", out)
+    return int(found[-1]) if found else None
+
+
+def _cli_port_from_settings():
+    """To samo pytanie co wczesniej, ale o sekcje NASZEJ roli, z zejsciem na
+    wspolna. getattr na None oddaje None, wiec brak sekcji profilu nie boli."""
+    code, out = run(["python3", "-c",
+                     "from wfb_ng.conf import settings; "
+                     "p = getattr(settings, %r, None); "
+                     "v = getattr(p, 'cli_port', None); "
+                     "print(v or settings.common.cli_port)" % ROLE], timeout=30)
+    if code != 0:
+        return None
+    # run() sklei stdout ze stderr, wiec bierzemy ostatnia linie bedaca sama
+    # liczba - ewentualne ostrzezenia importu nie podmienia portu
+    for ln in reversed(out.splitlines()):
+        if ln.strip().isdigit():
+            return int(ln.strip())
+    return None
+
+
+def _port_answers(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
 def wfb_cli_port():
+    """Port API wfb-ng dla naszej roli. Kandydatow zbieramy z trzech zrodel,
+    ale rozstrzyga ten, ktory faktycznie przyjmuje polaczenie - zgadywanie
+    z configu juz raz kosztowalo nas 'brak sygnalu' przy dzialajacym linku."""
     if _cli_port_cache["val"]:
         return _cli_port_cache["val"]
-    port = WFB_CLI_PORT_DEFAULT
-    code, out = run(["python3", "-c",
-                     "from wfb_ng.conf import settings; print(settings.common.cli_port)"],
-                    timeout=30)
-    if code == 0:
-        # run() sklei stdout ze stderr, wiec bierzemy ostatnia linie bedaca
-        # sama liczba - ewentualne ostrzezenia importu nie podmienia portu
-        for ln in reversed(out.splitlines()):
-            if ln.strip().isdigit():
-                port = int(ln.strip())
-                break
-    _cli_port_cache["val"] = port
-    return port
+
+    candidates = []
+    for getter in (_cli_port_from_journal, _cli_port_from_settings):
+        port = getter()
+        if port and port not in candidates:
+            candidates.append(port)
+    for port in (WFB_CLI_PORT_DEFAULT,) + WFB_CLI_PORT_CANDIDATES:
+        if port not in candidates:
+            candidates.append(port)
+
+    live = next((p for p in candidates if _port_answers(p)), None)
+    if live is None:
+        # Usluga moze dopiero wstawac - oddajemy najlepszy typ, ale NIE
+        # zapamietujemy go, zeby nastepne wywolanie sprobowalo jeszcze raz.
+        return candidates[0]
+    _cli_port_cache["val"] = live
+    return live
 
 
 def _to_text(value):
