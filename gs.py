@@ -62,7 +62,30 @@ APT_RELEASE = "master"
 # nadaje). Zmiana obu wartosci jest w menu i MUSI byc taka sama na dronie i gs.
 DEFAULT_CHANNEL = "13"
 DEFAULT_REGION = "PL"
-DEFAULT_TX_POWER = "63"  # 0-63, wg sterownika: 0 = wylaczone (EEPROM), 63 = max
+TX_POWER_MAX = 63  # skala sterownika: 0 = wylaczone (kalibracja z EEPROM), 63 = max
+
+# Gorny pulap mocy: 90% skali, czyli 56. Powyzej tego nie pozwalamy ustawic.
+# 8812AU przy pelnej mocy wyrywa z portu USB tyle pradu, ze Pi 5 z budzetem
+# 600 mA na wszystkie porty potrafi sie po prostu wylaczyc - a impulsy TX to
+# dokladnie ten moment, w ktorym zasilanie siada. Ostatnie 10% skali daje
+# ulamek dB zasiegu i kosztuje najwiecej pradu, wiec to najtanszy z mozliwych
+# kompromisow. Floor, a nie zaokraglenie: 90% ma byc SUFITEM, nie celem.
+TX_POWER_CAP = int(TX_POWER_MAX * 0.9)
+DEFAULT_TX_POWER = str(TX_POWER_CAP)
+
+
+def clamp_tx_power(value):
+    """Moc przyciety do pulapu. Wolane przy KAZDYM zapisie i kazdym ustawieniu
+    na zywo, bo wartosc wchodzi tu z trzech stron (menu, modprobe.d z poprzedniej
+    instalacji, stala domyslna) i pulap ma obowiazywac niezaleznie od drogi.
+    Zero zostawiamy nietkniete - to nie moc, tylko 'uzyj kalibracji EEPROM'."""
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_TX_POWER
+    if num <= 0:
+        return "0"
+    return str(min(num, TX_POWER_CAP))
 
 MODPROBE_WFB = Path("/etc/modprobe.d/wfb.conf")
 TX_POWER_SYSFS = Path("/sys/module/88XXau_wfb/parameters/rtw_tx_pwr_idx_override")
@@ -776,17 +799,18 @@ def write_modprobe_wfb(tx_power):
         "blacklist 8812au\n"
         "blacklist rtl8812au\n"
         "blacklist rtw88_8812au\n"
-        f"options 88XXau_wfb rtw_tx_pwr_idx_override={tx_power}\n"
+        f"options 88XXau_wfb rtw_tx_pwr_idx_override={clamp_tx_power(tx_power)}\n"
     )
 
 
 def apply_tx_power_live(tx_power):
-    """0-63: wymusza moc nadawania natychmiast, bez przeladowania modulu.
-    Parametr modulu 88XXau_wfb jest zapisywalny na zywo przez sysfs."""
+    """Wymusza moc nadawania natychmiast, bez przeladowania modulu. Parametr
+    modulu 88XXau_wfb jest zapisywalny na zywo przez sysfs. Wartosc przechodzi
+    przez pulap, bo to jest ostatnie miejsce przed samym sterownikiem."""
     if not TX_POWER_SYSFS.exists():
         return False
     try:
-        TX_POWER_SYSFS.write_text(str(tx_power))
+        TX_POWER_SYSFS.write_text(clamp_tx_power(tx_power))
         return True
     except OSError:
         return False
@@ -1487,18 +1511,45 @@ class PingProbe:
             self._stop.wait(0.4)
 
 
+# Sila sygnalu w skali 1-10. Punkty zaczepienia sa dobrane tak, zeby liczba
+# nigdy nie przeczyla kolorowi z rssi_grade: 7 wypada dokladnie na granicy
+# dobry/slaby (-65 dBm), a 4 na granicy slaby/na-granicy-zasiegu (-75 dBm).
+# Miedzy nimi interpolujemy liniowo, bo skokowa skala pokazywalaby to samo
+# "8" przy -52 i przy -64 dBm, a to sa dwa rozne swiaty przy ustawianiu anteny.
+RSSI_SCALE = ((-95, 1.0), (-75, 3.5), (-65, 6.5), (-50, 8.5), (-40, 10.0))
+
+
+def rssi_score(rssi):
+    """Sila sygnalu 1-10 albo None, gdy nic nie przychodzi. Liczba zamiast
+    slowa, bo przy przestawianiu anteny latwiej porownac "8 czy 9" niz dwa
+    razy to samo "dobry"."""
+    if rssi is None:
+        return None
+    if rssi <= RSSI_SCALE[0][0]:
+        return 1
+    for (x0, y0), (x1, y1) in zip(RSSI_SCALE, RSSI_SCALE[1:]):
+        if rssi <= x1:
+            # +0.5 zamiast round(): round() zaokragla polowki do PARZYSTEJ,
+            # wiec round(6.5) daje 6, a round(8.5) daje 8 - a punkty zaczepienia
+            # skali leza dokladnie na polowkach i wtedy liczba przeczyla kolorowi
+            # (-65 dBm: kolor "ok", sila 6, czyli z zakresu "warn").
+            return int(y0 + (y1 - y0) * (rssi - x0) / (x1 - x0) + 0.5)
+    return 10
+
+
 # Progi z praktyki dla 8812AU: powyzej -50 dBm karty sa praktycznie obok
-# siebie, ponizej -75 dBm zaczynaja sie zrywy obrazu.
+# siebie, ponizej -75 dBm zaczynaja sie zrywy obrazu. Kolor zostaje na tych
+# progach, zmienia sie tylko opis - zamiast przymiotnika idzie liczba.
 def rssi_grade(rssi):
     if rssi is None:
-        return None, "?"
-    if rssi >= -50:
-        return "ok", "doskonaly"
+        return None, "brak sygnalu"
     if rssi >= -65:
-        return "ok", "dobry"
-    if rssi >= -75:
-        return "warn", "slaby"
-    return "fail", "na granicy zasiegu"
+        status = "ok"
+    elif rssi >= -75:
+        status = "warn"
+    else:
+        status = "fail"
+    return status, f"{rssi_score(rssi)}/10"
 
 
 def loss_grade(pct):
@@ -2701,10 +2752,10 @@ def step_config():
     # Zawsze odswiezamy blackliste - niezaleznie od tego czy config juz byl,
     # bo nowsze jadra (6.x) maja WBUDOWANY sterownik rtw88_8812au, ktory
     # przechwytuje karte przy kazdym boocie zanim doda sie 88XXau_wfb.
-    # Moc nadawania: zachowujemy juz ustawiona wartosc, a jesli jeszcze
-    # jej nie bylo - domyslnie MAX (63/63), bo uzytkownik ma pozwolenie
-    # radiowe i moc nie jest tu ograniczeniem.
-    tx_power = parse_tx_power()
+    # Moc nadawania: zachowujemy juz ustawiona wartosc, a jesli jeszcze jej nie
+    # bylo - domyslnie pulap (90% skali). Wartosc i tak przechodzi przez
+    # clamp_tx_power, wiec starsza instalacja z 63 zjedzie tu do pulapu sama.
+    tx_power = clamp_tx_power(parse_tx_power())
     write_modprobe_wfb(tx_power)
     apply_tx_power_live(tx_power)
 
@@ -2897,6 +2948,26 @@ def refuse_wrong_role():
     return True
 
 
+def enforce_tx_power_cap():
+    """Sciaga moc do pulapu, jesli gdzies zostala wyzsza. Wolane przy KAZDYM
+    starcie, bo instalacje sprzed wprowadzenia pulapu maja w modprobe.d wpisane
+    pelne 63 i nic samo tego nie obnizy - full_setup() juz sie tam nie odpali,
+    a menu trzeba by odwiedzic recznie na obu Pi. Zwraca True, gdy cos ruszono."""
+    saved, live = parse_tx_power(), read_tx_power_live()
+    too_high = [v for v in (saved, live)
+                if v is not None and v.isdigit() and int(v) > TX_POWER_CAP]
+    if not too_high:
+        return False
+
+    log(f"    Moc TX: {'/'.join(too_high)} przekracza pulap {TX_POWER_CAP}"
+        f" (90% z {TX_POWER_MAX}) - obnizam.")
+    log("    Pelna moc 8812AU potrafi wylaczyc Pi poborem pradu z portu USB.")
+    write_modprobe_wfb(saved)      # obie funkcje same przycinaja do pulapu
+    if not apply_tx_power_live(saved):
+        log("    (na zywo sie nie udalo - zadziala po przeladowaniu modulu albo reboocie)")
+    return True
+
+
 def wait_for_dongles(timeout=30):
     """Po boocie USB bywa jeszcze niepoliczone - multi-user.target nie czeka na
     dongle, a dwa 8812AU na zasilaniu przez hub potrafia zglosic sie kilkanascie
@@ -2977,6 +3048,7 @@ def detect_nics_startup():
         return nics
 
     release_nics_from_network_stack(nics)
+    enforce_tx_power_cap()
 
     channel, region = wfb_effective_common()
     freq = channel_freq(channel)
@@ -3154,15 +3226,24 @@ def collect_checks():
     elif live_tx == "0":
         checks.append(("Moc nadawania (TX)", "warn", "override wylaczony (0) - uzywana kalibracja EEPROM"))
     elif live_tx != saved_tx:
-        checks.append(("Moc nadawania (TX)", "warn", f"na zywo={live_tx}/63, zapisane={saved_tx}/63 (niezgodne)"))
+        checks.append(("Moc nadawania (TX)", "warn",
+                       f"na zywo={live_tx}/{TX_POWER_CAP}, zapisane={saved_tx}/{TX_POWER_CAP} (niezgodne)"))
+    elif live_tx.isdigit() and int(live_tx) > TX_POWER_CAP:
+        # Zostalo po starszej wersji skryptu, ktora pozwalala na pelne 63.
+        # To jest dokladnie ta wartosc, przy ktorej dongiel potrafi wylaczyc
+        # Pi poborem pradu z USB - wiec fail, a nie warn.
+        checks.append(("Moc nadawania (TX)", "fail",
+                       f"{live_tx} przekracza pulap {TX_POWER_CAP} (90% z {TX_POWER_MAX}) - "
+                       "wejdz w 'Region i moc nadawania' i zapisz od nowa"))
     elif live_tx.isdigit() and int(live_tx) < 10:
         # Spojna, ale bardzo niska wartosc to typowy cichy zabojca zasiegu -
         # link "dziala na biurku" i pada kilka metrow dalej. Zostaje warn,
         # bo do testow w pomieszczeniu ustawia sie ja swiadomie.
         checks.append(("Moc nadawania (TX)", "warn",
-                       f"{live_tx}/63 - bardzo nisko, zasieg bedzie zaden (max = 63)"))
+                       f"{live_tx}/{TX_POWER_CAP} - bardzo nisko, zasieg bedzie zaden"))
     else:
-        checks.append(("Moc nadawania (TX)", "ok", f"{live_tx}/63"))
+        checks.append(("Moc nadawania (TX)", "ok",
+                       f"{live_tx}/{TX_POWER_CAP} (pulap = 90% z {TX_POWER_MAX})"))
 
     # Rozdzial rol sprawdzamy na LICZNIKACH KARTY, a nie w configu ani w linii
     # polecen wfb_tx: wfb-ng podaje procesowi wszystkie interfejsy i dopiero
@@ -3407,7 +3488,7 @@ def config_overview_lines():
     in_band = bool(freq and ranges and any(lo <= span[0] and span[1] <= hi for lo, hi in ranges))
     row("region", f"{reg}   (w jadrze: {country or '?'})", "ok" if in_band else "warn")
     live_tx, saved_tx = read_tx_power_live(), parse_tx_power()
-    row("moc TX", f"{live_tx or '?'}/63 na zywo, {saved_tx}/63 zapisane",
+    row("moc TX", f"{live_tx or '?'}/{TX_POWER_CAP} na zywo, {saved_tx}/{TX_POWER_CAP} zapisane",
         "warn" if live_tx != saved_tx else None)
     row("tryb wideo", video_service_type() or "?")
 
@@ -3495,16 +3576,31 @@ def radio_settings_screen(stdscr):
 
     region = prompt_line(stdscr, 5, "Region (CRDA)", cur_region)
 
+    # Pulap jest twardy juz na wejsciu, a nie dopiero przy zapisie: gdyby menu
+    # przyjmowalo 63 i dopiero clamp_tx_power scinal to po cichu do 56,
+    # uzytkownik widzialby w potwierdzeniu inna liczbe niz ta, ktora naprawde
+    # trafia do sterownika.
     tx_power = ""
-    while not (tx_power.isdigit() and 0 <= int(tx_power) <= 63):
-        tx_power = prompt_line(stdscr, 7, "Moc nadawania TX (0-63, 63=max)", cur_tx_power)
-        if not (tx_power.isdigit() and 0 <= int(tx_power) <= 63):
-            safe_addstr(stdscr, 8, 2, "Podaj liczbe 0-63 (0 = wylaczone, uzyj kalibracji EEPROM).",
+    def tx_ok(v):
+        return v.isdigit() and 0 <= int(v) <= TX_POWER_CAP
+
+    while not tx_ok(tx_power):
+        tx_power = prompt_line(stdscr, 7,
+                               f"Moc nadawania TX (0-{TX_POWER_CAP}, {TX_POWER_CAP}=max)",
+                               cur_tx_power)
+        if not tx_ok(tx_power):
+            safe_addstr(stdscr, 8, 2,
+                        f"Podaj liczbe 0-{TX_POWER_CAP} (0 = kalibracja EEPROM). Gorne "
+                        f"{TX_POWER_MAX - TX_POWER_CAP} stopni skali jest zablokowane -",
+                        color_for("fail"))
+            safe_addstr(stdscr, 9, 2,
+                        "dongiel na pelnej mocy potrafi wylaczyc Pi przez pobor pradu z USB.",
                         color_for("fail"))
 
     country, ranges = reg_domain_ranges()
     span = channel_span(freq)
-    lines = [f"Region: {region}   moc TX: {tx_power}/63",
+    lines = [f"Region: {region}   moc TX: {tx_power}/{TX_POWER_CAP}"
+             f" (pulap {TX_POWER_CAP} z {TX_POWER_MAX} = 90% skali)",
              f"Kanal zostaje: {channel}" + (f" ({freq} MHz)" if freq else ""),
              ""]
     # Kanal spoza pasma dozwolonego w regionie = karta w ogole nie nadaje,
@@ -4197,7 +4293,8 @@ class TestRecorder:
         w(f"# host: {socket.gethostname()}   jadro: {os.uname().release}"
           f"   wfb-ng: {wfb_ng_version()}\n")
         w(f"# kanal: {ch}" + (f" ({freq} MHz)" if freq else "") + f"   region: {reg}"
-          f"   moc TX: {read_tx_power_live() or '?'}/63\n")
+          f"   moc TX: {read_tx_power_live() or '?'}/{TX_POWER_CAP}"
+          f" (pulap 90% z {TX_POWER_MAX})\n")
         fingerprint = key_fingerprint(DRONE_KEY)
         w(f"# klucze: {mode}" + (f", kod {format_pairing_code(code)}" if code else "")
           + (f"   odcisk drone.key={fingerprint}" if fingerprint else "") + "\n")
@@ -4313,7 +4410,8 @@ class TestRecorder:
               + (f", ~{rate:.0f} Mbit/s PHY" if rate else "")
               + f" - w {count} z {self.samples} probek\n")
         if self._rssi.lo is not None:
-            w(f"# najslabszy sygnal: {self._rssi.lo:.0f} dBm ({rssi_grade(self._rssi.lo)[1]})\n")
+            w(f"# najslabszy sygnal: {self._rssi.lo:.0f} dBm"
+              f" (sila {rssi_grade(self._rssi.lo)[1]})\n")
         if self._loss.hi is not None:
             w(f"# najwieksze straty: {self._loss.hi:.1f}% ({loss_grade(self._loss.hi)[1]})\n")
         self._fh.flush()
@@ -4545,13 +4643,18 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
         overall, overall_txt = "fail", "BRAK ODBIORU"
     else:
         overall_txt = {"ok": "DOBRE", "warn": "SLABE", "fail": "ZLE"}.get(overall, "?")
-        if overall == "ok" and rssi_txt == "doskonaly":
+        # Prog ten sam co dawne "doskonaly" (-50 dBm), tylko wyrazony w skali:
+        # 9/10 wypada dokladnie na -50 dBm. Porownanie po LICZBIE, a nie po
+        # napisie - opis zmienia sie razem ze skala, prog nie ma prawa.
+        if overall == "ok" and (rssi_score(best_rssi) or 0) >= 9:
             overall_txt = "DOSKONALE"
 
     head = f"Ocena lacza: {overall_txt}"
     parts = []
     if best_rssi is not None:
-        parts.append(f"sygnal {best_rssi:.0f} dBm")
+        parts.append(f"sygnal {rssi_txt}  ({best_rssi:.0f} dBm)")
+    else:
+        parts.append(f"sygnal: {rssi_txt}")
     if metrics["mcs"] is not None:
         parts.append(f"MCS {metrics['mcs']}")
     if loss is not None:
@@ -4621,7 +4724,7 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
             rssi, snr = best["rssi"], best["snr"]
             st, txt = rssi_grade(rssi[1])
             row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
-                f"{meter(rssi[1], -90, -40)}  {txt}", st)
+                f"{meter(rssi[1], -90, -40)}  sila {txt}", st)
             if snr:
                 sst, stxt = snr_grade(snr[1])
                 row(f"SNR  {snr[0]:>5.0f}/{snr[1]:>5.0f}/{snr[2]:>5.0f} dB   "
@@ -4731,8 +4834,9 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
         row("wfb-nics nie zwraca zadnego interfejsu", "fail")
 
     section("Najgorsze wartosci od poczatku testu")
-    row(f"sygnal {worst['rssi']:.0f} dBm" if worst["rssi"] is not None else "sygnal ?",
-        rssi_grade(worst["rssi"])[0])
+    worst_rssi_st, worst_rssi_txt = rssi_grade(worst["rssi"])
+    row(f"sygnal {worst_rssi_txt}  ({worst['rssi']:.0f} dBm)"
+        if worst["rssi"] is not None else f"sygnal: {worst_rssi_txt}", worst_rssi_st)
     row(f"straty {worst['loss']:.1f}%" if worst["loss"] is not None else "straty ?",
         loss_grade(worst["loss"])[0])
 
