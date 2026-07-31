@@ -1511,6 +1511,16 @@ def loss_grade(pct):
     return "fail", "duze"
 
 
+# Ile trzeba uzbierac, zeby procent strat cokolwiek znaczyl. Ponizej tego progu
+# ocena w naglowku jest None i naglowek opiera sie na samym sygnale - lepiej nie
+# oceniac wcale niz oceniac z kilkunastu pakietow. Progi biora sie z mianownika:
+# przy 20 pkt/s jeden zgubiony pakiet to 5%, wiec dopoki nie uzbiera sie ich
+# kilkuset, kazda dziura wyrzuca ocene na "duze". Przy pingach jest jeszcze
+# gorzej, bo probka ma tylko 3 pakiety i moze dac wylacznie 0/33/67/100%.
+GRADE_MIN_PACKETS = 200  # ~10 s przy typowym ruchu tunelu
+GRADE_MIN_PINGS = 15     # 5 prob po 3 pakiety, czyli okolo 7 s
+
+
 def snr_grade(snr):
     if snr is None:
         return None, "?"
@@ -4503,7 +4513,18 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     snr_st, snr_txt = snr_grade(best_snr)
     ping_st, _ = loss_grade(last_loss)
 
-    overall = worst_status([s for s in (rssi_st, loss_st, snr_st, ping_st) if s])
+    # Naglowek ocenia CALY przebieg, a nie ostatnia sekunde i ostatnie trzy
+    # pingi. Powod jest arytmetyczny: przy 20 pkt/s jeden zgubiony pakiet to
+    # 5%, a przy trzech pingach jeden zgubiony to od razu 33% - obie wartosci
+    # wpadaja wtedy w prog "duze" i naglowek krzyczy ZLE, chociaz z calego
+    # testu wychodzi ponizej procenta. Chwilowe wartosci zostaja przy swoich
+    # wierszach nizej; tam sa na miejscu, bo mowia "co sie dzieje TERAZ".
+    seen_run = run.totals["rx"] + run.totals["lost"]
+    run_loss_st = loss_grade(run.per)[0] if seen_run >= GRADE_MIN_PACKETS else None
+    run_ping_st = loss_grade(total_loss)[0] if sent >= GRADE_MIN_PINGS else None
+    warming = run_loss_st is None and run_ping_st is None
+
+    overall = worst_status([s for s in (rssi_st, run_loss_st, snr_st, run_ping_st) if s])
     if not ants and rx_pps_total <= 0 and not rtt:
         overall, overall_txt = "fail", "BRAK ODBIORU"
     else:
@@ -4525,6 +4546,12 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
         parts.append(f"ping {rtt[1]:.1f} ms")
     parts.append(f"czas testu {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
     lines.append((f"{head}   " + "   ".join(parts), color_for(overall) | curses.A_BOLD))
+
+    # Bez tego pierwsze kilkanascie sekund wygladaja na blad: ocena stoi na
+    # samym sygnale i uparcie pokazuje DOSKONALE, chocby wlasnie lecialy straty.
+    if warming and ants:
+        row("(ocena strat wlaczy sie po kilkunastu sekundach - tyle trzeba, zeby "
+            "liczby cokolwiek znaczyly)")
 
     if overall == "fail" and not ants and rx_pps_total <= 0:
         row("Nic nie przychodzi z drugiej strony. Sprawdz po obu stronach: ten sam kanal,", "fail")
