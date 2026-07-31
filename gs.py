@@ -6380,9 +6380,30 @@ def load_test_screen(stdscr):
     # nie 'mbit' - ta nazwa nalezy do funkcji formatujacej przeplywnosc
     target_mbit = LOAD_DEFAULT_MBIT
 
+    # O przeplywnosc pyta tylko nadajnik - odbiornik liczy to, co dojdzie.
+    # Jedna wartosc nie wystarczy do niczego: dopiero przemiatanie od dolu
+    # w gore pokazuje, przy jakim strumieniu lacze zaczyna gubic, a to jest
+    # cala odpowiedz na pytanie "czy udzwignie obraz".
+    if VIDEO_SENDS:
+        stdscr.erase()
+        draw_header(stdscr, f"WFB-NG [{ROLE}] - test obciazeniowy")
+        safe_addstr(stdscr, 2, 2, "Przeplywnosc strumienia testowego.")
+        safe_addstr(stdscr, 3, 2, "Zacznij nisko i podnos - szukamy progu, przy ktorym "
+                                  "zaczynaja rosnac straty.", curses.A_DIM)
+        while True:
+            raw = prompt_line(stdscr, 5, "Mbit/s (0.5 - 40)", f"{LOAD_DEFAULT_MBIT:.1f}")
+            try:
+                target_mbit = float(raw.replace(",", "."))
+            except ValueError:
+                target_mbit = 0.0
+            if 0.5 <= target_mbit <= 40.0:
+                break
+            safe_addstr(stdscr, 6, 2, "Podaj liczbe od 0.5 do 40.", color_for("fail"))
+
     if VIDEO_SENDS:
         prompt = [f"Ta strona ({ROLE}) BEDZIE NADAWAC strumien testowy",
-                  f"na UDP {VIDEO_UDP_PORT} - tam, gdzie trafialby obraz z kamery.",
+                  f"{target_mbit:.1f} Mbit/s na UDP {VIDEO_UDP_PORT} - tam, gdzie",
+                  "trafialby obraz z kamery.",
                   "",
                   f"Na drugiej stronie ({PEER_NAME}) otworz ten sam ekran -",
                   "to ona policzy, ile z tego doszlo.",
