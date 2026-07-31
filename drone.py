@@ -125,6 +125,14 @@ NIC_NAMES = ["drone_RX", "drone_TX"]
 # przypadkiem tak nazwal interfejs".
 PEER_NIC_NAMES = ["gs_wfb"]
 
+# Strumien wideo idzie w JEDNA strone: dron -> gs. Dron wpycha go do wfb-ng na
+# UDP 5602 ([drone_video] peer = 'listen://'), a gs oddaje odebrany strumien na
+# UDP 5600 ([gs_video] peer = 'connect://'). Test obciazeniowy uzywa dokladnie
+# tej samej drogi, wiec mierzy ten port radiowy, ten FEC i te modulacje, ktorymi
+# naprawde poleci obraz - a nie tunel, ktory ma wlasne, inne ustawienia.
+VIDEO_UDP_PORT = 5602
+VIDEO_SENDS = True  # dron nadaje obraz; gs odbiera
+
 # Karty wylaczone z NADAWANIA. wfb-ng ma na to wartosc wifi_txpower = 'off'
 # (w master.cfg opisana jako "special value for RX only cards"): taka karta
 # jest inicjowana i odbiera, ale nie trafia na liste interfejsow wfb_tx.
@@ -1568,6 +1576,193 @@ class PingProbe:
                     self._last_loss = None
                 self._rtt = (float(r.group(1)), float(r.group(2)), float(r.group(3))) if r else None
             self._stop.wait(0.4)
+
+
+# ------------------------- test obciazeniowy -------------------------
+
+# Wielkosc pakietu zblizona do tego, co realnie wychodzi z kodera H.264 przez
+# wfb-ng. Wieksze nie zmieszcza sie w ramce radiowej po dolozeniu naglowkow,
+# mniejsze zawyzalyby narzut na pakiet i zanizaly wynik.
+LOAD_PACKET_BYTES = 1200
+LOAD_MAGIC = b"WFBL"  # zeby nie liczyc cudzych datagramow jako swoich
+LOAD_DEFAULT_MBIT = 8.0
+LOAD_HEAD = len(LOAD_MAGIC) + 8  # magic + 8-bajtowy numer sekwencyjny
+
+
+class LoadSender:
+    """Generator ruchu udajacy strumien wideo.
+
+    Po co to w ogole jest: ekran testu mierzy to, co akurat leci przez lacze,
+    a bez kamery leci tylko ping - okolo 20 pakietow na sekunde. Przy takim
+    ruchu JEDEN zgubiony pakiet to kilka procent strat, a bloki FEC (dla wideo
+    8/12) nie maja sie z czego zapelnic i lecza na fec_timeout. Zadna liczba
+    zmierzona na pustym laczu nie mowi nic o tym, jak zachowa sie obraz.
+
+    Wpychamy wiec ruch dokladnie tam, gdzie trafialby obraz z kamery, i w tym
+    samym tempie."""
+
+    def __init__(self, port=VIDEO_UDP_PORT, mbit=LOAD_DEFAULT_MBIT,
+                 size=LOAD_PACKET_BYTES):
+        self.port = port
+        self.mbit = mbit
+        self.size = max(LOAD_HEAD, size)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._sent = 0
+        self._bytes = 0
+        self._late = 0      # ile razy nie nadazylismy z tempem
+        self._error = None
+        self._sock = None
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError as e:
+            self._error = f"nie moge otworzyc gniazda: {e}"
+            return self
+        self._thread.start()
+        return self
+
+    def close(self):
+        self._stop.set()
+
+    def snapshot(self):
+        """(wyslane, bajty, ile razy nie nadazylismy, blad)"""
+        with self._lock:
+            return self._sent, self._bytes, self._late, self._error
+
+    def _loop(self):
+        addr = ("127.0.0.1", self.port)
+        pad = bytes(self.size - LOAD_HEAD)
+        interval = self.size * 8.0 / (self.mbit * 1e6)  # sekund na pakiet
+        seq = 0
+        late = 0
+        next_at = time.monotonic()
+
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now < next_at:
+                # Krotki sen zamiast dlugiego: wideo tez leci rownomiernym
+                # strumieniem, a nie seriami, i tempo ma to odwzorowac.
+                self._stop.wait(min(0.002, next_at - now))
+                continue
+
+            # Nadrabiamy zaleglosc, ale najwyzej kilkadziesiat pakietow naraz.
+            # Bez tego po chwilowym zatkaniu poszlaby seria, ktora sama z siebie
+            # wywolalaby straty - i test mierzylby wlasny artefakt zamiast lacza.
+            burst = 0
+            while next_at <= now and burst < 64 and not self._stop.is_set():
+                try:
+                    self._sock.sendto(LOAD_MAGIC + struct.pack(">Q", seq) + pad, addr)
+                except OSError as e:
+                    with self._lock:
+                        self._error = f"blad wysylania: {e}"
+                    return
+                seq += 1
+                burst += 1
+                next_at += interval
+
+            if next_at < now:
+                next_at = now  # nie nadazamy - odliczamy od nowa
+                late += 1
+
+            # Licznik pod zamkiem raz na serie, a nie na pakiet: przy kilku
+            # tysiacach pakietow na sekunde samo zamykanie kosztowaloby wiecej
+            # niz wysylka.
+            if burst:
+                with self._lock:
+                    self._sent += burst
+                    self._bytes += burst * self.size
+                    self._late = late
+
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class LoadReceiver:
+    """Liczy strumien testowy tam, gdzie wfb-ng oddaje wideo.
+
+    Dziury w numeracji to straty PO naprawie FEC - czyli dokladnie to, co
+    zobaczylby dekoder obrazu. To jest liczba, o ktora w tym tescie chodzi;
+    liczniki wfb-ng mowia, co sie dzialo na radiu, a ta mowi, co z tego
+    wyszlo na wyjsciu."""
+
+    def __init__(self, port=VIDEO_UDP_PORT):
+        self.port = port
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._first = None
+        self._last = None
+        self._got = 0
+        self._bytes = 0
+        self._reordered = 0
+        self._error = None
+        self._sock = None
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("127.0.0.1", self.port))
+            self._sock.settimeout(0.3)
+        except OSError as e:
+            self._error = (f"port {self.port} zajety - odtwarzacz obrazu juz na nim "
+                           f"slucha? [{e}]")
+            return self
+        self._thread.start()
+        return self
+
+    def close(self):
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def reset(self):
+        with self._lock:
+            self._first = self._last = None
+            self._got = self._bytes = self._reordered = 0
+
+    def snapshot(self):
+        """(odebrane, bajty, utracone, utrata %, przestawione, blad)"""
+        with self._lock:
+            if self._first is None:
+                return 0, 0, 0, None, 0, self._error
+            span = self._last - self._first + 1
+            lost = max(0, span - self._got)
+            pct = (100.0 * lost / span) if span else None
+            return self._got, self._bytes, lost, pct, self._reordered, self._error
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                data, _addr = self._sock.recvfrom(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            # Cudzy ruch na tym porcie (np. prawdziwy strumien z kamery) nie
+            # moze zaburzac numeracji - liczymy wylacznie wlasne pakiety.
+            if len(data) < LOAD_HEAD or not data.startswith(LOAD_MAGIC):
+                continue
+            seq = struct.unpack(">Q", data[len(LOAD_MAGIC):LOAD_HEAD])[0]
+            with self._lock:
+                self._got += 1
+                self._bytes += len(data)
+                if self._first is None or seq < self._first:
+                    self._first = seq
+                if self._last is None or seq > self._last:
+                    self._last = seq
+                elif self._last is not None and seq < self._last:
+                    # Przestawienie kolejnosci to nie strata - pakiet doszedl.
+                    # Liczymy je osobno, bo dla dekodera obrazu tez sa kosztem.
+                    self._reordered += 1
 
 
 # Sila sygnalu w skali 1-10. Punkty zaczepienia sa dobrane tak, zeby liczba
@@ -6096,6 +6291,7 @@ def main_menu(stdscr):
         "Identyfikacja kart (wypnij dongla)",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
+        "Test obciazeniowy (ruch jak wideo)",
         "Kanal i czestotliwosc (skan, tryb auto)",
         "Wybor modulacji (MCS)",
         "Naprawa utraconych pakietow (FEC tunelu)",
@@ -6153,14 +6349,16 @@ def main_menu(stdscr):
             elif idx == 4:
                 link_test_screen(stdscr)
             elif idx == 5:
-                channel_screen(stdscr)
+                load_test_screen(stdscr)
             elif idx == 6:
-                modulation_screen(stdscr)
+                channel_screen(stdscr)
             elif idx == 7:
-                repair_screen(stdscr)
+                modulation_screen(stdscr)
             elif idx == 8:
-                verification_screen(stdscr)
+                repair_screen(stdscr)
             elif idx == 9:
+                verification_screen(stdscr)
+            elif idx == 10:
                 if confirm_exit(stdscr):
                     break
         elif key in (ord("r"), ord("R")):
@@ -6171,6 +6369,143 @@ def main_menu(stdscr):
         elif key in (ord("q"), 27):
             if confirm_exit(stdscr):
                 break
+
+
+def load_test_screen(stdscr):
+    """Test obciazeniowy: dron nadaje strumien udajacy wideo, gs go liczy.
+
+    Musi byc otwarty PO OBU STRONACH - jedna generuje ruch, druga mierzy, co
+    z niego doszlo. Sensowna kolejnosc to najpierw gs (zeby liczyl od zera),
+    potem dron.
+
+    Rozne strony pokazuja rozne liczby i tak ma byc: nadajnik wie tylko, ile
+    wypchnal, a odbiornik - ile z tego wyszlo po naprawie FEC. Dopiero
+    zestawienie obu daje odpowiedz, czy lacze udzwignie obraz."""
+    nics = wfb_nics()
+    # nie 'mbit' - ta nazwa nalezy do funkcji formatujacej przeplywnosc
+    target_mbit = LOAD_DEFAULT_MBIT
+
+    if VIDEO_SENDS:
+        prompt = [f"Ta strona ({ROLE}) BEDZIE NADAWAC strumien testowy",
+                  f"na UDP {VIDEO_UDP_PORT} - tam, gdzie trafialby obraz z kamery.",
+                  "",
+                  f"Na drugiej stronie ({PEER_NAME}) otworz ten sam ekran -",
+                  "to ona policzy, ile z tego doszlo.",
+                  "",
+                  "Ruch idzie tym samym portem radiowym i tym samym FEC,",
+                  "co prawdziwe wideo, wiec wynik dotyczy wlasnie obrazu."]
+    else:
+        prompt = [f"Ta strona ({ROLE}) BEDZIE LICZYC strumien testowy",
+                  f"odbierany na UDP {VIDEO_UDP_PORT}.",
+                  "",
+                  f"Ruch musi wygenerowac druga strona ({PEER_NAME}) -",
+                  "otworz tam ten sam ekran.",
+                  "",
+                  "UWAGA: jesli na tym porcie slucha juz odtwarzacz obrazu,",
+                  "zatrzymaj go - dwa programy nie odbiora tego samego strumienia."]
+
+    if popup(stdscr, "Test obciazeniowy lacza", prompt, buttons=("Start", "Anuluj")) != 0:
+        return
+
+    sender = LoadSender(mbit=target_mbit).start() if VIDEO_SENDS else None
+    receiver = None if VIDEO_SENDS else LoadReceiver().start()
+    stats = WfbStatsProbe().start()
+    run = RunTotals()
+    started = time.monotonic()
+    prev = {"t": started, "sent": 0, "got": 0, "bytes": 0}
+    rate = {"pps": 0.0, "mbit": 0.0}
+
+    stdscr.timeout(200)
+    try:
+        while True:
+            now = time.monotonic()
+            elapsed = now - started
+            metrics = link_metrics(stats.snapshot()[0], nics)
+            run.update(metrics)
+
+            lines = []
+
+            def row(text, status=None, indent=2):
+                lines.append((" " * indent + text, color_for(status) if status else 0))
+
+            if sender:
+                sent, sbytes, late, err = sender.snapshot()
+                if now - prev["t"] >= 0.5:
+                    dt = now - prev["t"]
+                    rate["pps"] = (sent - prev["sent"]) / dt
+                    rate["mbit"] = (sbytes - prev["bytes"]) * 8.0 / dt / 1e6
+                    prev.update(t=now, sent=sent, bytes=sbytes)
+                lines.append((f"NADAJE strumien testowy   cel {target_mbit:.1f} Mbit/s",
+                              curses.A_BOLD))
+                row(f"wyslane {sent}   teraz {rate['pps']:.0f} pkt/s   "
+                    f"{rate['mbit']:.2f} Mbit/s")
+                if err:
+                    row(err, "fail")
+                elif late:
+                    # Nie nadazamy z wypychaniem - wynik po drugiej stronie
+                    # bedzie zanizony nie przez radio, tylko przez to Pi.
+                    row(f"nie nadazam z tempem ({late}x) - zejdz z przeplywnoscia", "warn")
+                row(f"wynik czytaj po drugiej stronie ({PEER_NAME})", indent=2)
+            else:
+                got, gbytes, lost, pct, reord, err = receiver.snapshot()
+                if now - prev["t"] >= 0.5:
+                    dt = now - prev["t"]
+                    rate["pps"] = (got - prev["got"]) / dt
+                    rate["mbit"] = (gbytes - prev["bytes"]) * 8.0 / dt / 1e6
+                    prev.update(t=now, got=got, bytes=gbytes)
+                st = loss_grade(pct)[0] if pct is not None else None
+                lines.append((f"LICZE strumien testowy z {PEER_NAME}", curses.A_BOLD))
+                if err:
+                    row(err, "fail")
+                elif not got:
+                    row("nic jeszcze nie doszlo - czy druga strona ma otwarty ten ekran?",
+                        "warn")
+                else:
+                    row(f"odebrane {got}   teraz {rate['pps']:.0f} pkt/s   "
+                        f"{rate['mbit']:.2f} Mbit/s")
+                    row(f"utracone {lost}"
+                        + (f"   {pct:.2f}%" if pct is not None else "")
+                        + (f"   przestawione {reord}" if reord else ""), st)
+                    row("(dziury w numeracji = straty PO naprawie FEC, czyli to,")
+                    row(" co zobaczylby dekoder obrazu)")
+
+            lines.append(("", 0))
+            lines.append(("Radio pod obciazeniem", curses.A_BOLD))
+            if metrics["best_rssi"] is not None:
+                rst, rtxt = rssi_grade(metrics["best_rssi"])
+                row(f"sygnal {rtxt}  ({metrics['best_rssi']:.0f} dBm)", rst)
+            if run.per is not None:
+                row(f"PER {run.per:.2f}%   {run.totals['lost']:.0f} utraconych z "
+                    f"{run.totals['rx'] + run.totals['lost']:.0f}", loss_grade(run.per)[0])
+                if run.per_before is not None:
+                    row(f"bez naprawy stracilibysmy {run.per_before:.2f}%", indent=4)
+            row(f"odbior {metrics['rx_pps']:.0f} pkt/s   "
+                f"{mbit(metrics['rx_bytes']):.2f} Mbit/s")
+            row(f"czas: {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - test obciazeniowy")
+            for i, (text, attr) in enumerate(lines):
+                safe_addstr(stdscr, 2 + i, 2, text, attr)
+            h, _ = stdscr.getmaxyx()
+            safe_addstr(stdscr, h - 1, 2, "q = powrot, z = zeruj liczniki",
+                        curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (ord("z"), ord("Z")):
+                run.reset()
+                if receiver:
+                    receiver.reset()
+                started = now
+    finally:
+        if sender:
+            sender.close()
+        if receiver:
+            receiver.close()
+        stats.close()
 
 
 def confirm_exit(stdscr):
