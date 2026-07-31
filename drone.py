@@ -4174,6 +4174,11 @@ class TestRecorder:
         self._loss = Stat()
         self._loss_before = Stat()
         self._ping = Stat()
+        # Sumy pingow od poczatku zapisu. Kolumna ping_utrata_% w wierszach to
+        # tylko OSTATNIA proba (3 pakiety), wiec potrafi pokazac wylacznie
+        # 0/33/67/100% - do oceny calego przebiegu nie nadaje sie zupelnie.
+        self._ping_sent = 0
+        self._ping_recv = 0
         self._mcs = {}
         # straty_% to chwila, per_% to caly test - przy szukaniu zasiegu liczy
         # sie to drugie, bo pojedyncza sekunda potrafi klamac w obie strony
@@ -4232,6 +4237,7 @@ class TestRecorder:
 
     def sample(self, elapsed, metrics, ping):
         rtt, last_loss = ping[0], ping[1]
+        self._ping_sent, self._ping_recv = ping[3], ping[4]
         rssi, snr, loss = metrics["best_rssi"], metrics["best_snr"], metrics["loss"]
         ants = " ".join(f"{a['label'].replace(' ', ':')}={a['rssi'][1]:.0f}"
                         for a in metrics["ants"] if a["rssi"])
@@ -4277,6 +4283,16 @@ class TestRecorder:
         w(f"# straty przed naprawa [%]: {self._loss_before.line()}\n")
         w(f"# straty po naprawie [%]:   {self._loss.line()}\n")
         w(f"# ping [ms]:   {self._ping.line()}\n")
+        if self._ping_sent:
+            # Ta liczba bez komentarza wprowadza w blad przy zestawieniu z PER
+            # nizej: PER opisuje JEDEN kierunek (to, co tu przyszlo), a ping
+            # musi przejsc tam i z powrotem. Jesli ping gubi wyraznie wiecej
+            # niz PER, to gubi kierunek przeciwny - ten, ktorego ten ekran
+            # w ogole nie widzi, i trzeba go zmierzyc z drugiej strony.
+            lost = self._ping_sent - self._ping_recv
+            w(f"# ping: {lost} zgubionych z {self._ping_sent}"
+              f" ({100.0 * lost / self._ping_sent:.2f}%) - strata W OBIE STRONY,\n"
+              "#   wiec porownuj ja z PER ponizej, ktory liczy tylko odbior\n")
 
         run, per = self._run.totals, self._run.per
         seen = run["rx"] + run["lost"]
