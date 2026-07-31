@@ -94,6 +94,12 @@ AUTOSTART_FLAG = "--autostart"
 # tu czego rozrozniac. Na dronie, gdzie karty sa dwie, sa to drone_RX/drone_TX.
 NIC_NAMES = ["gs_wfb"]
 
+# Nazwy kart DRUGIEJ roli - po nich poznajemy, ze skrypt odpalono na cudzym Pi
+# (patrz refuse_wrong_role). Nazwy sa przypiete do MAC-ow przez udev, wiec
+# drone_RX na maszynie znaczy "to Pi bylo urzadzane jako dron", a nie "ktos
+# przypadkiem tak nazwal interfejs".
+PEER_NIC_NAMES = ["drone_RX", "drone_TX"]
+
 # Karty wylaczone z NADAWANIA (wfb-ng: wifi_txpower = 'off', "rx only cards").
 # Na gs pusto: jedna karta i jedna antena nadawczo-odbiorcza, wiec nie ma czego
 # rozdzielac. Na dronie siedzi tu drone_RX, bo tam do drugiej karty idzie
@@ -2822,6 +2828,65 @@ def autostart_status():
     return "ok", f"{AUTOSTART_UNIT_NAME} wlaczony -> {SCRIPT_PATH}"
 
 
+# ------------------------- ochrona przed zla rola -------------------------
+
+def peer_role_nics():
+    """Interfejsy nalezace do DRUGIEJ roli - ale tylko wtedy, gdy zadnego
+    naszego tu nie ma. Gdy sa obie nazwy naraz, nie orzekamy niczego: to stan
+    po recznym grzebaniu i lepiej puscic uzytkownika dalej, niz zablokowac mu
+    jedyne narzedzie do posprzatania."""
+    try:
+        present = {p.name for p in Path("/sys/class/net").iterdir()}
+    except OSError:
+        return []
+    if any(n in present for n in NIC_NAMES):
+        return []
+    return [n for n in PEER_NIC_NAMES if n in present]
+
+
+def refuse_wrong_role():
+    """True = to Pi drugiej roli, konczymy bez dotykania czegokolwiek.
+
+    Uruchomienie gs.py na dronie (albo odwrotnie) konczylo sie tym, ze skrypt
+    uznawal cudze karty za swoje i startowal na nich wifibroadcast@<nasza
+    rola>. Dwa serwery wfb-ng na tych samych interfejsach przestawiaja je
+    nawzajem (ip link down, iw set monitor, iw set channel), wiec ktorys
+    zawsze przegrywa i pada - a kazdy jego restart to NOWY klucz sesji, czyli
+    link zrywajacy sie cyklicznie co kilkanascie sekund. Do tego zostawal po
+    tym wpis w autostarcie i balagan wracal po kazdym reboocie.
+
+    Dlatego to jest odmowa, a nie ostrzezenie, i musi zadzialac przed
+    install_autostart() oraz przed czymkolwiek, co wola systemctl."""
+    theirs = peer_role_nics()
+    if not theirs:
+        return False
+
+    log(f"==> BLAD: to jest Pi roli '{PEER_NAME}', a uruchomiles {SCRIPT_PATH.name} (rola '{ROLE}').")
+    log(f"    Karty tej maszyny: {', '.join(theirs)} - te nazwy naleza do '{PEER_NAME}'.")
+    log(f"    Uruchom tutaj:  sudo python3 {SCRIPT_PATH.parent / (PEER_NAME + '.py')}")
+    log("")
+    log("    Nie ruszam niczego. Dwa serwery wfb-ng na tych samych kartach")
+    log("    wywalaja sie nawzajem i usluga pada w kolko - link zrywa sie wtedy")
+    log("    cyklicznie, mimo ze sygnal jest doskonaly.")
+
+    # Slady po poprzednim takim uruchomieniu sprzatamy nie sami, tylko
+    # podajemy gotowa komende: to jest cudza maszyna i decyzja nalezy do
+    # uzytkownika, a nie do skryptu, ktory wlasnie przyznal sie do pomylki.
+    mess = []
+    if run(["systemctl", "is-active", "--quiet", f"wifibroadcast@{ROLE}"])[0] == 0:
+        mess.append(f"wifibroadcast@{ROLE}")
+    elif run(["systemctl", "is-enabled", "--quiet", f"wifibroadcast@{ROLE}"])[0] == 0:
+        mess.append(f"wifibroadcast@{ROLE}")
+    if AUTOSTART_UNIT.exists():
+        mess.append(AUTOSTART_UNIT_NAME)
+    if mess:
+        log("")
+        log(f"    UWAGA: zostaly tu slady roli '{ROLE}' z wczesniejszego uruchomienia.")
+        log("    Skasuj je, inaczej wroca po reboocie:")
+        log(f"      sudo systemctl disable --now {' '.join(mess)}")
+    return True
+
+
 def wait_for_dongles(timeout=30):
     """Po boocie USB bywa jeszcze niepoliczone - multi-user.target nie czeka na
     dongle, a dwa 8812AU na zasilaniu przez hub potrafia zglosic sie kilkanascie
@@ -2840,6 +2905,13 @@ def autostart_run():
     puszczamy - apt-get i budowanie sterownika w trakcie bootu (czesto jeszcze
     bez sieci) to ostatnia rzecz, jakiej sie tu chce."""
     log(f"==> Autostart {ROLE} ({AUTOSTART_UNIT_NAME})")
+    # Ta jednostka mogla zostac po pomylkowym uruchomieniu skryptu nie tej roli
+    # na cudzym Pi. Wtedy budzi sie po kazdym boocie i psuje dzialajacy link,
+    # a w journalu nie widac dlaczego - stad ten sam warunek co przy starcie
+    # z reki, tylko wczesniej niz cokolwiek innego.
+    if refuse_wrong_role():
+        return 1
+
     if not setup_artifacts_present():
         log("    Setup nie jest skonczony - uruchom recznie:")
         log(f"    sudo python3 {SCRIPT_PATH}")
@@ -5932,6 +6004,12 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == AUTOSTART_FLAG:
         require_root()
         sys.exit(autostart_run())
+
+    # PRZED require_root i przed autostartem: na cudzym Pi nie mamy tu nic do
+    # roboty, a kazdy dalszy krok (install_autostart, setup, restart uslugi)
+    # tylko robi szkode. Sama odmowa roota nie wymaga.
+    if refuse_wrong_role():
+        sys.exit(2)
 
     require_root()
     os.environ.setdefault("DEBIAN_FRONTEND", "noninteractive")
