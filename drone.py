@@ -6466,6 +6466,26 @@ def load_test_screen(stdscr):
                     # Nie nadazamy z wypychaniem - wynik po drugiej stronie
                     # bedzie zanizony nie przez radio, tylko przez to Pi.
                     row(f"nie nadazam z tempem ({late}x) - zejdz z przeplywnoscia", "warn")
+
+                # To rozstrzyga najwazniejsze pytanie tego testu: czy ramki,
+                # ktorych nie ma po drugiej stronie, w ogole polecialy w eter.
+                # Bez tego kazda strate zwalalo by sie na radio, a rownie dobrze
+                # moze ich nigdy nie byc na antenie.
+                tx_msgs = metrics["tx"]
+                inj = sum(rx_packets(m, "injected")[0] for m in tx_msgs.values())
+                drop = sum(rx_packets(m, "dropped")[0] for m in tx_msgs.values())
+                lat = max((r[3] or 0.0 for m in tx_msgs.values()
+                           for r in tx_wlan_rows(m, nics)), default=0.0)
+                row(f"wfb_tx wstrzyknelo {inj:.0f} pkt/s   odrzucone {drop:.0f}/s"
+                    + (f"   wstrzykiwanie {lat:.1f} ms" if lat else ""),
+                    "fail" if drop else None)
+                if drop:
+                    row("odrzucone > 0 = to Pi nie nadaza wypchnac ramek w eter.",
+                        "fail", indent=4)
+                    row("Strat nie szukaj w radiu - zejdz z przeplywnoscia albo",
+                        "fail", indent=4)
+                    row("podnies MCS, zeby jedna ramka zajmowala mniej czasu.",
+                        "fail", indent=4)
                 row(f"wynik czytaj po drugiej stronie ({PEER_NAME})", indent=2)
             else:
                 got, gbytes, lost, pct, reord, err = receiver.snapshot()
