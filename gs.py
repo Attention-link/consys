@@ -4333,6 +4333,14 @@ TEST_STATE = TEST_LOG_DIR / f".test-{ROLE}.stan"
 TEST_NOTE = TEST_LOG_DIR / f".test-{ROLE}.uwagi"
 RECORDER_FLAG = "--zapis-testu"
 
+# Znacznik: jeden klawisz w trakcie testu zostawia w logu pionowa kreske "tu
+# cos sie stalo" (obrot anteny, przelot za budynek, wlaczenie silnikow).
+# Po locie nikt nie pamieta, o ktorej minucie to bylo, a na wykresie
+# w podgladzie znaczniki widac jako czerwone linie i od razu wiadomo, ktore
+# zalamanie sygnalu z czym zestawic. Numeruje je proces zapisu - TUI wysyla
+# samo slowo, bo moze wystartowac i zniknac w srodku zapisu.
+MARK_TEXT = "ZNACZNIK"
+
 # Gorny limit rozmiaru logu. Przy 4 Hz to okolo miesiaca ciaglego zapisu, wiec
 # nie chodzi o skracanie testu, tylko o to, zeby zapomniany zapis nie zapchal
 # karty do zera - z pelna karta system przestaje dzialac, a nie tylko test.
@@ -4398,7 +4406,7 @@ def test_state():
     if not st.get("plik"):
         return None
 
-    for key in ("pid", "probek", "bajtow"):
+    for key in ("pid", "probek", "bajtow", "znacznikow"):
         try:
             st[key] = int(st.get(key) or 0)
         except ValueError:
@@ -4477,6 +4485,13 @@ def note_test_recorder(text):
         pass
 
 
+def mark_test_recorder():
+    """Znacznik "tu cos sie stalo" w miejscu, w ktorym stoi zapis. Numer nadaje
+    proces zapisu, wiec z paru miejsc naraz (ekran testu, menu) nie da sie
+    dostac dwoch znacznikow o tym samym numerze."""
+    note_test_recorder(MARK_TEXT)
+
+
 def take_test_notes():
     try:
         text = TEST_NOTE.read_text(encoding="utf-8")
@@ -4509,7 +4524,9 @@ class TestRecorder:
         self.path = path
         self.samples = 0
         self.size = 0
+        self.marks = []      # (godzina, sekunda od startu) recznych znacznikow
         self._fh = None
+        self._elapsed = 0.0  # czas ostatniej probki - do opisu znacznikow
         self._rssi = Stat()
         self._loss = Stat()
         self._loss_before = Stat()
@@ -4571,12 +4588,23 @@ class TestRecorder:
 
     def note(self, text):
         """Komentarz w srodku pliku - np. o wyzerowaniu licznikow, zeby przy
-        czytaniu bylo widac, ze w tym miejscu cos sie zmienilo."""
-        if self._fh:
-            self._fh.write(f"# {time.strftime('%H:%M:%S')}  {text}\n")
-            self._fh.flush()
+        czytaniu bylo widac, ze w tym miejscu cos sie zmienilo.
+
+        Samo slowo MARK_TEXT to znacznik z klawisza: numer dopisujemy tutaj,
+        bo tylko ten proces widzi caly zapis. TUI moze sie w miedzyczasie
+        zamknac i otworzyc, a numeracja i tak idzie po kolei."""
+        if not self._fh:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        if text.strip().upper() == MARK_TEXT:
+            self.marks.append((stamp, self._elapsed))
+            text = f"{MARK_TEXT} {len(self.marks)}"
+        self._fh.write(f"# {stamp}  {text}\n")
+        self._fh.flush()
+        self.size = self._fh.tell()
 
     def sample(self, elapsed, metrics, ping):
+        self._elapsed = elapsed
         rtt, last_loss = ping[0], ping[1]
         self._ping_sent, self._ping_recv = ping[3], ping[4]
         rssi, snr, loss = metrics["best_rssi"], metrics["best_snr"], metrics["loss"]
@@ -4620,6 +4648,12 @@ class TestRecorder:
         w(f"# czas testu: {int(elapsed) // 60} min {int(elapsed) % 60} s"
           f"   probek: {self.samples} ({LOG_SAMPLE_HZ} Hz)"
           f"   rozmiar: {human_size(self.size)}\n")
+        # Znaczniki zebrane w jednym miejscu: w srodku pliku leza rozrzucone
+        # miedzy tysiacami wierszy, a tutaj od razu widac, o ktorej minucie
+        # testu cos sie dzialo - takze bez otwierania podgladu.
+        for i, (stamp, when) in enumerate(self.marks, 1):
+            w(f"# znacznik {i}: {stamp}   {int(when) // 60}:{int(when) % 60:02d}"
+              " od startu zapisu\n")
         w(f"# RSSI [dBm]:  {self._rssi.line('{:.0f}')}\n")
         w(f"# straty przed naprawa [%]: {self._loss_before.line()}\n")
         w(f"# straty po naprawie [%]:   {self._loss.line()}\n")
@@ -4634,6 +4668,13 @@ class TestRecorder:
             w(f"# ping: {lost} zgubionych z {self._ping_sent}"
               f" ({100.0 * lost / self._ping_sent:.2f}%) - strata W OBIE STRONY,\n"
               "#   wiec porownuj ja z PER ponizej, ktory liczy tylko odbior\n")
+            if not self._ping_recv and self._rssi.lo is not None:
+                # Odbior byl (jest RSSI), a nie wrocil ani jeden ping - to nie
+                # jest "slaby link", tylko zerwany kierunek W GORE. Przy
+                # czytaniu logu po locie sama kolumna pingu tego nie mowi.
+                w("# UWAGA: przez caly test nie wrocil ANI JEDEN ping, a sygnal"
+                  " byl odbierany -\n#   lacze dzialalo tylko W DOL, druga strona"
+                  " nas nie slyszala\n")
 
         run, per = self._run.totals, self._run.per
         seen = run["rx"] + run["lost"]
@@ -4696,6 +4737,7 @@ def background_recorder(path):
         write_test_state(stan=stan, pid=os.getpid(), plik=recorder.path,
                          start=started_txt, czas=f"{elapsed:.1f}",
                          probek=recorder.samples, bajtow=recorder.size,
+                         znacznikow=len(recorder.marks),
                          limit=TEST_MAX_BYTES, powod=powod)
 
     save_state("trwa")
@@ -4720,8 +4762,15 @@ def background_recorder(path):
                 nics = wfb_nics()
                 next_nic_scan = now + 2.0
 
-            for note in take_test_notes():
+            notes = take_test_notes()
+            for note in notes:
                 recorder.note(note)
+            if notes:
+                # Numer znacznika ma wrocic na ekran od razu, a nie przy
+                # najblizszym odswiezeniu stanu - inaczej po nacisnieciu
+                # klawisza przez sekunde nie wiadomo, czy w ogole trafil.
+                next_state = now + 1.0
+                save_state("trwa", elapsed=elapsed)
 
             metrics = link_metrics(stats.snapshot()[0], nics)
             try:
@@ -4887,9 +4936,28 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     run_ping_st = loss_grade(total_loss)[0] if sent >= GRADE_MIN_PINGS else None
     warming = run_loss_st is None and run_ping_st is None
 
+    # "Lacze w jedna strone": slychac druga strone, ale zadna nasza wiadomosc
+    # do niej nie dociera. Sam martwy ping tego nie mowi - wyglada identycznie
+    # jak "wszystko padlo" - a to zupelnie inna usterka: radio W DOL jest
+    # sprawne, nie dziala kierunek W GORE (jego odbior, jego antena albo nasze
+    # nadawanie). Bez tego ekran pokazywal ZLE i kazal szukac problemu
+    # w sygnale, ktory akurat byl w porzadku.
+    #
+    # "recv == 0 od poczatku testu", a nie z ostatniej proby: chodzi o "ani
+    # jedna odpowiedz nie wrocila", a nie o chwilowy zanik w locie.
+    heard = bool(ants) or rx_pps_total > 0
+    # ten sam licznik, ktory nizej pokazuje sekcja "Nadawanie (TX)" - zeby
+    # diagnoza nie mowila czegos innego niz liczba widoczna na ekranie;
+    # liczniki jadra jako zapasowe zrodlo, gdy API akurat nie odpowiada
+    injected = sum(rx_packets(m, "injected")[0] for m in tx_msgs.values())
+    we_tx = injected > 0 or any(tx > 0 for _rx, tx in traffic.values())
+    one_way = heard and sent >= GRADE_MIN_PINGS and recv == 0
+
     overall = worst_status([s for s in (rssi_st, run_loss_st, snr_st, run_ping_st) if s])
     if not ants and rx_pps_total <= 0 and not rtt:
         overall, overall_txt = "fail", "BRAK ODBIORU"
+    elif one_way:
+        overall, overall_txt = "fail", ("TYLKO W DOL" if we_tx else "NIE NADAJEMY")
     else:
         overall_txt = {"ok": "DOBRE", "warn": "SLABE", "fail": "ZLE"}.get(overall, "?")
         # Prog ten sam co dawne "doskonaly" (-50 dBm), tylko wyrazony w skali:
@@ -4924,6 +4992,24 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     if overall == "fail" and not ants and rx_pps_total <= 0:
         row("Nic nie przychodzi z drugiej strony. Sprawdz po obu stronach: ten sam kanal,", "fail")
         row("ten sam odcisk kluczy, wlaczona usluga i moc TX wieksza od zera.", "fail")
+        # Bez kamery jedynym ruchem sa odpowiedzi na nasz ping, wiec zerwany
+        # kierunek W GORE wyglada tu DOKLADNIE tak samo jak wylaczony dron:
+        # on nie dostaje pytania, wiec nie odpowiada i cisza jest po obu
+        # stronach. Rozroznia je dopiero ruch, ktory tamta strona nadaje sama.
+        row(f"Uwaga: bez kamery {PEER_NAME} nadaje tylko odpowiedzi na nasz ping, wiec")
+        row("zerwany kierunek W GORE wyglada tak samo jak wylaczona druga strona.")
+        row(f"Zeby je rozroznic, odpal na {PEER_NAME} test obciazeniowy - on nadaje")
+        row("sam z siebie, nie musi niczego odbierac.")
+
+    if one_way and we_tx:
+        row(f"Slychac {PEER_NAME}, ale nie wrocila ANI JEDNA nasza wiadomosc"
+            f" ({recv} z {sent} pingow).", "fail")
+        row("Lacze dziala TYLKO W DOL: to, co wysylamy stad, do niego nie dociera.", "fail")
+        row(f"Sprawdz na {PEER_NAME}: czy odbior jest wlaczony (usluga wfb-ng), antene RX,")
+        row("ten sam kanal i ten sam odcisk kluczy. U nas: moc TX > 0 i adres tunelu.")
+    elif one_way:
+        row(f"Slychac {PEER_NAME}, ale nasze karty nie wstrzykuja ani jednej ramki -", "fail")
+        row("to TA strona nie nadaje. Sprawdz usluge wfb-ng i moc TX.", "fail")
 
     if api_error:
         section("Statystyki wfb-ng")
@@ -5063,6 +5149,11 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     if rtt:
         st = "ok" if rtt[1] < 50 else ("warn" if rtt[1] < 150 else "fail")
         row(f"RTT min/sr/max {rtt[0]:.1f}/{rtt[1]:.1f}/{rtt[2]:.1f} ms   {meter(rtt[1], 200, 0)}", st)
+    elif heard:
+        # Skoro slychac go na radiu, to na pewno NIE jest wylaczony - zostaje
+        # jego odbior albo tunel po jego stronie.
+        row(f"brak odpowiedzi, a {PEER_NAME} slychac na radiu - wiec on nas nie", "fail")
+        row("odbiera albo nie ma po tamtej stronie tunelu", "fail")
     else:
         row("brak odpowiedzi - tunel nie stoi albo druga strona jest wylaczona", "fail")
     if last_loss is not None:
@@ -5097,8 +5188,11 @@ def test_state_line(state, key="t"):
     name = Path(state["plik"]).name
     size = f"{human_size(state['bajtow'])} / {human_size(TEST_MAX_BYTES)}"
     if state["stan"] == "trwa":
+        marks = state.get("znacznikow") or 0
         return (f"TEST TRWA W TLE  {fmt_mmss(state['czas'])}   {name}   "
-                f"{state['probek']} probek   {size}   ({key} = zakoncz)")
+                f"{state['probek']} probek   {size}"
+                + (f"   znacznikow: {marks}" if marks else "")
+                + f"   (m = znacznik, {key} = zakoncz)")
     powod = state.get("powod") or "koniec"
     return f"ZAPIS TESTU ZAKONCZONY ({powod})   {name}   {size}   ({key} = szczegoly)"
 
@@ -5117,6 +5211,9 @@ def test_result_popup(stdscr, state):
              f"Probek:   {state['probek']}   ({LOG_SAMPLE_HZ} na sekunde)",
              f"Rozmiar:  {human_size(state['bajtow'])}",
              f"Czas:     {fmt_mmss(state['czas'])}"]
+    if state.get("znacznikow"):
+        lines.append(f"Znaczniki: {state['znacznikow']}"
+                     "   (na wykresie czerwone kreski)")
     if state.get("powod"):
         lines += ["", f"Powod zakonczenia: {state['powod']}"]
     lines += ["",
@@ -5193,7 +5290,8 @@ def link_test_screen(stdscr):
                f"   czas {fmt_mmss(state['czas'])}",
                "",
                "Ten ekran tylko go podglada - zapis leci wlasnym tempem.",
-               "Konczy go klawisz 't' - tutaj albo w menu glownym."],
+               "Konczy go klawisz 't' - tutaj albo w menu glownym.",
+               "Klawisz 'm' stawia w logu znacznik."],
               status="ok")
     else:
         if state:
@@ -5211,7 +5309,10 @@ def link_test_screen(stdscr):
                   "",
                   "Zapis idzie osobnym procesem: trwa po wyjsciu z tego ekranu",
                   "i po zamknieciu programu. Konczy go klawisz 't' (tutaj albo",
-                  f"w menu glownym); sam staje na {human_size(TEST_MAX_BYTES)}."],
+                  f"w menu glownym); sam staje na {human_size(TEST_MAX_BYTES)}.",
+                  "",
+                  "W trakcie: klawisz 'm' zostawia w logu znacznik -",
+                  "w podgladzie wykresu widac go jako czerwona pionowa kreske."],
                  buttons=("Tak", "Nie")) == 0:
             error = start_test_recorder(path)
             if error:
@@ -5235,6 +5336,9 @@ def link_test_screen(stdscr):
     next_state = started + 0.5
     elapsed = 0.0
     top = 0
+    # Potwierdzenie znacznika w dolnej linii - znika samo po paru sekundach,
+    # zeby nie zajmowac na stale miejsca podpowiedziom o klawiszach.
+    flash = None  # (tekst, do kiedy, status)
 
     try:
         while True:
@@ -5284,11 +5388,16 @@ def link_test_screen(stdscr):
 
             hint = "q = powrot, z = zeruj liczniki testu"
             if state and state["stan"] == "trwa":
-                hint += ", t = zakoncz zapis"
+                hint += ", m = znacznik, t = zakoncz zapis"
             if len(lines) > view:
                 hint = (f"strzalki = przewijanie ({top + 1}-{min(top + view, len(lines))}"
                         f"/{len(lines)}), " + hint)
-            safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+            if flash and now < flash[1]:
+                safe_addstr(stdscr, h - 1, 2, flash[0],
+                            color_for(flash[2]) | curses.A_BOLD)
+            else:
+                flash = None
+                safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -5308,6 +5417,22 @@ def link_test_screen(stdscr):
                 run.reset()
                 started = now
                 note_test_recorder("wyzerowano liczniki testu")
+            elif key in (ord("m"), ord("M")):
+                # TYLKO 'm' - spacja odpada celowo: to najlatwiejszy klawisz do
+                # przypadkowego trafienia, a falszywy znacznik w logu jest
+                # gorszy niz jego brak (szukalo by sie potem zdarzenia, ktorego
+                # nie bylo). Numer nadaje proces zapisu, wiec tu tylko
+                # potwierdzamy godzine; licznik w gornej linii dojdzie przy
+                # najblizszym odczycie stanu (ponizej pol sekundy).
+                if state and state["stan"] == "trwa":
+                    mark_test_recorder()
+                    flash = (f"ZNACZNIK zapisany o {time.strftime('%H:%M:%S')}"
+                             " - w podgladzie bedzie czerwona kreska",
+                             now + 3.0, "ok")
+                    next_state = now  # licznik znacznikow ma sie odswiezyc od razu
+                else:
+                    flash = ("Zapis nie trwa - znacznik nie ma gdzie trafic",
+                             now + 3.0, "warn")
             elif key in (ord("t"), ord("T")):
                 stdscr.timeout(-1)  # okienko czeka na klawisz, nie na timeout
                 state = background_test_popup(stdscr)
@@ -6294,6 +6419,7 @@ def main_menu(stdscr):
         "Wyjdz",
     ]
     idx = 0
+    flash = None  # (tekst, do kiedy) - potwierdzenie postawionego znacznika
 
     while True:
         # erase(), a nie clear(): przy zapisie w tle menu odrysowuje sie samo co
@@ -6321,7 +6447,16 @@ def main_menu(stdscr):
         hint = "Strzalki gora/dol, Enter = wybierz, r = odswiez, q = wyjscie"
         if state:
             hint += ", t = zapis w tle"
-        safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+        if state and state["stan"] == "trwa":
+            hint += ", m = znacznik"
+        # To samo potwierdzenie co na ekranie testu: bez niego po nacisnieciu
+        # 'm' przez sekunde nie wiadomo, czy znacznik gdzies poszedl - licznik
+        # w linijce o zapisie dochodzi dopiero przy nastepnym odswiezeniu.
+        if flash and time.monotonic() < flash[1]:
+            safe_addstr(stdscr, h - 1, 2, flash[0], color_for("ok") | curses.A_BOLD)
+        else:
+            flash = None
+            safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
         stdscr.refresh()
 
         # Przy zapisie w tle menu odswieza sie samo co sekunde, zeby licznik
@@ -6358,6 +6493,13 @@ def main_menu(stdscr):
                     break
         elif key in (ord("r"), ord("R")):
             _nic_status_cache["val"] = None  # wpiety wlasnie dongiel bez czekania
+        elif key in (ord("m"), ord("M")) and state and state["stan"] == "trwa":
+            # Ten sam klawisz co na ekranie testu: zapis leci w tle, wiec
+            # znacznik musi dac sie postawic takze stad, bez wchodzenia w test.
+            mark_test_recorder()
+            flash = (f"ZNACZNIK zapisany o {time.strftime('%H:%M:%S')}"
+                     " - w podgladzie bedzie czerwona kreska",
+                     time.monotonic() + 3.0)
         elif key in (ord("t"), ord("T")):
             stdscr.timeout(-1)  # okienko ma czekac na klawisz, nie na timeout
             background_test_popup(stdscr)

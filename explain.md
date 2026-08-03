@@ -724,7 +724,29 @@ mieszały się przy zwykłym `ls`):
 | `start_test_recorder(path)` | odpala zapis w **nowej sesji** (`setsid`), inaczej zginąłby razem z terminalem |
 | `stop_test_recorder(timeout)` | grzeczne zatrzymanie sygnałem — proces sam dopisuje podsumowanie |
 | `note_test_recorder(text)` | dopisuje uwagę do kolejki (TUI nie ma logu otwartego) |
+| `mark_test_recorder()` | znacznik z klawisza `m` — wysyła samo słowo `MARK_TEXT`, numer nadaje proces zapisu |
 | `take_test_notes()` | zabiera kolejkę i kasuje plik |
+
+### Znaczniki (klawisz `m`)
+
+Jeden klawisz w trakcie testu zostawia w logu linię `# 12:34:56  ZNACZNIK 3`,
+a w podglądzie **czerwoną pionową kreskę przez wszystkie wykresy**. Po locie
+nikt nie pamięta, w której minucie obrócił antenę albo dron schował się za
+budynkiem — a bez tego nie da się zestawić załamania sygnału z tym, co się
+wtedy działo.
+
+- działa na **ekranie testu** i w **menu głównym** (`m` / `M`), bo zapis leci
+  w tle i nie trzeba wchodzić w test. **Tylko `m`** — spacja jest celowo
+  niepodpięta, bo to najłatwiejszy klawisz do przypadkowego trafienia,
+  a fałszywy znacznik jest gorszy niż jego brak: szukałoby się potem
+  zdarzenia, którego nie było,
+- **numer nadaje proces zapisu**, a nie TUI: ekran może się zamknąć i otworzyć
+  w środku zapisu, a numeracja i tak idzie po kolei i nie ma dwóch trójek,
+- licznik wraca do TUI w pliku stanu (`znacznikow=`) i widać go w linijce
+  „TEST TRWA W TLE"; po naciśnięciu klawisza proces zapisuje stan **od razu**,
+  żeby potwierdzenie nie czekało sekundy,
+- na końcu pliku wszystkie znaczniki są wypisane razem (`# znacznik 1: ...`) —
+  widać je bez otwierania podglądu.
 
 ### `Stat`
 
@@ -760,9 +782,9 @@ Plik rozdzielony średnikami, więc otwiera się i w notatniku, i w arkuszu.
 |---|---|
 | `open()` | tworzy plik i pisze nagłówek. Może rzucić `OSError` — wołający pokazuje to w okienku, a test idzie dalej bez zapisu |
 | `_header()` | rola, czas startu, host, jądro, wersja wfb-ng, kanał, region, moc, klucze i odcisk, karty, parametry nadawania, **naprawa pakietów w tunelu (FEC)**, druga strona, tempo próbkowania, limit rozmiaru |
-| `note(text)` | komentarz w środku pliku — widać, że w tym miejscu coś się zmieniło |
+| `note(text)` | komentarz w środku pliku — widać, że w tym miejscu coś się zmieniło. Samo `MARK_TEXT` to znacznik z klawisza: **numer dopisuje ta metoda** i zapamiętuje go w `marks` |
 | `sample(elapsed, metrics, ping)` | jeden wiersz danych + dorzucenie do `Stat`-ów i `RunTotals` |
-| `close(reason, elapsed)` | podsumowanie: czas, próbki, rozmiar, statystyki RSSI / strat przed / strat po / pingu, PER, **ile pakietów uratowała naprawa**, błędne ramki, restarty usługi, rozkład MCS |
+| `close(reason, elapsed)` | podsumowanie: czas, próbki, rozmiar, **lista znaczników**, statystyki RSSI / strat przed / strat po / pingu, PER, **ile pakietów uratowała naprawa**, błędne ramki, restarty usługi, rozkład MCS |
 
 **Kolumny logu** (`COLUMNS`):
 
@@ -827,6 +849,34 @@ Sekcje: ocena zbiorcza → sygnał odbierany → odbiór (RX) z wierszem
 wierszem **„uratowane przez naprawę: N pakietów"** → nadawanie (TX) → karty →
 ping → tunel.
 
+#### Diagnoza kierunku łącza
+
+Wszystko, co ekran wie o sygnale, opisuje **jeden kierunek — ten, który tu
+przyszedł**. Ping jako jedyny chodzi tam i z powrotem, więc martwy ping przy
+dobrym sygnale znaczy coś zupełnie innego niż „słaby link":
+
+| Warunek | Nagłówek | Co to znaczy |
+|---|---|---|
+| nic nie słychać i ping martwy | `BRAK ODBIORU` | druga strona nie nadaje **albo** nas nie słyszy i dlatego nie odpowiada — z tej strony **nie da się tego rozróżnić** |
+| słychać drugą stronę, nadajemy, **ani jeden** ping nie wrócił | `TYLKO W DOL` | radio w dół sprawne, zerwany kierunek w górę: on nas nie odbiera albo nie ma po tamtej stronie tunelu |
+| słychać drugą stronę, ale nasze karty nie wstrzykują ramek | `NIE NADAJEMY` | usterka po **tej** stronie — usługa wfb-ng albo moc TX = 0 |
+
+- `heard` = są anteny **albo** `rx_pps > 0`; `we_tx` = licznik `injected` z API
+  (ten sam, który pokazuje sekcja TX) **albo** licznik jądra karty,
+- warunek to `recv == 0` **od początku testu**, a nie z ostatniej próby —
+  chodzi o „ani jedna odpowiedź nie wróciła", a nie o chwilowy zanik w locie.
+  Do tego `sent >= GRADE_MIN_PINGS` (15 pakietów, ~7 s), żeby werdykt nie
+  padał na rozgrzewce,
+- **Pułapka `BRAK ODBIORU`:** bez kamery jedynym ruchem są odpowiedzi na nasz
+  ping (`LoadSender` opisuje to wprost: „bez kamery leci tylko ping"). Zerwany
+  kierunek w górę wygląda wtedy identycznie jak wyłączona druga strona — ona
+  nie dostaje pytania, więc nie odpowiada. Rozróżnia je dopiero ruch, który
+  tamta strona nadaje **sama z siebie**: test obciążeniowy albo kamera. Ekran
+  o tym mówi wprost w komunikacie,
+- ta sama diagnoza trafia do **podsumowania logu**: gdy przez cały zapis nie
+  wrócił ani jeden ping, a sygnał był odbierany, `TestRecorder.close()` dopisuje
+  linię `# UWAGA: … łącze działało tylko W DÓŁ`.
+
 ---
 
 ## 24. Ekrany TUI
@@ -841,7 +891,7 @@ ping → tunel.
 | `keys_screen(stdscr)` | klucze i parowanie: stan, odcisk, wpisanie kodu, wygenerowanie własnych |
 | `show_pairing_code_screen(stdscr, code)` | kod w ramce do przepisania |
 | `radio_settings_screen(stdscr)` | region i moc nadawania (kanału **tu się nie ustawia**) |
-| `link_test_screen(stdscr)` | żywy test łącza + start/stop zapisu w tle, `z` zeruje liczniki |
+| `link_test_screen(stdscr)` | żywy test łącza + start/stop zapisu w tle, `z` zeruje liczniki, **`m` stawia znacznik w logu** |
 | `channel_screen(stdscr)` | wybór kanału z podpowiedzią, który wolny |
 | `channel_rows(...)` | wiersze listy kanałów: numer, MHz, pasmo, legalność, zajętość ze skanu |
 | `channel_scan_screen(stdscr, nic, previous)` | skan pasma z podglądem na żywo; kanał i usługa **wracają na swoje** po wyjściu |
@@ -886,6 +936,8 @@ Rysuje log testu na wykresach na wspólnej osi czasu.
 | Stała | Znaczenie |
 |---|---|
 | `SERIES_COLORS` | 6 kolorów: niebieski, pomarańczowy, zielony, fioletowy, morski, czerwony |
+| `MARK_COLOR`, `MARK_RE` | kolor i wzorzec znacznika z klawisza `m` (`ZNACZNIK n` w komentarzu logu) — numer jest opcjonalny, bo w starszym logu albo w ręcznie dopisanej uwadze może go nie być |
+| `GAP_SECONDS`, `LOST_BAND` | dziura w danych: próbki lecą 4 razy na sekundę, więc przerwa **dłuższa niż 3 s** znaczy, że wartości nie było. Krzywa jest wtedy **przerywana**, a odcinek dostaje czerwone tło |
 | `RSSI_BANDS`, `LOSS_BANDS` | tła paneli — **te same progi co w ocenie w `gs.py`** |
 | `PAD_L/R/T/B`, `PANEL_GAP`, `PANEL_MIN_H` | geometria; tytuł i legenda idą **nad** ramkę, bo w środku zasłaniałyby wykres |
 
@@ -903,12 +955,13 @@ Rysuje log testu na wykresach na wspólnej osi czasu.
 
 | Metoda | Co robi |
 |---|---|
-| `_parse()` | rozkłada plik na nagłówek, próbki, zdarzenia i podsumowanie. Komentarz **przed** kolumnami to nagłówek, **między próbkami** to zdarzenie, **po `---`** to podsumowanie |
+| `_parse()` | rozkłada plik na nagłówek, próbki, zdarzenia i podsumowanie. Komentarz **przed** kolumnami to nagłówek, **między próbkami** to zdarzenie, **po `---`** to podsumowanie. Zdarzenie pasujące do `MARK_RE` trafia dodatkowo do `marks` — to znaczniki z klawisza `m` |
 | `_parse_antennas(text)` | `"gs_wfb:ant0=-61"` → `{"gs_wfb ant0": -61.0}` |
 | `span()` / `duration()` | zakres i długość testu |
 | `series(column)` | `[(sekunda od startu, wartość)]` z pominięciem pustych |
 | `antenna_series(name)` | to samo dla jednej anteny |
 | `has(column)` | czy kolumna ma choć jedną wartość — **tym wykrywane są stare logi** bez nowych kolumn |
+| **`gaps(column)`** | odcinki `[(od, do)]`, w których kolumna **nie miała żadnej wartości**, choć próbki leciały dalej. Pusta kolumna to nie to samo co zero — gdy ping przestaje wracać, w logu zostaje pusto, a to główny objaw **zerwanego kierunku w górę** przy sprawnym odbiorze |
 | `stat(column)` | `(min, średnia, max)` |
 | **`integral(column)`** | **ile tego było ŁĄCZNIE** z kolumny podanej „na sekundę" — np. ile pakietów w sumie naprawił FEC. Liczy po odstępach między próbkami, a nie przez pomnożenie przez ich liczbę (zapis potrafi chodzić w innym tempie, niż deklaruje nagłówek). Przerwy >5 s są pomijane — po przerwie ostatnia znana wartość nie opisuje tego, co działo się w międzyczasie |
 
@@ -932,8 +985,10 @@ jeden na drugim.
 | `_build_panels()` | **buduje listę paneli** — patrz niżej |
 | `redraw()` | układa panele jeden pod drugim wg wag; przy małym oknie płótno robi się wyższe niż widok i wchodzi suwak |
 | `x_at(t)` | czas → piksel |
-| `_draw_panel(panel, last)` | tło, pasma, siatka, znaczniki zdarzeń, krzywe, tytuł, legenda |
-| `_line_coords(panel, points)` | współrzędne łamanej; `step=True` rysuje schodki (MCS) |
+| `_draw_panel(panel, last, marks)` | tło, pasma, siatka, zdarzenia (szare kreskowane), **znaczniki (czerwone ciągłe)**, krzywe, tytuł, legenda. `marks=True` dostaje tylko jeden panel — ten, na którym rysują się numery |
+| `_draw_mark_label(x, y, num)` | numer znacznika w chorągiewce; przy prawej krawędzi idzie w lewo, żeby nie wyjechać poza ramkę |
+| `scroll_vertical(steps)` / `yview(*args)` | przewijanie paneli w pionie (Ctrl+kółko i suwak) — **z przerysowaniem**, bo chorągiewki z numerami siedzą na górnej krawędzi widoku |
+| `_line_coords(panel, points)` | współrzędne łamanej **pocięte na kawałki** na dziurach w danych (zwraca listę odcinków); `step=True` rysuje schodki (MCS). Bez cięcia brakujące wartości zostałyby połączone prostą i wykres pokazywałby ciągły pomiar tam, gdzie nie było żadnego |
 | `_on_motion(event)` | pionowy krzyżyk, kropki na krzywych i ramka z odczytem |
 | `_readout_lines(picks)` | treść odczytu: przy jednym pliku wszystko po kolei, przy porównaniu jedna gęsta linia na plik (inaczej ramka zasłania pół wykresu) |
 | `_draw_readout(picks, sx, sy)` | rysuje ramkę po tej stronie kursora, po której się mieści |
@@ -961,6 +1016,41 @@ innego**: przy jednym pliku oznacza wielkość, przy kilku — plik.
 
 **Kilka plików (porównanie):** „przed naprawą" dostaje **osobny panel**, żeby na
 każdym panelu została jedna krzywa na plik — dwie krzywe na plik by się zlały.
+
+### Jak wygląda zerwany kierunek w górę
+
+Gdy druga strona przestaje nas słyszeć (a my ją słyszymy dalej), **wszystkie
+panele lecą normalnie** — sygnał, SNR, modulacja, straty, przepływ. Zmienia się
+tylko jedno: kolumna `ping_ms` robi się pusta, bo nie ma odpowiedzi.
+
+Sama krzywa tego nie pokaże (urywa się i tyle), więc:
+
+- panel pingu dostaje na tym odcinku **czerwone tło**, a w tytule dopisek
+  „czerwone pole: brak odpowiedzi" (`Panel.zones`, wypełniane z `gaps("ping_ms")`),
+- krzywa jest **przerwana**, a nie przeciągnięta przez dziurę — inaczej wyglądałaby
+  jak ciągły pomiar,
+- panel boczny wypisuje przedziały co do sekundy w bloku **„Brak odpowiedzi na
+  ping (kierunek w górę)"**.
+
+Zestawienie „wszystko zielone oprócz pingu" to właśnie podpis zerwanego uplinku.
+Gdyby padło radio, razem z pingiem zniknęłyby też RSSI i przepływ.
+
+### Znaczniki na wykresie
+
+Znacznik postawiony w trakcie testu klawiszem `m` to **czerwona pionowa linia
+przez wszystkie panele naraz** — chodzi o to, żeby jednym spojrzeniem zestawić
+„tu coś zrobiłem" z załamaniem sygnału, strat i pingu jednocześnie. Numer
+w chorągiewce jest tylko na jednym panelu (na każdym byłby szumem) — na
+**najwyższym widocznym**, bo przy małym oknie płótno jest wyższe niż widok
+i pierwszy panel potrafi być przewinięty nad ekran. Dlatego przewijanie
+w pionie idzie przez `scroll_vertical()` / `yview()`, które **przerysowują**
+wykres; samo `canvas.yview_scroll` zostawiłoby numery przy panelu, który
+właśnie wyjechał. Czasy znaczników są też w panelu bocznym w bloku
+**„Znaczniki (czerwone kreski)"** i w podsumowaniu z pliku.
+
+Zwykłe komentarze z logu (np. wyzerowanie liczników) zostają **szarą kreskowaną**
+linią w bloku „Zdarzenia w trakcie" — jedno i drugie tylko przy **jednym** pliku,
+bo przy porównaniu kreski z kilku testów zlałyby się w płot.
 
 ### `App` — okno
 

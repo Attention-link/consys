@@ -13,6 +13,11 @@ to pakiety, ktore zgubilo radio, a wfb-ng odtworzyl z nadmiarowosci - osobny
 panel pokazuje ich tempo, a panel obok laczna liczbe. Bez tej pary z samego
 wykresu strat nie widac, czy link jest czysty, czy tylko dobrze latany.
 
+Znaczniki postawione w trakcie testu klawiszem 'm' (gs.py / drone.py) sa na
+wykresie CZERWONYMI pionowymi liniami z numerem - po to, zeby nie trzeba bylo
+pamietac, w ktorej minucie obrocilo sie antene albo dron schowal sie za
+budynkiem. Reszta komentarzy z logu to szare linie kreskowane.
+
 Os czasu przybliza sie kolkiem myszy (wokol kursora), przesuwa przeciaganiem
 albo Shift+kolko, a podwojny klik / Home wraca do calego testu. Ctrl+kolko
 przewija panele w pionie. Bez tego przy dluzszym locie jedna sekunda zajmuje
@@ -41,11 +46,24 @@ AXIS = "#9aa0a6"
 TEXT = "#202124"
 MUTED = "#5f6368"
 SERIES_COLORS = ("#1a73e8", "#e8710a", "#12a150", "#a142f4", "#00838f", "#c5221f")
+MARK_COLOR = "#d93025"   # znacznik z klawisza - ma sie rzucac w oczy
+
+# Znacznik postawiony w trakcie testu klawiszem 'm'. Proces zapisu numeruje je
+# po kolei ("# 12:34:56  ZNACZNIK 3"), ale numer moze go nie miec (starszy log
+# albo uwaga wpisana recznie) - wtedy nadajemy wlasny, po kolejnosci w pliku.
+MARK_RE = re.compile(r"\bznacznik\b\s*(\d+)?", re.I)
 
 # Progi te same, co w ocenie na ekranie testu w gs.py/drone.py - zeby ten sam
 # sygnal nie byl tu "zielony", a tam "slaby".
 RSSI_BANDS = ((-65, 0, "#eaf6ec"), (-75, -65, "#fff6e0"), (-200, -75, "#fdeceb"))
 LOSS_BANDS = ((0, 0.5, "#eaf6ec"), (0.5, 3, "#fff6e0"), (3, 1000, "#fdeceb"))
+
+# Dziura w danych. Probki leca 4 razy na sekunde, wiec przerwa dluzsza niz to
+# znaczy, ze wartosci po prostu NIE BYLO - nie wolno przez nia przeciagnac
+# krzywej, bo wykres pokazywalby ciagly pomiar tam, gdzie nie bylo zadnego.
+# Najwazniejszy przypadek: ping, ktory przestal wracac.
+GAP_SECONDS = 3.0
+LOST_BAND = "#fdeceb"  # tlo odcinka, na ktorym kolumna milczala
 
 # Tytul i legenda kazdego panelu ida NAD jego ramke - w srodku zaslanialyby
 # wykres, a przy niskich panelach (modulacja) linia potrafi isc gora.
@@ -79,6 +97,7 @@ class TestLog:
         self.header = []
         self.summary = []
         self.events = []     # (sekunda, tekst)
+        self.marks = []      # (sekunda, numer) - podzbior events z klawisza 'm'
         self.columns = []
         self.samples = []
         self.antennas = []   # nazwy w kolejnosci pojawienia sie
@@ -109,6 +128,10 @@ class TestLog:
                     elif self.columns:
                         # komentarz miedzy probkami = cos sie w trakcie stalo
                         self.events.append((last_sec, text))
+                        found = MARK_RE.search(text)
+                        if found:
+                            self.marks.append(
+                                (last_sec, found.group(1) or str(len(self.marks) + 1)))
                     else:
                         self.header.append(text)
                     continue
@@ -161,6 +184,29 @@ class TestLog:
 
     def has(self, column):
         return any(s.get(column) is not None for s in self.samples)
+
+    def gaps(self, column, shortest=GAP_SECONDS):
+        """Odcinki [(od, do)], w ktorych kolumna nie miala ZADNEJ wartosci,
+        chociaz probki leciaty dalej.
+
+        Po to jest osobno: pusta kolumna to nie to samo, co zero. Gdy ping
+        przestaje wracac (druga strona nas nie slyszy), w logu zostaje pusto -
+        z samej krzywej widac tylko, ze sie urwala, a to jest glowny objaw
+        zerwanego kierunku W GORE przy sprawnym odbiorze."""
+        out = []
+        start = last = None
+        for s in self.samples:
+            t = s["sek"] - self.t0
+            if s.get(column) is None:
+                start = t if start is None else start
+                last = t
+            elif start is not None:
+                if last - start >= shortest:
+                    out.append((start, t))  # do najblizszej probki z wartoscia
+                start = None
+        if start is not None and last - start >= shortest:
+            out.append((start, last))
+        return out
 
     def stat(self, column):
         """(min, srednia, max) albo None - do panelu z podsumowaniem."""
@@ -248,6 +294,7 @@ class Panel:
         self.series = series
         self.unit = unit
         self.bands = bands
+        self.zones = ()  # odcinki czasu do podswietlenia (brak danych)
         self.step = step
         self.y_fmt = y_fmt
         self.y_floor = y_floor  # np. straty i ping nie schodza ponizej zera
@@ -394,6 +441,17 @@ class ChartArea:
             if log.has("per_%"):
                 loss_panel.series.append(("PER od poczatku", SERIES_COLORS[3],
                                           log.series("per_%")))
+
+        # Ping, ktory nie wraca, to pusta kolumna - krzywa po prostu sie urywa
+        # i przy pobieznym spojrzeniu wyglada jak koniec danych. A to jedyny
+        # objaw zerwanego kierunku W GORE: w dol leci wszystko (sygnal, straty,
+        # przeplyw sa dalej), tylko nasze pakiety nie docieraja do drugiej
+        # strony. Dlatego te odcinki dostaja czerwone tlo i wlasny podpis.
+        ping_panel = next((p for p in panels if p.key == "ping"), None)
+        if ping_panel and not multi:
+            ping_panel.zones = self.logs[0].gaps("ping_ms")
+            if ping_panel.zones:
+                ping_panel.title += " - czerwone pole: brak odpowiedzi"
         return panels
 
     # --- zoom i przesuwanie osi czasu ---
@@ -428,12 +486,25 @@ class ChartArea:
             self.view = None
             self.redraw()
 
+    def scroll_vertical(self, steps):
+        """Przewijanie paneli w pionie (Ctrl+kolko albo suwak). Po przesunieciu
+        widoku przerysowujemy, bo choragiewki z numerami znacznikow siedza na
+        gornej krawedzi WIDOKU - bez tego zostalyby przy panelu, ktory wlasnie
+        wyjechal nad ekran."""
+        self.canvas.yview_scroll(steps, "units")
+        self.redraw()
+
+    def yview(self, *args):
+        """Suwak z boku plotna - to samo co wyzej, tylko sterowane myszka."""
+        self.canvas.yview(*args)
+        self.redraw()
+
     def _on_wheel(self, event):
         steps = 1 if getattr(event, "num", 0) == 4 else (
             -1 if getattr(event, "num", 0) == 5 else
             (1 if event.delta > 0 else -1))
         if event.state & 0x0004:  # Ctrl - przewijanie paneli w pionie
-            self.canvas.yview_scroll(-steps, "units")
+            self.scroll_vertical(-steps)
         elif event.state & 0x0001:  # Shift - jazda po osi czasu
             self.pan_by(-steps * (self.t1 - self.t0) * 0.15)
         else:
@@ -510,12 +581,22 @@ class ChartArea:
         self.top, self.bottom = PAD_T, total - PAD_B
 
         y = PAD_T
-        for i, panel in enumerate(self.panels):
+        for panel in self.panels:
             h = usable * panel.weight / weights
             panel.box = (self.x0, y, self.x1, y + h)
             panel.compute_range()
-            self._draw_panel(panel, last=(i == len(self.panels) - 1))
             y += h + PANEL_GAP
+
+        # Numery znacznikow ida na najwyzszy WIDOCZNY panel, a nie zawsze na
+        # pierwszy: przy malym oknie plotno jest wyzsze niz widok i pierwszy
+        # panel potrafi byc przewiniety nad ekran - razem z choragiewkami,
+        # a wtedy przy kilku kreskach nie wiadomo, ktora jest ktora.
+        top_visible = self.canvas.canvasy(0)
+        labelled = next((p for p in self.panels if p.box[3] > top_visible + 20),
+                        self.panels[0])
+        for i, panel in enumerate(self.panels):
+            self._draw_panel(panel, marks=(panel is labelled),
+                             last=(i == len(self.panels) - 1))
 
         if self.on_view_change:
             self.on_view_change()
@@ -523,11 +604,19 @@ class ChartArea:
     def x_at(self, t):
         return self.x0 + (t - self.t0) / (self.t1 - self.t0) * (self.x1 - self.x0)
 
-    def _draw_panel(self, panel, last):
+    def _draw_panel(self, panel, last, marks=False):
         c = self.canvas
         x0, y0, x1, y1 = panel.box
 
         c.create_rectangle(x0, y0, x1, y1, fill=PANEL_BG, outline="")
+        # najpierw odcinki bez danych, zeby siatka i krzywe zostaly na wierzchu
+        for z0, z1 in panel.zones:
+            if z1 < self.t0 or z0 > self.t1:
+                continue
+            a = self.x_at(max(z0, self.t0))
+            b = self.x_at(min(z1, self.t1))
+            if b > a:
+                c.create_rectangle(a, y0, b, y1, fill=LOST_BAND, outline="")
         for lo, hi, color in panel.bands:
             top = panel.y_at(min(hi, panel.hi))
             bottom = panel.y_at(max(lo, panel.lo))
@@ -557,18 +646,32 @@ class ChartArea:
         # Zdarzenia rysujemy tylko przy jednym pliku - przy porownaniu kreski
         # z kilku testow zlewaja sie w plot i nie wiadomo, czyja jest ktora.
         if len(self.logs) == 1:
-            for sec, _text in self.logs[0].events:
-                rel = sec - self.logs[0].t0
-                if not (self.t0 <= rel <= self.t1):
+            log = self.logs[0]
+            for sec, text in log.events:
+                rel = sec - log.t0
+                if not (self.t0 <= rel <= self.t1) or MARK_RE.search(text):
                     continue  # po zoomie kreska z poza widoku spadlaby obok panelu
                 x = self.x_at(rel)
                 c.create_line(x, y0, x, y1, fill="#b0b6c0", dash=(3, 3))
 
+            # Znaczniki z klawisza - czerwone, ciagle i przez wszystkie panele
+            # na raz: chodzi o to, zeby jednym spojrzeniem zestawic "tu cos
+            # zrobilem" z zalamaniem sygnalu, strat i pingu naraz.
+            for sec, num in log.marks:
+                rel = sec - log.t0
+                if not (self.t0 <= rel <= self.t1):
+                    continue
+                x = self.x_at(rel)
+                c.create_line(x, y0, x, y1, fill=MARK_COLOR, width=2)
+                if marks:
+                    # przy przewinietym plotnie choragiewka siada na gornej
+                    # krawedzi WIDOKU, a nie panelu - zeby zostala na ekranie
+                    self._draw_mark_label(x, max(y0, c.canvasy(0)), num)
+
         c.create_rectangle(x0, y0, x1, y1, outline=AXIS)
 
         for label, color, points in panel.series:
-            coords = self._line_coords(panel, points)
-            if len(coords) >= 4:
+            for coords in self._line_coords(panel, points):
                 c.create_line(*coords, fill=color, width=2, joinstyle="round",
                               capstyle="round")
 
@@ -592,6 +695,20 @@ class ChartArea:
             c.create_text((x0 + x1) / 2, y1 + 28, text="czas testu [min:s]",
                           fill=MUTED, font=("Segoe UI", 8))
 
+    def _draw_mark_label(self, x, y, num):
+        """Numer znacznika w choragiewce nad pierwszym panelem. Bez numeru przy
+        kilku kreskach nie wiadomo, ktora jest ktora - a w podsumowaniu pliku
+        i w panelu obok znaczniki wypisane sa wlasnie po numerach."""
+        text = str(num)
+        width = 10 + 6 * len(text)
+        # przy prawej krawedzi wykresu choragiewka idzie w lewo, zeby nie
+        # wyjechala poza ramke panelu
+        left = x if x + width <= self.x1 else x - width
+        self.canvas.create_rectangle(left, y + 2, left + width, y + 17,
+                                     fill=MARK_COLOR, outline="")
+        self.canvas.create_text(left + width / 2, y + 10, text=text, fill="#ffffff",
+                                font=("Segoe UI", 8, "bold"))
+
     def _visible_points(self, points, step=False):
         """Obcina krzywa do widocznego zakresu czasu. Plotno Tk nie przycina
         rysowania samo, wiec po zoomie linia wyszlaby poza ramke panelu na
@@ -601,7 +718,9 @@ class ChartArea:
         out = []
         prev = None
         for point in points:
-            if prev is not None:
+            # przez dziure w danych nie interpolujemy - punkt na krawedzi
+            # lezalby na linii, ktorej w ogole nie bylo
+            if prev is not None and point[0] - prev[0] <= GAP_SECONDS:
                 for edge in (self.t0, self.t1):
                     if (prev[0] < edge) != (point[0] < edge):
                         out.append(point_at_time(prev, point, edge, hold=step))
@@ -611,15 +730,23 @@ class ChartArea:
         return out
 
     def _line_coords(self, panel, points):
-        coords = []
-        prev_y = None
+        """Wspolrzedne lamanej, POCIETE na kawalki tam, gdzie w danych jest
+        dziura. Bez tego brakujace wartosci (ping, ktory przestal wracac,
+        albo zerwany odbior) zostalyby polaczone prosta i wykres pokazywalby
+        ciagly pomiar tam, gdzie nie bylo zadnego."""
+        runs, coords = [], []
+        prev_y = prev_t = None
         for t, value in self._visible_points(points, panel.step):
+            if prev_t is not None and t - prev_t > GAP_SECONDS:
+                runs.append(coords)
+                coords, prev_y = [], None
             x, y = self.x_at(t), panel.y_at(value)
             if panel.step and prev_y is not None:
                 coords.extend([x, prev_y])  # schodek: najpierw w bok, potem w gore
             coords.extend([x, y])
-            prev_y = y
-        return coords
+            prev_y, prev_t = y, t
+        runs.append(coords)
+        return [run for run in runs if len(run) >= 4]
 
     # --- krzyzyk z odczytem ---
 
@@ -829,7 +956,10 @@ class App(tk.Tk):
         chart_box.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.canvas = tk.Canvas(chart_box, bg=BG, highlightthickness=1,
                                 highlightbackground="#d8dbe2")
-        vbar = ttk.Scrollbar(chart_box, orient="vertical", command=self.canvas.yview)
+        # suwak idzie przez ChartArea, a nie prosto do plotna - po przewinieciu
+        # trzeba przerysowac, zeby numery znacznikow zostaly na ekranie
+        vbar = ttk.Scrollbar(chart_box, orient="vertical",
+                             command=lambda *args: self.chart.yview(*args))
         self.canvas.configure(yscrollcommand=vbar.set)
         vbar.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -919,8 +1049,10 @@ class App(tk.Tk):
         self.status.configure(
             text=f"Plikow: {len(logs)}   probek: {sum(len(l.samples) for l in logs)}"
                  f"   najdluzszy test: {fmt_time(max(l.duration() for l in logs))}"
-                 + ("" if many else f"   anteny: {', '.join(logs[0].antennas) or 'brak'}"
-                                    f"   |   {logs[0].path}"))
+                 + ("" if many else
+                    (f"   znacznikow: {len(logs[0].marks)}" if logs[0].marks else "")
+                    + f"   anteny: {', '.join(logs[0].antennas) or 'brak'}"
+                      f"   |   {logs[0].path}"))
 
     def _shorten_labels(self):
         """Nazwy logow roznia sie zwykle tylko koncowka z godzina - pelna nazwa
@@ -968,8 +1100,21 @@ class App(tk.Tk):
             block("Warunki testu", log.header)
             block("Policzone z probek", self._stat_lines(log))
             block("Podsumowanie z pliku", log.summary)
+            # Kiedy dokladnie nie wracal ping - z wykresu odczytuje sie to
+            # z dokladnoscia do kilku sekund, a tu jest co do probki. To jest
+            # odpowiedz na "o ktorej zerwalo mi kierunek w gore".
+            block("Brak odpowiedzi na ping (kierunek w gore)",
+                  [f"{fmt_time(a)} - {fmt_time(b)}   ({fmt_time(b - a)})"
+                   for a, b in log.gaps("ping_ms")])
+            # Znaczniki osobno od reszty komentarzy: po locie szuka sie
+            # wlasnie ich ("co bylo w 3:20?"), a nie zapisu o wyzerowaniu
+            # licznikow. Czasy sa te same, co czerwone kreski na wykresie.
+            block("Znaczniki (czerwone kreski)",
+                  [f"{fmt_time(sec - log.t0)}  znacznik {num}"
+                   for sec, num in log.marks])
             block("Zdarzenia w trakcie",
-                  [f"{fmt_time(sec - log.t0)}  {text}" for sec, text in log.events])
+                  [f"{fmt_time(sec - log.t0)}  {text}" for sec, text in log.events
+                   if not MARK_RE.search(text)])
 
         self.info.configure(state="disabled")
 
