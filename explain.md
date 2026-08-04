@@ -167,7 +167,7 @@ uratowane             =  przed − po                        ← zasługa FEC
 Dzięki temu nic nie trzeba kopiować między urządzeniami (`wfb_keygen` zrobiłby
 na każdym Pi inną parę i strony by się nie dogadały).
 
-> ⚠️ To **nie jest sekret** — kto ma skrypt, ten może podsłuchać transmisję.
+> **Uwaga:** To **nie jest sekret** — kto ma skrypt, ten może podsłuchać transmisję.
 > Menu ma opcję wygenerowania własnej pary albo sparowania kodem.
 
 ### Progi automatów
@@ -501,7 +501,7 @@ Wszystkie zwracają `(status, tekst)`, gdzie status to `"ok"` / `"warn"` /
 | `rank_channels(results)` | od najlepszego: najmniej zajęte pasmo, przy remisie niższy szum |
 | `auto_candidates(scan_results, current, ranges=None)` | kolejność prób dla trybu automatycznego — najpierw najcichsze ze skanu |
 
-> ⚠️ Przez **cały skan karta jest poza kanałem linku**, czyli nie ma połączenia.
+> **Uwaga:** Przez **cały skan karta jest poza kanałem linku**, czyli nie ma połączenia.
 
 ---
 
