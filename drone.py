@@ -14,8 +14,14 @@ ruch.
 
 Karty dostaja stale nazwy (NIC_NAMES: drone_RX, drone_TX) zamiast wlanX -
 przypiete regula udev do MAC-a karty, wiec ta sama karta ma zawsze te sama
-nazwe, niezaleznie od portu USB. To sa na razie tylko etykiety, a nie podzial
-rol: obie karty i odbieraja, i nadaja.
+nazwe, niezaleznie od portu USB. Nazwa niesie role (NIC_ROLES): drone_TX nadaje,
+drone_RX tylko slucha - rozdzial wymusza wpis wifi_txpower = 'off' w configu.
+Ktora fizyczna karta ma ktora role, ustawia sie w menu ("Przypisanie rol kart"),
+bo przy jednokierunkowym wzmacniaczu nadawac ma konkretna karta.
+
+Menu pokazuje tez, w ktorym gniezdzie USB siedzi kazda karta, a po wypieciu
+dongla mowi, KTORA karta zniknela i z ktorego gniazda - z ewidencji w
+/etc/wfb-cards.json, bo nieobecnej karty nie ma juz o co zapytac.
 
 Klucze szyfrujace sa wbudowane w oba skrypty (identyczne), wiec link wstaje
 od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
@@ -36,6 +42,7 @@ import base64
 import curses
 import hashlib
 import io
+import json
 import os
 import re
 import secrets
@@ -115,9 +122,20 @@ AUTOSTART_FLAG = "--autostart"
 # miedzy bootami) dajemy kartom stale, czytelne nazwy. Nazwa jest przypieta do
 # MAC-a karty, wiec jedzie razem z donglem takze po przelozeniu go do innego
 # portu USB - istotne, gdy do konkretnej karty przykrecony jest wzmacniacz.
-# UWAGA: wfb-ng nadal odbiera z obu kart i przez obie nadaje - sama nazwa
-# NIE dzieli rol, rozdzial trzeba wymusic w konfiguracji uslugi.
+# UWAGA: wfb-ng nadal odbiera z obu kart - sama nazwa NIE dzieli rol. Rozdzial
+# nadawania wymusza dopiero wpis wifi_txpower = 'off' w configu (RX_ONLY_NICS,
+# ensure_tx_split), a KTORA fizyczna karta nosi ktora nazwe ustawia sie w menu
+# ("Przypisanie rol kart", assign_nic_role).
 NIC_NAMES = ["drone_RX", "drone_TX"]
+
+# Rola przypisana do KAZDEJ nazwy: "tx" = nadaje, "rx" = tylko odbiera,
+# "txrx" = oba kierunki. Rola siedzi w nazwie, a nazwa jest przypieta udevem do
+# MAC-a karty - dzieki temu "przypisanie karty do roli" to po prostu nadanie jej
+# wlasciwej nazwy (assign_nic_role), a przypisanie przezywa reboot i przelozenie
+# dongla do innego portu USB. Na dronie do drone_TX idzie jednokierunkowy
+# wzmacniacz, wiec to musi byc konkretna karta, a nie ta, ktora akurat wstala
+# pierwsza; gs ma jedna karte robiaca oba kierunki (jedna pozycja "txrx").
+NIC_ROLES = {"drone_RX": "rx", "drone_TX": "tx"}
 
 # Nazwy kart DRUGIEJ roli - po nich poznajemy, ze skrypt odpalono na cudzym Pi
 # (patrz refuse_wrong_role). Nazwy sa przypiete do MAC-ow przez udev, wiec
@@ -143,6 +161,13 @@ VIDEO_SENDS = True  # dron nadaje obraz; gs odbiera
 RX_ONLY_NICS = ["drone_RX"]
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
+
+# Ewidencja kart: co, kiedy i w ktorym gniezdzie USB widzielismy ostatnio.
+# Bez niej wypieta karta znika bez sladu - system widzi tylko "jest 1 z 2" i nie
+# ma jak powiedziec, KTORA zniknela ani w jakim porcie siedziala, bo nieobecny
+# interfejs nie ma juz ani MAC-a, ani gniazda. Plik pozwala nazwac brakujaca
+# karte po imieniu i roli takze po reboocie z wypietym donglem.
+WFB_CARDS = Path("/etc/wfb-cards.json")
 
 # Staly komplet kluczy, ten sam w drone.py i gs.py - dzieki temu nic nie trzeba
 # przenosic miedzy urzadzeniami (wfb_keygen na kazdym Pi zrobilby INNA pare i
@@ -229,6 +254,59 @@ def nic_usb_slot(nic):
         return ""
 
 
+USB_DEVICES = Path("/sys/bus/usb/devices")
+
+
+def usb_port_path(nic):
+    """Sam port USB, bez koncowki interfejsu: '1-1.4:1.0' -> '1-1.4'. Tak
+    nazywa gniazdo cale sysfs, wiec dopiero pod ta postacia da sie doczytac
+    predkosc, producenta i drzewko hubow."""
+    return nic_usb_slot(nic).split(":")[0]
+
+
+def _usb_attr(port, name):
+    try:
+        return (USB_DEVICES / port / name).read_text().strip()
+    except OSError:
+        return ""
+
+
+def usb_speed_txt(speed):
+    """Surowe Mb/s z sysfs na nazwe generacji USB. Wazne przy 8812AU: dongiel
+    wpiety w port USB 2.0 raportuje 480 i przy pelnym strumieniu wideo potrafi
+    gubic pakiety - a po samym wygladzie gniazda tego nie widac."""
+    table = {"1.5": "USB 1.1", "12": "USB 1.1", "480": "USB 2.0",
+             "5000": "USB 3.0", "10000": "USB 3.1", "20000": "USB 3.2"}
+    if not speed:
+        return ""
+    return f"{table.get(speed, 'USB ?')}, {speed} Mb/s"
+
+
+def usb_port_txt(port, short=False):
+    """Gniazdo USB po ludzku: '1-1.4  (magistrala 1, gniazdo 1.4, USB 2.0)'.
+    Bez tego port jest tylko ciagiem cyfr - a przy dwoch identycznych donglach
+    to wlasnie numer gniazda mowi, ktory z nich trzymasz w rece."""
+    if not port:
+        return "gniazdo nieznane"
+    if short:
+        return port
+    bits = []
+    bus, _, chain = port.partition("-")
+    if chain:
+        bits.append(f"magistrala {bus}, gniazdo {chain}")
+    speed = usb_speed_txt(_usb_attr(port, "speed"))
+    if speed:
+        bits.append(speed)
+    product = _usb_attr(port, "product")
+    if product:
+        bits.append(product[:28])
+    return f"{port}" + (f"  ({', '.join(bits)})" if bits else "")
+
+
+def nic_usb_txt(nic, short=False):
+    return usb_port_txt(usb_port_path(nic), short)
+
+
 def nic_mac(nic):
     """MAC karty, malymi literami. To na nim wieszamy nazwy: MAC jedzie razem
     z dongla, wiec karta przelozona do innego portu zachowuje swoja nazwe -
@@ -310,6 +388,7 @@ def nic_status_summary(max_age=2.0):
     props = service_props()
     used = service_nics(set(nics)) if nics else set()
     dongles = len(usb_rtl_dongles())
+    remember_cards(nics)  # zeby bylo czym nazwac karte, gdy za chwile zniknie
 
     txt = (f"Karty: {len(nics)}/{EXPECTED_NICS}"
            f"{' [' + ' '.join(nics) + ']' if nics else ''}"
@@ -318,7 +397,14 @@ def nic_status_summary(max_age=2.0):
 
     if len(nics) < EXPECTED_NICS:
         status = "fail"
-        txt += "   <- BRAK KARTY" + (", dongiel wisi na innym sterowniku" if dongles > len(nics) else "")
+        # Sama liczba "1/2" nie mowi nic o tym, ktorej karty brakuje - a przy
+        # rozdziale rol to jest cala roznica miedzy "nie ma czym nadawac"
+        # a "leci bez dywersyfikacji". Nazwe bierzemy z ewidencji, bo po
+        # wypieciu nie ma juz kogo o nia zapytac.
+        gone = missing_cards_txt(nics)
+        txt += "   <- BRAK: " + (gone if gone else "KARTY")
+        if dongles > len(nics):
+            txt += ", dongiel wisi na innym sterowniku"
     elif not service_active(props):
         # Karty moga byc idealne, a i tak 0/2 - bo usluga w ogole nie wstala.
         # Radzenie "zrestartuj usluge" byloby wtedy myleniem tropu.
@@ -2825,6 +2911,50 @@ def release_nics_from_network_stack(nics):
 EMPTY_MACS = ("", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
 
+# ------------------------- role kart (TX / RX) -------------------------
+
+ROLE_LABELS = {
+    "tx": ("NADAJE", "nadaje (i odbiera)"),
+    "rx": ("TYLKO ODBIOR", "tylko odbior - nie nadaje"),
+    "txrx": ("TX+RX", "nadaje i odbiera"),
+}
+
+
+def role_of_name(name):
+    """Rola przypisana do nazwy karty. Pusta dla wlanX i wszystkiego, czego
+    nie rozdajemy sami - taka karta jeszcze nie ma przydzialu."""
+    return NIC_ROLES.get(name, "")
+
+
+def role_txt(role, short=False):
+    labels = ROLE_LABELS.get(role)
+    if not labels:
+        return "bez przydzialu"
+    return labels[0] if short else labels[1]
+
+
+def names_for_role(role):
+    return [n for n in NIC_NAMES if NIC_ROLES.get(n) == role]
+
+
+def role_tag(name, fallback=""):
+    """Etykieta roli doklejana po nazwie karty, np. "[NADAJE]". Pusta tam, gdzie
+    rol nie rozdzielamy (gs): jedna karta robi oba kierunki, wiec przydzial
+    niczego nie rozroznia i byl by tylko szumem. Jedno miejsce na te decyzje,
+    bo etykieta wychodzi w naglowku menu, na trzech ekranach i w weryfikacji."""
+    if not role_split_used():
+        return ""
+    role = role_of_name(name) or fallback
+    return f"[{role_txt(role, short=True)}]" if role else "[bez przydzialu]"
+
+
+def role_split_used():
+    """Czy na tej roli w ogole jest co rozdzielac. Gs ma jedna karte robiaca
+    oba kierunki, wiec caly ekran przypisania jest tam tylko informacyjny -
+    na dronie karty sa dwie i przydzial decyduje, ktora nadaje."""
+    return len(NIC_NAMES) > 1
+
+
 def parse_name_rules():
     """{kotwica: nazwa} z naszego pliku regul udev - czyli przypisania, ktore
     juz kiedys ustalilismy. Kotwica to ("mac", adres) albo ("slot", gniazdo);
@@ -2863,6 +2993,111 @@ def nic_anchors(nics):
             slot = nic_usb_slot(nic)
             out[nic] = ("slot", slot) if slot else None
     return out
+
+
+def anchor_key(anchor):
+    """Kotwica jako jeden ciag do klucza w pliku ewidencji: ('mac', 'aa:..')
+    -> 'mac:aa:..'. Ta sama kotwica co w regulach udev, wiec ewidencja i nazwy
+    mowia o tej samej karcie."""
+    return f"{anchor[0]}:{anchor[1]}" if anchor else ""
+
+
+def load_cards():
+    """Ewidencja kart z pliku: {kotwica: {name, role, usb, mac, seen}}.
+    Uszkodzony plik traktujemy jak pusty - to tylko pamiec pomocnicza i nie ma
+    powodu, zeby jej brak blokowal cokolwiek."""
+    try:
+        data = json.loads(WFB_CARDS.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_cards(cards):
+    try:
+        WFB_CARDS.write_text(json.dumps(cards, indent=1, sort_keys=True))
+        return True
+    except OSError:
+        return False  # bez roota (np. podglad z konta usera) - trudno, jedziemy dalej
+
+
+SEEN_REFRESH = 600  # co ile sekund odswiezamy sam znacznik czasu (patrz nizej)
+
+
+def remember_cards(nics=None):
+    """Dopisuje do ewidencji karty, ktore widac TERAZ, i zwraca cala ewidencje.
+    Wpisow nieobecnych kart nie kasujemy - to wlasnie one pozwalaja powiedziec
+    'brakuje drone_TX, ostatnio w gniezdzie 1-1.4', kiedy dongla juz nie ma
+    w systemie i nie da sie o nic zapytac sterownika.
+
+    Sam znacznik czasu odswiezamy najwyzej co SEEN_REFRESH sekund: funkcja jest
+    wolana przy kazdym odswiezeniu naglowka menu, a zapis do /etc co sekunde
+    mieliłby karte SD bez zadnego pozytku."""
+    nics = wfb_nics() if nics is None else nics
+    cards = load_cards()
+    anchors = nic_anchors(nics)
+    now = int(time.time())
+    changed = False
+    for nic in nics:
+        key = anchor_key(anchors.get(nic))
+        if not key:
+            continue  # karta bez czytelnego MAC-a i bez gniazda - nie ma czego zapamietac
+        old = cards.get(key, {})
+        entry = dict(old, name=nic, mac=nic_mac(nic), usb=usb_port_path(nic),
+                     role=role_of_name(nic))
+        stale = now - int(old.get("seen_ts") or 0) >= SEEN_REFRESH
+        if stale or any(entry.get(k) != old.get(k) for k in ("name", "mac", "usb", "role")):
+            entry.update(seen=time.strftime("%Y-%m-%d %H:%M:%S"), seen_ts=now)
+            cards[key] = entry
+            changed = True
+    if changed:
+        save_cards(cards)
+    return cards
+
+
+def forget_card(key):
+    cards = load_cards()
+    if cards.pop(key, None) is None:
+        return False
+    save_cards(cards)
+    return True
+
+
+def missing_cards(nics=None):
+    """Karty, ktore ewidencja zna, a ktorych teraz nie ma - czyli dokladnie te,
+    ktore ktos wypial (albo ktore nie wstaly po boocie). Zwraca liste wpisow
+    z kluczem, posortowana po nazwie."""
+    nics = wfb_nics() if nics is None else nics
+    present = set(nics)
+    out = []
+    for key, entry in load_cards().items():
+        if entry.get("name") not in present:
+            out.append(dict(entry, key=key))
+    return sorted(out, key=lambda e: e.get("name") or "")
+
+
+def card_txt(entry, with_seen=True):
+    """Jedna linijka o karcie z ewidencji: nazwa, rola, MAC i gniazdo USB.
+    Uzywana tam, gdzie karty juz nie ma i nie ma sie o co pytac systemu."""
+    name = entry.get("name") or "?"
+    tag = role_tag(name, entry.get("role") or "")
+    txt = name + (f" {tag}" if tag else "")
+    txt += f"   mac={entry.get('mac') or '?'}   gniazdo USB {entry.get('usb') or '?'}"
+    if with_seen and entry.get("seen"):
+        txt += f"   ostatnio: {entry['seen']}"
+    return txt
+
+
+def missing_cards_txt(nics=None, sep="; "):
+    """Krotki opis brakujacych kart do naglowka i do checkow - zeby zamiast
+    samego 'BRAK KARTY' bylo widac, KTORA karta zniknela i z ktorego gniazda."""
+    out = []
+    for e in missing_cards(nics):
+        name = e.get("name") or "?"
+        tag = role_tag(name, e.get("role") or "")
+        out.append(name + (f" {tag}" if tag else "")
+                   + f" (gniazdo {e.get('usb') or '?'}, mac {e.get('mac') or '?'})")
+    return sep.join(out)
 
 
 def plan_nic_names(nics):
@@ -2997,7 +3232,126 @@ def ensure_nic_names():
     if was_active:
         run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
         time.sleep(2)
+    remember_cards(nics)  # nazwy sa juz ustalone, wiec ewidencja zapisze te wlasciwe
     return nics
+
+
+def _default_say(msg, status=None):
+    """Domyslne 'gadanie' funkcji, ktore dzialaja i z TUI, i z konsoli - ekrany
+    curses podaja wlasne say(tekst, status), instalator zostaje przy log()."""
+    log(f"    {msg}")
+
+
+def apply_nic_renames(wanted, say=_default_say):
+    """wanted: {biezaca nazwa: docelowa}. Zamiana nazw miedzy dwiema kartami
+    (TX <-> RX) nie moze isc wprost: jadro ani na moment nie pozwoli na dwa
+    interfejsy o tej samej nazwie, wiec karta, ktorej nazwy ktos chce, idzie
+    najpierw pod nazwe tymczasowa. Zwraca liste wykonanych par (stara, nowa)."""
+    todo = {cur: tgt for cur, tgt in wanted.items() if cur != tgt}
+    done, staged = [], {}
+
+    for i, (cur, tgt) in enumerate(list(todo.items())):
+        if tgt in todo:  # nazwe docelowa trzyma jeszcze inna przenoszona karta
+            tmp = f"wfbswap{i}"
+            ok, err = rename_nic(cur, tmp)
+            if not ok:
+                say(f"nie udalo sie zwolnic nazwy {cur}: {err}", "fail")
+                return done
+            staged[tmp] = tgt
+            done.append((cur, tmp))
+            del todo[cur]
+
+    for cur, tgt in list(todo.items()) + list(staged.items()):
+        ok, err = rename_nic(cur, tgt)
+        if ok:
+            # para z nazwa tymczasowa juz jest na liscie - podmieniamy ja na
+            # docelowa, zeby update_wfb_defaults nie wpisalo do configu wfbswapN
+            done = [(o, tgt if n == cur else n) for o, n in done]
+            if not any(n == tgt for _, n in done):
+                done.append((cur, tgt))
+            say(f"nazwa karty: {cur} -> {tgt}")
+        else:
+            say(f"nie udalo sie przemianowac {cur} na {tgt}: {err}", "fail")
+    return done
+
+
+def assign_nic_role(nic, target_name, say=_default_say):
+    """Przypisuje karcie role, czyli nadaje jej nazwe z NIC_NAMES (rola siedzi
+    w nazwie - patrz NIC_ROLES). Jesli nazwa jest zajeta przez druga karte,
+    karty zamieniaja sie nazwami: przydzialow jest tyle co kart, wiec kazde inne
+    zachowanie zostawiloby jedna karte bez roli.
+
+    Przypisanie zapisujemy w regulach udev (przypiete do MAC-a), wiec przezywa
+    reboot i przelozenie dongla do innego portu USB. Zwraca (ok, komunikat)."""
+    nics = wfb_nics()
+    if nic not in nics:
+        return False, f"karty {nic} juz nie ma"
+    if target_name not in NIC_NAMES:
+        return False, f"nieznana nazwa {target_name}"
+    if nic == target_name:
+        return True, f"{nic} juz ma te role"
+
+    anchors = nic_anchors(nics)
+    mine = anchors.get(nic)
+    if not mine:
+        return False, (f"{nic} nie ma ani czytelnego MAC-a, ani gniazda USB - "
+                       "nie ma czego zakotwiczyc w regule udev")
+
+    before = parse_name_rules()  # do wycofania, gdyby po zmianie karty przepadly
+    by_anchor = dict(before)
+    old_name = by_anchor.get(mine)  # None, gdy karta nie miala jeszcze przydzialu
+    by_anchor[mine] = target_name
+
+    # Wybrana nazwe moze trzymac druga karta - takze taka, ktorej akurat nie ma
+    # w systemie. Zostawiona w regulach robilaby duplikat: udev mialby dwie
+    # karty do jednej nazwy i po wpieciu tej wypietej nie nazwalby zadnej z nich.
+    # Dostaje wiec nazwe po tej karcie, a jak ta nie miala jeszcze zadnej -
+    # pierwsza wolna. Gdy wolnej nie ma, wypada z regul i zostanie przy wlanX.
+    spare = old_name if old_name in NIC_NAMES else None
+    for anchor in [a for a, name in list(by_anchor.items())
+                   if name == target_name and a != mine]:
+        if not spare:
+            spare = next((n for n in NIC_NAMES if n not in by_anchor.values()), None)
+        if spare:
+            by_anchor[anchor], spare = spare, None
+        else:
+            del by_anchor[anchor]
+
+    was_active = service_active()
+    if was_active:
+        run(["systemctl", "stop", f"wifibroadcast@{ROLE}"])
+
+    write_name_rules(by_anchor)
+    # Docelowe nazwy czytamy juz z gotowych regul - dzieki temu ta sama sciezka
+    # obsluguje zwykle nadanie nazwy i zamiane rol miedzy dwiema kartami.
+    wanted = {n: by_anchor[anchors[n]] for n in nics
+              if anchors.get(n) and anchors[n] in by_anchor}
+    done = apply_nic_renames(wanted, say)
+
+    nics = wfb_nics()
+    if done and not nics:
+        # Ten sam bezpiecznik co w ensure_nic_names: dzialajace lacze jest
+        # wazniejsze niz przydzial rol, wiec cofamy wszystko.
+        for old, new in done:
+            rename_nic(new, old)
+        write_name_rules(before)
+        if was_active:
+            run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
+        return False, "po zmianie nazw wfb-nics nie widzi kart - wycofano"
+
+    if done:
+        update_wfb_defaults(done)
+        release_nics_from_network_stack(nics)
+    remember_cards(nics)
+    ensure_tx_split(nics)  # 'off' w wifi_txpower musi trafic na NOWA karte rx-only
+
+    if was_active:
+        run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
+        time.sleep(3)
+        if not service_active():
+            return False, f"usluga nie wstala po zmianie: {service_state_txt()}"
+    _nic_status_cache["val"] = None
+    return True, f"{nic} -> {target_name} ({role_txt(role_of_name(target_name))})"
 
 
 def step_config():
@@ -3294,7 +3648,13 @@ def detect_nics_startup():
 
     for nic in nics:
         d = nic_details(nic)
-        log(f"    {nic}: {d['driver']} mac={d['mac']} usb={d['usb']} tryb={d['mode']} kanal={d['channel']}")
+        log(f"    {nic}{nic_role_txt(nic)}: {d['driver']} mac={d['mac']} tryb={d['mode']} kanal={d['channel']}")
+        log(f"      gniazdo USB {nic_usb_txt(nic)}")
+
+    for entry in missing_cards(nics):
+        # Karty nie ma, wiec systemu nie ma o co pytac - to jedyne miejsce,
+        # w ktorym po wypieciu dongla widac, KTORA karta zniknela.
+        log(f"    BRAKUJE: {card_txt(entry)}")
 
     if not nics:
         log("    BLAD: zadna karta nie jest podpieta pod sterownik wfb.")
@@ -3396,6 +3756,7 @@ def collect_checks():
         checks.append(("Sterownik 88XXau_wfb", "fail", "brak - uruchom skrypt ponownie"))
 
     nics = wfb_nics()
+    remember_cards(nics)
     if len(nics) >= EXPECTED_NICS:
         checks.append(("Interfejsy wfb", "ok", f"{len(nics)} z {EXPECTED_NICS}: {' '.join(nics)}"))
     elif nics:
@@ -3404,6 +3765,18 @@ def collect_checks():
                        f"- reszta wisi na innym sterowniku niz {TARGET_USB_DRIVER}"))
     else:
         checks.append(("Interfejsy wfb", "fail", "wfb-nics nie zwraca zadnego interfejsu"))
+
+    # Ktora karta zniknela i skad. Bez ewidencji zostaje samo "1 z 2" - a przy
+    # rozdziale rol brak karty NADAWCZEJ to zupelnie inna awaria niz brak
+    # odbiorczej i szuka sie jej w innym miejscu.
+    gone = missing_cards(nics)
+    if gone:
+        checks.append(("Brakujace karty", "fail",
+                       "; ".join(card_txt(e) for e in gone)))
+    elif nics:
+        checks.append(("Karty i gniazda USB", "ok",
+                       "; ".join(f"{n}{nic_role_txt(n)} w gniezdzie {nic_usb_txt(n, short=True)}"
+                                 for n in nics)))
 
     if nics and Path("/etc/NetworkManager").is_dir():
         code, out = run_tool("nmcli", "-t", "-f", "DEVICE,STATE", "device")
@@ -3750,12 +4123,14 @@ def config_overview_lines():
     nics = wfb_nics()
     used = service_nics(set(nics)) if nics else set()
     traffic = nic_traffic(nics) if nics else {}
+    remember_cards(nics)
     for nic in nics:
         d = nic_details(nic)
         rx_pps, tx_pps = traffic.get(nic, (0.0, 0.0))
-        row(nic, f"mac={d['mac']}  usb={d['usb']}  {d['driver']} {d['mode']} "
+        row(nic, f"mac={d['mac']}  {d['driver']} {d['mode']} "
                  f"kan={d['channel']}{nic_role_txt(nic)}",
             "ok" if nic in used else "fail")
+        row("", f"gniazdo USB {nic_usb_txt(nic)}")
         row("", f"rx={rx_pps:.0f}/s tx={tx_pps:.0f}/s   w usludze={'tak' if nic in used else 'NIE'}"
                 f"{'   <- przez ta karte leci nadawanie' if tx_pps > 0 else ''}",
             "ok" if tx_pps > 0 else None)
@@ -3763,6 +4138,8 @@ def config_overview_lines():
         row("", "(licznik tx > 0 wskazuje karte, ktora faktycznie nadaje)")
     else:
         row("(brak)", "wfb-nics nie zwraca zadnego interfejsu", "fail")
+    for entry in missing_cards(nics):
+        row("BRAKUJE", card_txt(entry), "fail")
 
     section("Klucze")
     mode, code = key_mode()
@@ -4018,7 +4395,12 @@ def redetect_screen(stdscr):
 
     for nic in nics:
         d = nic_details(nic)
-        say(f"  {nic}: {d['driver']} mac={d['mac']} usb={d['usb']} tryb={d['mode']} kanal={d['channel']}")
+        say(f"  {nic}{nic_role_txt(nic)}: {d['driver']} mac={d['mac']} "
+            f"tryb={d['mode']} kanal={d['channel']}")
+        say(f"     gniazdo USB {nic_usb_txt(nic)}")
+
+    for entry in missing_cards(nics):
+        say(f"  BRAKUJE: {card_txt(entry)}", "fail")
 
     if nics:
         release_nics_from_network_stack(nics)
@@ -4053,25 +4435,21 @@ def redetect_screen(stdscr):
 
 
 def nic_role_txt(nic):
-    """Dopisek o roli karty - pusty, gdy rol nie rozdzielamy (gs). Na dronie
-    mowi, ktora karta nadaje: to do niej idzie wzmacniacz i to jej MAC trzeba
-    znac, zeby nie pomylic dongli."""
-    if not RX_ONLY_NICS:
-        return ""
-    return "   [tylko odbior]" if nic in RX_ONLY_NICS else "   [nadaje]"
+    """Dopisek o roli karty - pusty, gdy rol nie rozdzielamy (gs ma jedna karte
+    robiaca oba kierunki). Na dronie mowi, ktora karta nadaje: to do niej idzie
+    wzmacniacz i to jej MAC trzeba znac, zeby nie pomylic dongli."""
+    tag = role_tag(nic)
+    return f"   {tag}" if tag else ""
 
 
 def nic_snapshot():
     """{nazwa: (gniazdo USB, mac)} - lekko, bez wolania 'iw', bo ten ekran
     odpytuje karty dwa razy na sekunde."""
-    snap = {}
-    for nic in wfb_nics():
-        try:
-            mac = (Path("/sys/class/net") / nic / "address").read_text().strip()
-        except OSError:
-            mac = "?"
-        snap[nic] = (nic_usb_slot(nic) or "?", mac)
-    return snap
+    # MAC przez nic_mac, a nie wlasnym odczytem pliku: to ten sam, malymi
+    # literami zapisany adres, na ktorym wisza reguly udev i ewidencja kart -
+    # dwa zapisy tego samego MAC-a myliłyby przy porownywaniu z regula.
+    return {nic: (usb_port_path(nic) or "?", nic_mac(nic) or "?")
+            for nic in wfb_nics()}
 
 
 def nic_identify_screen(stdscr):
@@ -4083,6 +4461,7 @@ def nic_identify_screen(stdscr):
     stdscr.timeout(500)  # getch wraca po 0.5 s, wiec petla sama sie odswieza
 
     known = nic_snapshot()
+    remember_cards(list(known))
     prev_dongles = len(usb_rtl_dongles())
     counters = {nic: (*nic_counters(nic), time.monotonic()) for nic in known}
     events = []
@@ -4099,23 +4478,30 @@ def nic_identify_screen(stdscr):
 
             for nic in [n for n in known if n not in current]:
                 slot, mac = known[nic]
-                note(f"WYPIETO: {nic}   (gniazdo {slot}, mac {mac})", "fail")
+                # Nazwa, rola i gniazdo od razu w komunikacie: po wypieciu nie da
+                # sie ich juz nigdzie odczytac, bo interfejsu po prostu nie ma.
+                note(f"WYPIETO: {nic}{nic_role_txt(nic)}"
+                     f"   (gniazdo USB {slot}, mac {mac})", "fail")
                 if dongles < prev_dongles:
-                    note(f"   ... dongiel zniknal tez z lsusb - to fizyczne wypiecie", "warn")
+                    note("   ... dongiel zniknal tez z lsusb - to fizyczne wypiecie", "warn")
                 else:
                     note("   ... ale lsusb dalej go widzi - to nie kabel, tylko sterownik", "warn")
 
             for nic in [n for n in current if n not in known]:
                 slot, mac = current[nic]
-                note(f"WPIETO: {nic}   (gniazdo {slot}, mac {mac})", "ok")
+                note(f"WPIETO: {nic}{nic_role_txt(nic)}"
+                     f"   (gniazdo USB {slot}, mac {mac})", "ok")
                 note("   ... usluga uzyje jej dopiero po 'Wykryj karty ponownie'", "warn")
 
+            if set(current) != set(known):
+                remember_cards(list(current))  # ewidencja ma pamietac takze po wyjsciu z ekranu
             known, prev_dongles = current, dongles
 
             stdscr.clear()
             draw_header(stdscr, f"WFB-NG [{ROLE}] - identyfikacja kart")
             safe_addstr(stdscr, 2, 2,
-                        "Wypnij jeden dongiel - ekran powie, ktora nazwa zniknela.", curses.A_BOLD)
+                        "Wypnij jeden dongiel - ekran powie, ktora nazwa i rola zniknela.",
+                        curses.A_BOLD)
 
             row = 4
             safe_addstr(stdscr, row, 2,
@@ -4140,14 +4526,25 @@ def nic_identify_screen(stdscr):
                 # wisi nazwa) - a przy dwoch identycznych donglach to jedyna
                 # rzecz, po ktorej odroznisz je w rece od tej w drugim porcie
                 safe_addstr(stdscr, row, 2,
-                            f"{nic:<12} mac={mac}   gniazdo={slot}{nic_role_txt(nic)}",
+                            f"{nic:<12} mac={mac}{nic_role_txt(nic)}",
                             color_for("ok" if nic in used else "warn") | curses.A_BOLD)
-                safe_addstr(stdscr, row + 1, 4,
+                safe_addstr(stdscr, row + 1, 4, f"gniazdo USB {usb_port_txt(slot)}")
+                safe_addstr(stdscr, row + 2, 4,
                             f"rx={rx_pps:6.0f}/s  tx={tx_pps:6.0f}/s   w usludze="
                             f"{'tak' if nic in used else 'NIE'}"
                             + ("   <- ta karta nadaje" if tx_pps > 0 else ""),
                             color_for("ok") if tx_pps > 0 else 0)
-                row += 3
+                row += 4
+
+            gone = missing_cards(list(current))
+            if gone:
+                safe_addstr(stdscr, row, 2, "Brakuje (znane z ewidencji):",
+                            color_for("fail") | curses.A_BOLD)
+                row += 1
+                for entry in gone:
+                    safe_addstr(stdscr, row, 4, card_txt(entry), color_for("fail"))
+                    row += 1
+                row += 1
 
             if events:
                 safe_addstr(stdscr, row, 2, "Zdarzenia:", curses.A_BOLD)
@@ -4157,14 +4554,157 @@ def nic_identify_screen(stdscr):
                     row += 1
 
             h, _ = stdscr.getmaxyx()
-            safe_addstr(stdscr, h - 1, 2, "q = powrot", curses.A_DIM)
+            safe_addstr(stdscr, h - 1, 2,
+                        "q = powrot" + ("   |   z = zapomnij brakujace karty" if gone else ""),
+                        curses.A_DIM)
             stdscr.refresh()
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q"), 27):
                 break
+            if key in (ord("z"), ord("Z")) and gone:
+                # Karta wymieniona na inna zostalaby w ewidencji na zawsze jako
+                # "brakujaca" - to jest sposob, zeby powiedziec: juz jej nie ma
+                # i nie ma po co jej szukac.
+                for entry in gone:
+                    forget_card(entry["key"])
+                note("ewidencja wyczyszczona z brakujacych kart", "warn")
     finally:
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
+
+
+def role_apply_screen(stdscr, nic, target_name):
+    """Wykonanie zmiany przydzialu z widocznym przebiegiem. Zmiana zatrzymuje
+    usluge, przemianowuje interfejsy i poprawia config, wiec przez kilka sekund
+    link nie stoi - lepiej, zeby bylo widac, na czym to stoi, niz zeby ekran
+    zamarl bez slowa."""
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - zmiana przydzialu karty")
+    row = 2
+
+    def say(text, status=None):
+        nonlocal row
+        safe_addstr(stdscr, row, 2, text,
+                    (color_for(status) | curses.A_BOLD) if status else 0)
+        row += 1
+        stdscr.refresh()
+
+    say(f"{nic} -> {target_name} ({role_txt(role_of_name(target_name))})", "warn")
+    say("zatrzymuje usluge, zmieniam nazwy, wracam...")
+    row += 1
+
+    ok, msg = assign_nic_role(nic, target_name, say)
+    row += 1
+    say(msg, "ok" if ok else "fail")
+    if ok:
+        say("przypisanie siedzi w regulach udev (na MAC-u karty) - przezyje")
+        say("reboot i przelozenie dongla do innego gniazda USB.")
+    pause(stdscr)
+
+
+def nic_roles_screen(stdscr):
+    """Przypisanie kart do rol TX / RX.
+
+    Rola karty siedzi w jej NAZWIE (NIC_ROLES), a nazwa jest przypieta udevem do
+    MAC-a karty - wiec zmiana przydzialu to zmiana nazwy, i dlatego przydzial
+    trzyma sie karty, a nie gniazda. Ma to znaczenie tam, gdzie do jednej karty
+    przykrecony jest jednokierunkowy wzmacniacz albo antena kierunkowa: nadawac
+    ma dokladnie ta karta, niezaleznie od tego, w ktory port USB trafi."""
+    stdscr.timeout(1000)
+    idx = 0
+    try:
+        while True:
+            nics = sorted(wfb_nics())
+            used = service_nics(set(nics)) if nics else set()
+            gone = missing_cards(nics)
+            idx = min(idx, max(0, len(nics) - 1))
+
+            stdscr.erase()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - przypisanie rol kart (TX / RX)")
+            row = 2
+
+            if role_split_used():
+                safe_addstr(stdscr, row, 2,
+                            "Rola jedzie z karta (przypieta do MAC-a), nie z gniazdem USB.",
+                            curses.A_BOLD)
+            else:
+                safe_addstr(stdscr, row, 2,
+                            f"Rola {ROLE} ma jedna karte i robi nia oba kierunki - "
+                            "nie ma tu czego rozdzielac.", color_for("warn"))
+            row += 2
+
+            for i, nic in enumerate(nics):
+                mark = ">" if i == idx else " "
+                attr = curses.color_pair(5) if i == idx else curses.A_BOLD
+                role = role_of_name(nic)
+                safe_addstr(stdscr, row, 2,
+                            f"{mark} {nic:<12} {role_txt(role, short=True):<14}"
+                            f" mac={nic_mac(nic) or '?'}".ljust(60), attr)
+                safe_addstr(stdscr, row + 1, 4,
+                            f"gniazdo USB {nic_usb_txt(nic)}")
+                safe_addstr(stdscr, row + 2, 4,
+                            f"{role_txt(role)}   w usludze="
+                            f"{'tak' if nic in used else 'NIE'}",
+                            color_for("ok" if nic in used else "warn"))
+                row += 4
+
+            if not nics:
+                safe_addstr(stdscr, row, 2, "wfb-nics nie zwraca zadnego interfejsu",
+                            color_for("fail"))
+                row += 2
+
+            if gone:
+                safe_addstr(stdscr, row, 2, "Brakuje (przydzial czeka na te karte):",
+                            color_for("fail") | curses.A_BOLD)
+                row += 1
+                for entry in gone:
+                    safe_addstr(stdscr, row, 4, card_txt(entry), color_for("fail"))
+                    row += 1
+
+            h, _ = stdscr.getmaxyx()
+            hint = "strzalki = wybor, Enter = zmien role, r = odswiez, q = powrot"
+            safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (curses.KEY_UP, ord("k")) and nics:
+                idx = (idx - 1) % len(nics)
+            elif key in (curses.KEY_DOWN, ord("j")) and nics:
+                idx = (idx + 1) % len(nics)
+            elif key in (10, 13, curses.KEY_ENTER) and nics:
+                stdscr.timeout(-1)
+                nic = nics[idx]
+                if not role_split_used():
+                    popup(stdscr, "Nie ma czego rozdzielac",
+                          [f"{ROLE} pracuje na jednej karcie i ta sama karta",
+                           "odbiera i nadaje. Przydzial rol ma sens tam, gdzie",
+                           "kart sa dwie."], status="warn")
+                else:
+                    choices = [n for n in NIC_NAMES]
+                    buttons = tuple(role_txt(role_of_name(n), short=True) for n in choices) + ("Anuluj",)
+                    holder = {n: n for n in nics}
+                    lines = [f"Karta {nic}   mac={nic_mac(nic) or '?'}",
+                             f"gniazdo USB {nic_usb_txt(nic)}",
+                             "",
+                             "Nowa rola tej karty:"]
+                    lines += [f"  {role_txt(role_of_name(n), short=True):<14} = {n}"
+                              + ("   (teraz zajete)" if n in holder and n != nic else "")
+                              for n in choices]
+                    lines += ["",
+                              "Karta, ktora trzyma wybrana nazwe, dostanie w zamian",
+                              "nazwe tej karty - inaczej zostalaby bez przydzialu.",
+                              "Na czas zmiany usluga jest zatrzymana."]
+                    pick = popup(stdscr, "Przypisanie roli", lines, buttons,
+                                 status="warn", default=len(buttons) - 1)
+                    if pick < len(choices) and choices[pick] != nic:
+                        role_apply_screen(stdscr, nic, choices[pick])
+                stdscr.timeout(1000)
+            elif key in (ord("r"), ord("R")):
+                _nic_status_cache["val"] = None
+    finally:
+        stdscr.timeout(-1)
 
 
 def popup(stdscr, title, lines, buttons=("OK",), status=None, default=0):
@@ -6414,6 +6954,7 @@ def main_menu(stdscr):
         "Pokaz biezaca konfiguracje",
         "Wykryj karty ponownie (naprawa)",
         "Identyfikacja kart (wypnij dongla)",
+        "Przypisanie rol kart (TX / RX)",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
         "Test obciazeniowy (ruch jak wideo)",
@@ -6480,20 +7021,22 @@ def main_menu(stdscr):
             elif idx == 2:
                 nic_identify_screen(stdscr)
             elif idx == 3:
-                keys_screen(stdscr)
+                nic_roles_screen(stdscr)
             elif idx == 4:
-                link_test_screen(stdscr)
+                keys_screen(stdscr)
             elif idx == 5:
-                load_test_screen(stdscr)
+                link_test_screen(stdscr)
             elif idx == 6:
-                channel_screen(stdscr)
+                load_test_screen(stdscr)
             elif idx == 7:
-                modulation_screen(stdscr)
+                channel_screen(stdscr)
             elif idx == 8:
-                repair_screen(stdscr)
+                modulation_screen(stdscr)
             elif idx == 9:
-                verification_screen(stdscr)
+                repair_screen(stdscr)
             elif idx == 10:
+                verification_screen(stdscr)
+            elif idx == 11:
                 if confirm_exit(stdscr):
                     break
         elif key in (ord("r"), ord("R")):

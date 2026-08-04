@@ -25,7 +25,7 @@ Opisuje **co robi każda funkcja** i **jak funkcje współpracują ze sobą**.
 16. [Automaty: AutoPeer, AutoChannel, AutoFec](#16-automaty-autopeer-autochannel-autofec)
 17. [Instalacja](#17-instalacja)
 18. [Klucze i parowanie](#18-klucze-i-parowanie)
-19. [Stałe nazwy kart](#19-stałe-nazwy-kart)
+19. [Stałe nazwy kart, role TX/RX i ewidencja](#19-stałe-nazwy-kart-role-txrx-i-ewidencja)
 20. [Wykrywanie kart przy starcie i weryfikacja](#20-wykrywanie-kart-przy-starcie-i-weryfikacja)
 21. [Warstwa curses](#21-warstwa-curses)
 22. [Zapis testu do pliku](#22-zapis-testu-do-pliku)
@@ -57,6 +57,7 @@ Co je różni:
 | `PEER_NAME` | `"drone"` | `"gs"` |
 | `EXPECTED_NICS` | `1` | `2` |
 | `NIC_NAMES` | `["gs_wfb"]` | `["drone_RX", "drone_TX"]` |
+| `NIC_ROLES` | `{"gs_wfb": "txrx"}` | `{"drone_RX": "rx", "drone_TX": "tx"}` |
 | `RX_ONLY_NICS` | `[]` | `["drone_RX"]` |
 | `ROLE_SECTION` | `connect://` (odbiera) | `listen://` (nadaje) |
 
@@ -152,7 +153,8 @@ uratowane             =  przed − po                        ← zasługa FEC
 | `DRONE_KEY`, `GS_KEY` | `/etc/drone.key`, `/etc/gs.key` |
 | `MODPROBE_WFB` | `/etc/modprobe.d/wfb.conf` — blacklisty + moc nadawania |
 | `TX_POWER_SYSFS` | parametr modułu do zmiany mocy na żywo |
-| `UDEV_NAMES` | `/etc/udev/rules.d/70-wfb-names.rules` — stałe nazwy kart |
+| `UDEV_NAMES` | `/etc/udev/rules.d/70-wfb-names.rules` — stałe nazwy kart (= przydział ról) |
+| `WFB_CARDS` | `/etc/wfb-cards.json` — ewidencja kart: nazwa, rola, MAC, gniazdo USB, kiedy ostatnio widziana |
 | `WFB_DEFAULTS` | `/etc/default/wifibroadcast` |
 | `SCRIPT_PATH` | ten plik po `resolve()` — wchodzi do jednostki autostartu |
 | `TEST_LOG_DIR` | katalog skryptu — tam lądują logi testu |
@@ -219,6 +221,10 @@ kanał.
 | `wfb_nics()` | lista interfejsów z `wfb-nics` — to, co wfb-ng uważa za swoje karty |
 | `usb_rtl_dongles()` | linie z `lsusb` pasujące do RTL88xx — czyli co **fizycznie** wpięte |
 | `nic_usb_slot(nic)` | gniazdo USB, np. `1-1:1.0`. Stałe dla portu niezależnie od karty |
+| `usb_port_path(nic)` | sam port, bez końcówki interfejsu: `1-1.4:1.0` → `1-1.4`. Pod tą postacią gniazdo zna sysfs |
+| `usb_speed_txt(speed)` | `480` → `USB 2.0, 480 Mb/s`. Dongiel w porcie 2.0 przy pełnym wideo gubi pakiety, a po gnieździe tego nie widać |
+| `usb_port_txt(port)` | gniazdo po ludzku: `1-1.4  (magistrala 1, gniazdo 1.4, USB 2.0, 480 Mb/s)` |
+| `nic_usb_txt(nic, short=False)` | to samo, ale od razu dla interfejsu |
 | `nic_mac(nic)` | MAC małymi literami — **na nim wieszamy nazwy**, bo jedzie razem z donglem |
 | `nic_details(nic)` | komplet: sterownik, MAC, gniazdo, tryb (monitor?), kanał |
 | `nic_counters(nic)` | `(rx_packets, tx_packets)` z `/sys/class/net/<nic>/statistics` |
@@ -655,7 +661,7 @@ identyczną parę kluczy** — bez przenoszenia plików między urządzeniami.
 
 ---
 
-## 19. Stałe nazwy kart
+## 19. Stałe nazwy kart, role TX/RX i ewidencja
 
 Zamiast `wlanX` (numer zależy od kolejności wykrycia) karty dostają stałe nazwy
 przypięte regułą udev do **MAC-a**, więc nazwa jedzie razem z donglem — także po
@@ -669,7 +675,68 @@ przełożeniu do innego portu USB.
 | `write_name_rules(by_anchor)` | zapis pliku udev + `udevadm control --reload-rules`. Zwraca `False`, gdy treść się nie zmieniła |
 | `rename_nic(old, new)` | zmiana nazwy — jądro pozwala **tylko interfejsowi w stanie DOWN** |
 | `update_wfb_defaults(renames)` | podmiana nazw w `WFB_NICS`, jeśli plik wymienia karty wprost |
-| `ensure_nic_names()` | całość: zaplanuj, zapisz reguły, przemianuj, popraw `/etc/default` |
+| `ensure_nic_names()` | całość: zaplanuj, zapisz reguły, przemianuj, popraw `/etc/default`, odśwież ewidencję |
+
+### Role: TX czy RX
+
+**Rola siedzi w nazwie karty**, a nazwa jest przypięta do MAC-a — dlatego
+przypisanie karty do roli sprowadza się do nadania jej właściwej nazwy i dlatego
+**jedzie razem z kartą**, nie z gniazdem. To jest cały sens: gdy do jednej karty
+przykręcony jest jednokierunkowy wzmacniacz, nadawać ma **ta** karta, a nie ta,
+która akurat wstała pierwsza po boocie.
+
+| Funkcja | Co robi |
+|---|---|
+| `NIC_ROLES` | `{nazwa: rola}` — `"tx"` nadaje, `"rx"` tylko słucha, `"txrx"` oba kierunki |
+| `role_of_name(name)` | rola przypisana do nazwy; pusta dla `wlanX`, czyli „bez przydziału" |
+| `role_txt(role, short)` | `"tx"` → `NADAJE` / `nadaje (i odbiera)` |
+| `role_tag(name, fallback)` | etykieta `[NADAJE]` doklejana po nazwie. **Pusta na gs** — jedna karta robi oba kierunki, więc przydział niczego nie rozróżnia. Jedno miejsce na tę decyzję, bo etykieta wychodzi w nagłówku menu, na trzech ekranach i w weryfikacji |
+| `role_split_used()` | czy na tej roli jest co rozdzielać (`len(NIC_NAMES) > 1`) |
+| `names_for_role(role)` | nazwy pełniące daną rolę |
+| `apply_nic_renames(wanted, say)` | wykonuje `{bieżąca: docelowa}`. Zamiana TX↔RX idzie **przez nazwę tymczasową** (`wfbswapN`), bo jądro ani na moment nie pozwoli na dwa interfejsy o tej samej nazwie |
+| `assign_nic_role(nic, target_name, say)` | całość zmiany przydziału — patrz niżej |
+
+`assign_nic_role()` po kolei: zatrzymuje usługę → przepisuje reguły udev →
+przemianowuje interfejsy → poprawia `/etc/default` → przelicza `wifi_txpower`
+(`ensure_tx_split`, czyli `'off'` musi trafić na **nową** kartę rx-only) →
+startuje usługę. Trzy rzeczy, które załatwia po drodze:
+
+- **Zamiana, nie nadpisanie.** Karta, która trzymała wybraną nazwę, dostaje
+  w zamian nazwę tej pierwszej — inaczej zostałaby bez przydziału.
+- **Nazwę może trzymać karta wypięta.** Zostawiona w regułach robiłaby duplikat
+  (dwie kotwice na jedną nazwę) i po wpięciu udev nie nazwałby **żadnej**.
+  Dostaje więc pierwszą wolną nazwę, a jak wolnej nie ma — wypada z reguł.
+- **Wycofanie.** Jeśli po zmianie `wfb-nics` nie widzi już żadnej karty,
+  wszystko wraca na swoje (nazwy i reguły) i funkcja zwraca `False`. Działające
+  łącze jest ważniejsze niż ładny przydział — ta sama zasada co w
+  `ensure_nic_names()`.
+
+### Ewidencja kart — „którą kartę wyjąłem?"
+
+Wypięta karta znika bez śladu: nie ma interfejsu, więc nie ma się o co zapytać
+ani o MAC, ani o gniazdo. Bez ewidencji system umie powiedzieć tylko „jest 1 z 2".
+Plik `WFB_CARDS` pamięta, **co, gdzie i kiedy** widzieliśmy ostatnio — dzięki
+temu brakującą kartę da się nazwać po imieniu, roli i gnieździe, także po
+reboocie z wypiętym donglem.
+
+| Funkcja | Co robi |
+|---|---|
+| `anchor_key(anchor)` | kotwica jako jeden ciąg (`mac:aa:bb:…`) — **ta sama** co w regułach udev, więc nazwy i ewidencja mówią o tej samej karcie |
+| `load_cards()` / `save_cards(cards)` | odczyt i zapis. Uszkodzony plik = pusty; brak roota = jedziemy dalej. To tylko pamięć pomocnicza |
+| `remember_cards(nics)` | dopisuje karty widoczne **teraz**. Wpisów nieobecnych **nie kasuje** — to one są całą wartością pliku |
+| `forget_card(key)` | usuwa wpis (klawisz `z` na ekranie identyfikacji) — dla karty wymienionej na inną, żeby nie wisiała wiecznie jako „brakująca" |
+| `missing_cards(nics)` | wpisy, których teraz nie ma — czyli dokładnie te wypięte |
+| `card_txt(entry)` | `drone_TX [NADAJE]   mac=…   gniazdo USB 1-1.4   ostatnio: …` |
+| `missing_cards_txt(nics)` | krótka wersja do nagłówka menu i do `collect_checks()` |
+
+> **Znacznik czasu odświeżamy najwyżej co `SEEN_REFRESH` (600 s).**
+> `remember_cards()` woła się przy każdym odświeżeniu nagłówka menu, a zapis do
+> `/etc` co sekundę mieliłby kartę SD bez żadnego pożytku.
+
+Gdzie to widać: nagłówek menu (`nic_status_summary` — zamiast `BRAK KARTY` jest
+`BRAK: drone_TX [NADAJE] (gniazdo 1-1.4, mac …)`), weryfikacja (osobny check
+„Brakujące karty"), `detect_nics_startup()` i `redetect_screen()` (linia
+`BRAKUJE: …`), ekran identyfikacji i ekran przypisania ról.
 
 ---
 
@@ -678,7 +745,7 @@ przełożeniu do innego portu USB.
 | Funkcja | Co robi |
 |---|---|
 | `detect_nics_startup()` | odpalane przy **każdym** starcie, przed TUI: czy są wszystkie karty, czy pod właściwym sterownikiem, czy usługa je widzi. Potrafi przepiąć sterownik i zrestartować usługę; `REBOOT_MARKER` pilnuje, żeby nie zapętlić restartów |
-| `collect_checks()` | lista `(nazwa, status, szczegół)` — dongle w `lsusb`, zasilanie USB, sterownik, tryb monitor, kanał, usługa, autostart, klucze, ruch na kartach, tunel, ping do drugiej strony |
+| `collect_checks()` | lista `(nazwa, status, szczegół)` — dongle w `lsusb`, zasilanie USB, sterownik, **karty z rolami i gniazdami USB**, **brakujące karty z ewidencji**, tryb monitor, kanał, rozdział RX/TX, usługa, autostart, klucze, ruch na kartach, tunel, ping do drugiej strony |
 
 **Podpowiedź o parowaniu.** Jeśli w liście jest choć jeden `fail`, na jej
 **początek** trafia blok „Zanim zaczniesz szukać: PAROWANIE" z odciskiem kluczy
@@ -886,8 +953,10 @@ dobrym sygnale znaczy coś zupełnie innego niż „słaby link":
 | `main_menu(stdscr)` | menu główne. Przy zapisie w tle odświeża się **samo co sekundę**, żeby licznik próbek szedł do przodu; `erase()` zamiast `clear()`, bo pełne czyszczenie migałoby |
 | `show_config_screen(stdscr)` | bieżąca konfiguracja (pager) |
 | `redetect_screen(stdscr)` | ta sama naprawa co przy starcie, ale z menu — po wpięciu dongla |
-| `nic_identify_screen(stdscr)` | **żywy podgląd kart**: wypnij dongla, a ekran powie, która nazwa właśnie zniknęła. Dwa identyczne dongle 8812AU wyglądają tak samo i inaczej nie da się ich rozróżnić |
-| `nic_role_txt(nic)` / `nic_snapshot()` | pomocnicze do powyższego (lekko, bez wołania `iw`) |
+| `nic_identify_screen(stdscr)` | **żywy podgląd kart**: wypnij dongla, a ekran powie, **która nazwa, rola i gniazdo** właśnie zniknęły. Dwa identyczne dongle 8812AU wyglądają tak samo i inaczej nie da się ich rozróżnić. Na dole karty znane z ewidencji, których nie ma; `z` = zapomnij je |
+| **`nic_roles_screen(stdscr)`** | **przypisanie kart do ról TX / RX**: lista kart z rolą, MAC-iem, gniazdem USB i stanem w usłudze, Enter = zmiana roli. Na gs mówi tylko, że nie ma czego rozdzielać |
+| **`role_apply_screen(stdscr, nic, target)`** | wykonanie zmiany z widocznym przebiegiem — usługa na te kilka sekund stoi, więc ekran nie może zamarznąć bez słowa |
+| `nic_role_txt(nic)` / `nic_snapshot()` | pomocnicze do powyższych (lekko, bez wołania `iw`) |
 | `keys_screen(stdscr)` | klucze i parowanie: stan, odcisk, wpisanie kodu, wygenerowanie własnych |
 | `show_pairing_code_screen(stdscr, code)` | kod w ramce do przepisania |
 | `radio_settings_screen(stdscr)` | region i moc nadawania (kanału **tu się nie ustawia**) |
@@ -910,16 +979,18 @@ dobrym sygnale znaczy coś zupełnie innego niż „słaby link":
 ### Pozycje menu
 
 ```
-0 Pokaz biezaca konfiguracje          → show_config_screen
-1 Wykryj karty ponownie (naprawa)     → redetect_screen
-2 Identyfikacja kart (wypnij dongla)  → nic_identify_screen
-3 Klucze i parowanie                  → keys_screen
-4 Test polaczenia                     → link_test_screen
-5 Kanal i czestotliwosc               → channel_screen
-6 Wybor modulacji (MCS)               → modulation_screen
-7 Naprawa utraconych pakietow (FEC)   → repair_screen      ← nowe
-8 Uruchom weryfikacje                 → verification_screen
-9 Wyjdz                               → confirm_exit
+ 0 Pokaz biezaca konfiguracje          → show_config_screen
+ 1 Wykryj karty ponownie (naprawa)     → redetect_screen
+ 2 Identyfikacja kart (wypnij dongla)  → nic_identify_screen
+ 3 Przypisanie rol kart (TX / RX)      → nic_roles_screen    ← nowe
+ 4 Klucze i parowanie                  → keys_screen
+ 5 Test polaczenia                     → link_test_screen
+ 6 Test obciazeniowy                   → load_test_screen
+ 7 Kanal i czestotliwosc               → channel_screen
+ 8 Wybor modulacji (MCS)               → modulation_screen
+ 9 Naprawa utraconych pakietow (FEC)   → repair_screen
+10 Uruchom weryfikacje                 → verification_screen
+11 Wyjdz                               → confirm_exit
 ```
 
 > Dodając pozycję, pamiętaj o **obu** listach: `items` i drabince `elif idx == …`.
@@ -1091,6 +1162,9 @@ bo przy porównaniu kreski z kilku testów zlałyby się w płot.
 | dodać ją do odczytu pod kursorem | `ChartArea.READOUT` |
 | dodać ją do panelu bocznego | `App.STAT_ROWS` lub `App._repair_lines()` |
 | dodać pozycję menu | `main_menu()` — **`items` i drabinka `elif`** |
+| dodać / zmienić rolę karty (TX, RX) | `NIC_NAMES` **i** `NIC_ROLES` (każda nazwa musi mieć rolę), a rx-only także `RX_ONLY_NICS` |
+| zmienić, którą kartę fizycznie obsadzić w roli | nic w kodzie — menu „Przypisanie rol kart" (`assign_nic_role`) |
+| dopisać pole do ewidencji kart | `remember_cards()` (zapis) **i** `card_txt()` (wyświetlanie) |
 | zmienić progi oceny | `rssi_grade` / `loss_grade` / `snr_grade` **oraz** `RSSI_BANDS` / `LOSS_BANDS` w podglądzie |
 
 ### Zasady, które warto utrzymać
@@ -1107,3 +1181,9 @@ bo przy porównaniu kreski z kilku testów zlałyby się w płot.
    się ich zestawić na jednym wykresie.
 6. **Każda zmiana FEC lub kanału to restart usługi**, czyli kilka sekund bez
    obrazu i telemetrii. Stąd cooldowny.
+7. **Rola karty siedzi w jej nazwie, a nazwa na MAC-u.** Nie wieszaj ról na
+   gnieździe USB ani na kolejności z `wfb-nics` — przydział ma jechać razem
+   z kartą, bo to do konkretnej karty przykręcony jest wzmacniacz.
+8. **O karcie, której nie ma, mów z ewidencji** (`WFB_CARDS`). Po wypięciu
+   dongla nie ma już czego zapytać o MAC ani o gniazdo, a „1 z 2" nie jest
+   odpowiedzią na pytanie „którą kartę wyjąłem".
