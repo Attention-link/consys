@@ -283,8 +283,9 @@ Wyższy poziom:
 | `build_config(channel, region)` | treść świeżego configu |
 | `save_common_config(channel, region)` | zapis kanału i regionu **bez deptania reszty** |
 | `ensure_video_service_type(nics)` | `udp_direct_tx` nie obsłuży kilku kart — przy >1 karcie podmienia `service_type` na `udp_proxy`, inaczej usługa restartuje się w kółko |
+| `rx_only_nics(nics)` | karty, które mają milczeć: `RX_ONLY_NICS` **plus te bez przydziału** (`wlanX`) — patrz §19 |
 | `txpower_cfg_value(nics)` | treść `wifi_txpower` dla `[common]` |
-| `ensure_tx_split(nics)` | wymusza, że nadaje tylko karta spoza `RX_ONLY_NICS` |
+| `ensure_tx_split(nics)` | wymusza, że nadaje **tylko karta z rolą TX** |
 | `apply_tx_split(nics, say)` | rozdział ról + restart **z wycofaniem**, gdy usługa nie wstanie |
 
 ---
@@ -693,6 +694,8 @@ która akurat wstała pierwsza po boocie.
 | `role_tag(name, fallback)` | etykieta `[NADAJE]` doklejana po nazwie. **Pusta na gs** — jedna karta robi oba kierunki, więc przydział niczego nie rozróżnia. Jedno miejsce na tę decyzję, bo etykieta wychodzi w nagłówku menu, na trzech ekranach i w weryfikacji |
 | `role_split_used()` | czy na tej roli jest co rozdzielać (`len(NIC_NAMES) > 1`) |
 | `names_for_role(role)` | nazwy pełniące daną rolę |
+| `rx_only_nics(nics)` | karty, które mają **nie** nadawać: z przydziałem `rx` **oraz bez żadnego przydziału** |
+| `free_ifname(taken)` | wolna nazwa `wlanN` dla karty, która straciła przydział |
 | `apply_nic_renames(wanted, say)` | wykonuje `{bieżąca: docelowa}`. Zamiana TX↔RX idzie **przez nazwę tymczasową** (`wfbswapN`), bo jądro ani na moment nie pozwoli na dwa interfejsy o tej samej nazwie |
 | `assign_nic_role(nic, target_name, say)` | całość zmiany przydziału — patrz niżej |
 
@@ -710,6 +713,30 @@ startuje usługę. Trzy rzeczy, które załatwia po drodze:
   wszystko wraca na swoje (nazwy i reguły) i funkcja zwraca `False`. Działające
   łącze jest ważniejsze niż ładny przydział — ta sama zasada co w
   `ensure_nic_names()`.
+
+### Więcej kart niż ról (np. trzy dongle na dwie role)
+
+Nadmiarowe karty zostają przy `wlanX` — `plan_nic_names()` rozdaje tylko nazwy
+z `NIC_NAMES` (pierwszeństwo wg gniazda USB), a resztę zostawia w spokoju.
+Którą dwójkę obsadzić w rolach, wskazuje się w menu; są tu dwie pułapki, które
+kod musi obsłużyć, bo inaczej „trzecia karta" cicho psuje link:
+
+1. **Karta bez przydziału też nie może nadawać.** `wfb_tx` rozkłada pakiety
+   między wszystkie karty z włączonym nadawaniem, więc dongiel wpięty „na zapas"
+   zabrałby część wideo torowi ze wzmacniaczem — dokładnie to, czemu rozdział
+   ról ma zapobiegać. Stąd `rx_only_nics()` wycisza (`'off'`) także `wlanX`,
+   a nie tylko `RX_ONLY_NICS`. Bezpiecznik zostaje: gdyby wyszło, że **wszystkie**
+   karty miałyby milczeć, wpis nie powstaje — lepiej nadawać torem bez
+   wzmacniacza niż nie nadawać wcale.
+2. **Wywłaszczona karta musi oddać nazwę.** Gdy trzecia karta przejmuje
+   `drone_TX`, dla poprzedniej nie ma już wolnego przydziału — a dopóki trzyma
+   nazwę `drone_TX`, jądro odmówi (`File exists`) i cała zmiana stanęłaby
+   w połowie: reguły przepisane, interfejsy nie. Dlatego trafia do `wanted`
+   z nazwą z `free_ifname()` i wraca do `wlanX` (`apply_nic_renames()` sam
+   ustawia kolejność).
+
+> Przy dwóch kartach na dwie role żadna nie zostaje bez przydziału — karty
+> po prostu zamieniają się nazwami.
 
 ### Ewidencja kart — „którą kartę wyjąłem?"
 

@@ -800,11 +800,22 @@ def build_config(channel, region):
     )
 
 
+def rx_only_nics(nics):
+    """Karty, ktore maja NIE nadawac: te z przydzialem rx ORAZ te bez zadnego
+    przydzialu (wlanX). Ten drugi przypadek to trzeci dongiel wpiety "na zapas":
+    wfb_tx rozklada pakiety miedzy wszystkie karty z wlaczonym nadawaniem, wiec
+    taka karta zabralaby czesc wideo torowi ze wzmacniaczem - czyli dokladnie to,
+    czemu rozdzial rol ma zapobiegac. Pusto tam, gdzie rol nie rozdzielamy."""
+    if not RX_ONLY_NICS:
+        return []
+    return [n for n in nics if n in RX_ONLY_NICS or not role_of_name(n)]
+
+
 def txpower_cfg_value(nics):
     """Tresc wpisu wifi_txpower dla sekcji [common] albo None, gdy nie ma czego
     rozdzielac. 'off' = karta tylko do odbioru, None = moc wedlug sterownika
     (ustawiamy ja parametrem modulu, a nie tutaj - patrz TX_POWER_SYSFS)."""
-    rx_only = [n for n in RX_ONLY_NICS if n in nics]
+    rx_only = rx_only_nics(nics)
     if not rx_only or len(nics) < 2 or len(rx_only) >= len(nics):
         return None  # jedna karta albo same rx-only: nie bylo by czym nadawac
     entries = ", ".join(f"'{n}': " + ("'off'" if n in rx_only else "None")
@@ -847,7 +858,7 @@ def apply_tx_split(nics, say):
     if not ensure_tx_split(nics):
         return False
 
-    rx_only = ", ".join(n for n in RX_ONLY_NICS if n in nics)
+    rx_only = ", ".join(sorted(rx_only_nics(nics)))
     say(f"config: {rx_only} tylko do odbioru (wifi_txpower = 'off')", "warn")
     run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
     time.sleep(3)
@@ -3227,6 +3238,23 @@ def ensure_nic_names():
     return nics
 
 
+def free_ifname(taken=()):
+    """Wolna nazwa wlanN dla karty, ktora wlasnie stracila przydzial. Jadro nie
+    zabierze jej nazwy samo - interfejs zostaje przy tej, ktora ma, a ta jest
+    wlasnie potrzebna innej karcie. Nazw z NIC_NAMES nie ruszamy, bo to sa
+    przydzialy, a nie nazwy zastepcze."""
+    try:
+        busy = {p.name for p in Path("/sys/class/net").iterdir()}
+    except OSError:
+        busy = set()
+    busy.update(taken)
+    busy.update(NIC_NAMES)
+    for i in range(64):
+        if f"wlan{i}" not in busy:
+            return f"wlan{i}"
+    return ""
+
+
 def _default_say(msg, status=None):
     """Domyslne 'gadanie' funkcji, ktore dzialaja i z TUI, i z konsoli - ekrany
     curses podaja wlasne say(tekst, status), instalator zostaje przy log()."""
@@ -3299,6 +3327,7 @@ def assign_nic_role(nic, target_name, say=_default_say):
     # Dostaje wiec nazwe po tej karcie, a jak ta nie miala jeszcze zadnej -
     # pierwsza wolna. Gdy wolnej nie ma, wypada z regul i zostanie przy wlanX.
     spare = old_name if old_name in NIC_NAMES else None
+    dropped = []
     for anchor in [a for a, name in list(by_anchor.items())
                    if name == target_name and a != mine]:
         if not spare:
@@ -3307,6 +3336,7 @@ def assign_nic_role(nic, target_name, say=_default_say):
             by_anchor[anchor], spare = spare, None
         else:
             del by_anchor[anchor]
+            dropped.append(anchor)
 
     was_active = service_active()
     if was_active:
@@ -3317,6 +3347,20 @@ def assign_nic_role(nic, target_name, say=_default_say):
     # obsluguje zwykle nadanie nazwy i zamiane rol miedzy dwiema kartami.
     wanted = {n: by_anchor[anchors[n]] for n in nics
               if anchors.get(n) and anchors[n] in by_anchor}
+
+    # Karta, ktora stracila przydzial i jest wpieta, MUSI oddac swoja nazwe:
+    # to wlasnie jej chce teraz inna karta, a jadro nie pozwoli na dwa
+    # interfejsy o tym samym imieniu i cala zmiana staneloby na "nazwa zajeta".
+    # Dzieje sie tak przy trzech kartach na dwie role - wtedy nie ma dla niej
+    # wolnego przydzialu i wraca do wlanX.
+    by_anchor_nic = {a: n for n, a in anchors.items() if a}
+    for anchor in dropped:
+        loser = by_anchor_nic.get(anchor)
+        spare_name = free_ifname(set(wanted.values())) if loser else ""
+        if spare_name:
+            wanted[loser] = spare_name
+            say(f"{loser} traci przydzial - wraca do {spare_name}", "warn")
+
     done = apply_nic_renames(wanted, say)
 
     nics = wfb_nics()
@@ -3868,7 +3912,7 @@ def collect_checks():
     # w srodku pomija te oznaczone jako rx-only (rx_only_wlan_ids). Jedynym
     # wiarygodnym dowodem jest wiec to, czy z karty cokolwiek wychodzi -
     # a przy wzmacniaczu jednokierunkowym "nadaje nie ta karta" to zepsuty lot.
-    rx_only = {n for n in RX_ONLY_NICS if n in nics}
+    rx_only = set(rx_only_nics(nics))
     if rx_only:
         traffic = nic_traffic(nics)
         sending = {n: traffic[n][1] for n in rx_only if traffic.get(n, (0, 0))[1] > 0}
