@@ -2554,6 +2554,21 @@ def step_driver():
         )
         dkms_conf.write_text(content)
 
+        # Tag v5.2.20 w svpcom/rtl8812au bywa przesuwany na nowsze commity
+        # w gorę (bez zmiany nazwy taga). Jeden z takich commitow dodal w
+        # core/rtw_br_ext.c blok "#if LINUX_VERSION_CODE >= KERNEL_VERSION(...)"
+        # pod kernele 7.1+, ale zapomnial dolaczyc <linux/version.h> - bez
+        # tego makra sa nieokreslone i build pada bledem "missing binary
+        # operator". Dopisujemy brakujacy include, jesli go nie ma.
+        br_ext = Path(src_dir) / "core" / "rtw_br_ext.c"
+        br_ext_src = br_ext.read_text()
+        if "#include <linux/version.h>" not in br_ext_src:
+            br_ext.write_text(br_ext_src.replace(
+                "#ifdef __KERNEL__\n\t#include <linux/if_arp.h>",
+                "#ifdef __KERNEL__\n\t#include <linux/version.h>\n\t#include <linux/if_arp.h>",
+                1,
+            ))
+
         # dkms-install.sh robi "cp -r $(pwd) /usr/src/rtl8812au-5.2.20.2" -
         # jesli ten katalog juz istnieje (np. po wczesniejszej nieudanej
         # probie), cp wklei tam nowe zrodla jako PODFOLDER zamiast nadpisac,
