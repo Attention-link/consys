@@ -4248,16 +4248,16 @@ def prompt_line(stdscr, y, label, default):
     return raw if raw else default
 
 
-def radio_settings_screen(stdscr):
-    """Region i moc nadawania. Kanalu sie tu NIE ustawia - jest od tego osobny
-    ekran ze skanem pasma i trybem automatycznym. Dwa miejsca do zmiany tej
-    samej rzeczy to prosta droga do tego, ze jedno pokazuje co innego niz
-    drugie. Ekran otwiera sie z listy kanalow klawiszem 'r'."""
+def region_screen(stdscr):
+    """Region (CRDA). Kanalu sie tu NIE ustawia - jest od tego osobny ekran ze
+    skanem pasma i trybem automatycznym, a moc nadawania ma wlasny ekran w
+    menu glownym ('Moc nadawania (TX)'). Dwa miejsca do zmiany tej samej
+    rzeczy to prosta droga do tego, ze jedno pokazuje co innego niz drugie.
+    Ekran otwiera sie z listy kanalow klawiszem 'r'."""
     stdscr.clear()
-    draw_header(stdscr, f"WFB-NG [{ROLE}] - region i moc nadawania")
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - region")
 
     channel, cur_region = wfb_effective_common()
-    cur_tx_power = parse_tx_power()
     freq = channel_freq(channel)
 
     safe_addstr(stdscr, 2, 2, f"Puste pole = zostaw obecna wartosc (Enter). Rola: {ROLE}.")
@@ -4266,31 +4266,9 @@ def radio_settings_screen(stdscr):
 
     region = prompt_line(stdscr, 5, "Region (CRDA)", cur_region)
 
-    # Pulap jest twardy juz na wejsciu, a nie dopiero przy zapisie: gdyby menu
-    # przyjmowalo 63 i dopiero clamp_tx_power scinal to po cichu do 56,
-    # uzytkownik widzialby w potwierdzeniu inna liczbe niz ta, ktora naprawde
-    # trafia do sterownika.
-    tx_power = ""
-    def tx_ok(v):
-        return v.isdigit() and 0 <= int(v) <= TX_POWER_CAP
-
-    while not tx_ok(tx_power):
-        tx_power = prompt_line(stdscr, 7,
-                               f"Moc nadawania TX (0-{TX_POWER_CAP}, {TX_POWER_CAP}=max)",
-                               cur_tx_power)
-        if not tx_ok(tx_power):
-            safe_addstr(stdscr, 8, 2,
-                        f"Podaj liczbe 0-{TX_POWER_CAP} (0 = kalibracja EEPROM). Gorne "
-                        f"{TX_POWER_MAX - TX_POWER_CAP} stopni skali jest zablokowane -",
-                        color_for("fail"))
-            safe_addstr(stdscr, 9, 2,
-                        "dongiel na pelnej mocy potrafi wylaczyc Pi przez pobor pradu z USB.",
-                        color_for("fail"))
-
     country, ranges = reg_domain_ranges()
     span = channel_span(freq)
-    lines = [f"Region: {region}   moc TX: {tx_power}/{TX_POWER_CAP}"
-             f" (pulap {TX_POWER_CAP} z {TX_POWER_MAX} = 90% skali)",
+    lines = [f"Region: {region}",
              f"Kanal zostaje: {channel}" + (f" ({freq} MHz)" if freq else ""),
              ""]
     # Kanal spoza pasma dozwolonego w regionie = karta w ogole nie nadaje,
@@ -4306,8 +4284,6 @@ def radio_settings_screen(stdscr):
         return
 
     save_common_config(channel, region)
-    write_modprobe_wfb(tx_power)
-    live_ok = apply_tx_power_live(tx_power)
     ensure_video_service_type(wfb_nics())  # gdyby config byl jeszcze sprzed migracji
     ensure_tx_split(wfb_nics())            # restart uslugi i tak jest ponizej
     _common_cache["val"] = None
@@ -4316,14 +4292,59 @@ def radio_settings_screen(stdscr):
     code3, out3 = run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
 
     if code2 == 0 and code3 == 0:
-        popup(stdscr, "Zapisano",
-              [f"wifibroadcast@{ROLE} uruchomiona.",
-               "moc zastosowana natychmiast" if live_ok
-               else "moc zapisana, zadziala po nast. zaladowaniu modulu"],
-              status="ok" if live_ok else "warn")
+        popup(stdscr, "Zapisano", [f"wifibroadcast@{ROLE} uruchomiona."], status="ok")
     else:
         popup(stdscr, "Zapisano, ale usluga zglosila blad",
               [(out2 + " " + out3)[:70]], status="fail")
+
+
+def tx_power_screen(stdscr):
+    """Sama moc nadawania - bez regionu, ten ma wlasny ekran ('r' z listy
+    kanalow). Zapis idzie od razu na zywo przez sysfs, wiec restart uslugi
+    wifibroadcast tu nie jest potrzebny - patrz apply_tx_power_live."""
+    stdscr.clear()
+    draw_header(stdscr, f"WFB-NG [{ROLE}] - moc nadawania (TX)")
+
+    cur_tx_power = parse_tx_power()
+
+    safe_addstr(stdscr, 2, 2, f"Puste pole = zostaw obecna wartosc (Enter). Rola: {ROLE}.")
+
+    # Pulap jest twardy juz na wejsciu, a nie dopiero przy zapisie: gdyby menu
+    # przyjmowalo 63 i dopiero clamp_tx_power scinal to po cichu do 56,
+    # uzytkownik widzialby w potwierdzeniu inna liczbe niz ta, ktora naprawde
+    # trafia do sterownika.
+    tx_power = ""
+    def tx_ok(v):
+        return v.isdigit() and 0 <= int(v) <= TX_POWER_CAP
+
+    while not tx_ok(tx_power):
+        tx_power = prompt_line(stdscr, 4,
+                               f"Moc nadawania TX (0-{TX_POWER_CAP}, {TX_POWER_CAP}=max)",
+                               cur_tx_power)
+        if not tx_ok(tx_power):
+            safe_addstr(stdscr, 5, 2,
+                        f"Podaj liczbe 0-{TX_POWER_CAP} (0 = kalibracja EEPROM). Gorne "
+                        f"{TX_POWER_MAX - TX_POWER_CAP} stopni skali jest zablokowane -",
+                        color_for("fail"))
+            safe_addstr(stdscr, 6, 2,
+                        "dongiel na pelnej mocy potrafi wylaczyc Pi przez pobor pradu z USB.",
+                        color_for("fail"))
+
+    lines = [f"Moc TX: {tx_power}/{TX_POWER_CAP}"
+             f" (pulap {TX_POWER_CAP} z {TX_POWER_MAX} = 90% skali)"]
+
+    if popup(stdscr, "Zapisac?", lines, buttons=("Tak", "Nie")) != 0:
+        return
+
+    write_modprobe_wfb(tx_power)
+    live_ok = apply_tx_power_live(tx_power)
+
+    if live_ok:
+        popup(stdscr, "Zapisano", ["moc zastosowana natychmiast"], status="ok")
+    else:
+        popup(stdscr, "Zapisano",
+              ["modul niezaladowany - moc zadziala po nast. zaladowaniu modulu"],
+              status="warn")
 
 
 def show_pairing_code_screen(stdscr, code):
@@ -6294,7 +6315,7 @@ def channel_screen(stdscr):
             safe_addstr(stdscr, h - 3, 2, "* = kanal uzywany teraz. Skan zmierzy, "
                                           "na ktorym kanale jest najciszej.", curses.A_DIM)
         safe_addstr(stdscr, h - 1, 2, "Strzalki, Enter = ustaw zaznaczony, s = skanuj, "
-                                      "r = region i moc TX, q = powrot", curses.A_DIM)
+                                      "r = region, q = powrot", curses.A_DIM)
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -6309,7 +6330,7 @@ def channel_screen(stdscr):
         elif key in (ord("q"), ord("Q"), 27):
             return
         elif key in (ord("r"), ord("R")):
-            radio_settings_screen(stdscr)
+            region_screen(stdscr)
             channel, region = wfb_effective_common()
             ranges = reg_domain_ranges()[1]
             current = int(channel) if str(channel).isdigit() else None
@@ -7018,6 +7039,7 @@ def main_menu(stdscr):
         "Test polaczenia (sygnal, straty, ping)",
         "Test obciazeniowy (ruch jak wideo)",
         "Kanal i czestotliwosc (skan, tryb auto)",
+        "Moc nadawania (TX)",
         "Wybor modulacji (MCS)",
         "Naprawa utraconych pakietow (FEC tunelu)",
         "Uruchom weryfikacje",
@@ -7090,12 +7112,14 @@ def main_menu(stdscr):
             elif idx == 7:
                 channel_screen(stdscr)
             elif idx == 8:
-                modulation_screen(stdscr)
+                tx_power_screen(stdscr)
             elif idx == 9:
-                repair_screen(stdscr)
+                modulation_screen(stdscr)
             elif idx == 10:
-                verification_screen(stdscr)
+                repair_screen(stdscr)
             elif idx == 11:
+                verification_screen(stdscr)
+            elif idx == 12:
                 if confirm_exit(stdscr):
                     break
         elif key in (ord("r"), ord("R")):
