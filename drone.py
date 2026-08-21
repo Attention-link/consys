@@ -162,6 +162,18 @@ RX_ONLY_NICS = ["drone_RX"]
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
 
+# WFB_NICS w /etc/default/wifibroadcast wymienia obie karty na sztywno
+# ("drone_RX drone_TX"). wfb-server odpala sie TYLKO gdy WSZYSTKIE wymienione
+# tam karty istnieja - jak jednej zabraknie (wypiety dongiel), caly proces
+# odmawia startu bledem "Device not found" i milknie TAKZE ta karta, ktora
+# nadal jest podpieta. Efekt: wypiecie drone_RX zabija rowniez nadawanie z
+# drone_TX, mimo ze fizycznie caly czas tkwi w porcie. Regula udev ponizej
+# (patrz ensure_hotplug_rule, sync_wfb_nics) na kazde dodanie/usuniecie karty
+# przepisuje WFB_NICS na to, co NAPRAWDE jest podpiete, i restartuje usluge -
+# ocalala karta wraca do nadawania w kilka sekund zamiast milczec w nieskonczonosc.
+HOTPLUG_RULES = Path("/etc/udev/rules.d/71-wfb-hotplug.rules")
+HOTPLUG_FLAG = "--nic-hotplug"
+
 # Ewidencja kart: co, kiedy i w ktorym gniezdzie USB widzielismy ostatnio.
 # Bez niej wypieta karta znika bez sladu - system widzi tylko "jest 1 z 2" i nie
 # ma jak powiedziec, KTORA zniknela ani w jakim porcie siedziala, bo nieobecny
@@ -3185,6 +3197,75 @@ def write_name_rules(by_anchor):
     return True
 
 
+def hotplug_rules_text():
+    """RUN+= jest wolane przez udev synchronicznie, wiec 'systemd-run --no-block'
+    zeby nie trzymac kolejki zdarzen na czas trwania restartu uslugi."""
+    return (
+        "# generowane przez skrypt wfb - nie edytuj recznie\n"
+        "# po kazdym dodaniu/usunieciu karty drone_RX albo drone_TX odswieza\n"
+        "# WFB_NICS i restartuje usluge - patrz sync_wfb_nics() w drone.py\n"
+        'SUBSYSTEM=="net", KERNEL=="drone_*", ACTION=="add", '
+        f'RUN+="/usr/bin/systemd-run --no-block --quiet {sys.executable} {SCRIPT_PATH} {HOTPLUG_FLAG}"\n'
+        'SUBSYSTEM=="net", KERNEL=="drone_*", ACTION=="remove", '
+        f'RUN+="/usr/bin/systemd-run --no-block --quiet {sys.executable} {SCRIPT_PATH} {HOTPLUG_FLAG}"\n'
+    )
+
+
+def ensure_hotplug_rule():
+    txt = hotplug_rules_text()
+    if HOTPLUG_RULES.exists() and HOTPLUG_RULES.read_text() == txt:
+        return False
+    HOTPLUG_RULES.parent.mkdir(parents=True, exist_ok=True)
+    HOTPLUG_RULES.write_text(txt)
+    run(["udevadm", "control", "--reload-rules"])
+    return True
+
+
+def wfb_nics_defaults():
+    """Karty aktualnie wpisane w WFB_NICS (kolejnosc z pliku)."""
+    if not WFB_DEFAULTS.exists():
+        return []
+    m = re.search(r'^WFB_NICS="([^"]*)"', WFB_DEFAULTS.read_text(), re.M)
+    return m.group(1).split() if m else []
+
+
+def write_wfb_nics(nics):
+    """Podmienia WFB_NICS na liste podana - kolejnosc wg NIC_NAMES, zeby plik
+    nie skakal bez powodu przy kazdym wywolaniu."""
+    if not WFB_DEFAULTS.exists() or not nics:
+        return False
+    ordered = [n for n in NIC_NAMES if n in nics] + [n for n in nics if n not in NIC_NAMES]
+    txt = WFB_DEFAULTS.read_text()
+    new_txt, count = re.subn(r'^WFB_NICS=".*"$', f'WFB_NICS="{" ".join(ordered)}"', txt, flags=re.M)
+    if count == 0 or new_txt == txt:
+        return False
+    WFB_DEFAULTS.write_text(new_txt)
+    return True
+
+
+def sync_wfb_nics():
+    """Wolane z reguly udev (ensure_hotplug_rule) po kazdym dodaniu/usunieciu
+    karty drone_RX/drone_TX. Patrz komentarz przy HOTPLUG_RULES: bez tego
+    zniknieciecie jednej karty zabijaloby rowniez te, ktora zostala podpieta."""
+    nics = wfb_nics()
+    current = wfb_nics_defaults()
+    if sorted(nics) == sorted(current):
+        return
+    if not write_wfb_nics(nics):
+        return
+    log(f"    WFB_NICS: {' '.join(current) or '(brak)'} -> {' '.join(nics) or '(brak)'}")
+    run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
+
+
+def hotplug_run():
+    """Tryb bez TUI wolany przez regule udev (HOTPLUG_FLAG). Tylko WFB_NICS +
+    restart - zadnego innego sprzatania, zeby zdazyc, zanim ktos zauwazy
+    przerwe w odbiorze na gs."""
+    log(f"==> Hotplug {ROLE} ({HOTPLUG_FLAG})")
+    sync_wfb_nics()
+    return 0
+
+
 def rename_nic(old, new):
     """Jadro pozwala zmienic nazwe tylko interfejsowi w stanie DOWN."""
     run(["ip", "link", "set", old, "down"])
@@ -3223,6 +3304,7 @@ def ensure_nic_names():
 
     by_anchor, per_nic = plan_nic_names(nics)
     write_name_rules(by_anchor)  # zeby przetrwalo reboot i ponowne wpiecie dongla
+    ensure_hotplug_rule()  # zeby wypiecie jednej karty nie usypialo drugiej
     todo = [(nic, name) for nic, name in per_nic.items() if nic != name]
     if not todo:
         return nics
@@ -3704,6 +3786,11 @@ def detect_nics_startup():
         nics = wfb_nics()
 
     nics = ensure_nic_names()
+
+    # WFB_NICS moze byc za waskie (np. z instalacji na jednej karcie, zanim
+    # dolozono druga) - sam restart nizej tego nie naprawi, bo znowu przeczyta
+    # ten sam plik. sync_wfb_nics() dopisuje brakujace karty PRZED restartem.
+    sync_wfb_nics()
 
     for nic in nics:
         d = nic_details(nic)
@@ -7354,6 +7441,13 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == AUTOSTART_FLAG:
         require_root()
         sys.exit(autostart_run())
+
+    # Tryb wolany z reguly udev przy kazdym dodaniu/usunieciu karty drone_RX
+    # albo drone_TX (patrz HOTPLUG_RULES) - ma byc szybki, wiec zadnego setupu
+    # ani wykrywania sterownika, tylko WFB_NICS + restart.
+    if len(sys.argv) >= 2 and sys.argv[1] == HOTPLUG_FLAG:
+        require_root()
+        sys.exit(hotplug_run())
 
     # PRZED require_root i przed autostartem: na cudzym Pi nie mamy tu nic do
     # roboty, a kazdy dalszy krok (install_autostart, setup, restart uslugi)
