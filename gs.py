@@ -5661,34 +5661,39 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     row(" predkosc odbioru liczona przy dlugim GI, bo ramka jej nie niesie)")
 
     if ants:
-        # Jedna linia zamiast wiersza na kazdy tor odbiorczy karty. RSSI
-        # pojedynczego toru nie mowi nic o jakosci lacza: wfb-ng sklada strumien
-        # z tego, ktory akurat slyszy lepiej, i tak samo liczona jest ocena na
-        # gorze ekranu. Rozbicie na anteny zostaje w zapisie do pliku (kolumna
-        # anteny_rssi) - tam przydaje sie przy ustawianiu anten.
+        # Osobny wiersz na KAZDY tor odbiorczy (karta + antena), a nie tylko
+        # zlozony wynik - przy dwoch oddzielnych kartach (np. RX-only i TX-only
+        # na dronie) trzeba widziec sile sygnalu tam, gdzie faktycznie sie
+        # sluchamy, a nie jedna uśrednioną liczbę. wfb-ng i tak sklada strumien
+        # z toru, ktory akurat slyszy lepiej - ten ma dopisek "najlepsza".
         section(f"Sygnal odbierany z {PEER_NAME}")
-        best = max((a for a in ants if a["rssi"]), key=lambda a: a["rssi"][1],
-                   default=None)
-        if not best:
+        with_rssi = [a for a in ants if a["rssi"]]
+        best = max(with_rssi, key=lambda a: a["rssi"][1], default=None)
+        if not with_rssi:
             row("brak danych o sygnale - ramki przychodza bez statystyk anten", "warn")
-        else:
-            rssi, snr = best["rssi"], best["snr"]
+        for a in ants:
+            label = a["label"]
+            if not a["rssi"]:
+                row(f"{label:<16}brak statystyk RSSI", "warn")
+                continue
+            rssi, snr = a["rssi"], a["snr"]
             st, txt = rssi_grade(rssi[1])
-            row(f"RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
-                f"{meter(rssi[1], -90, -40)}  sila {txt}", st)
+            mark = "  <- najlepsza" if a is best and len(with_rssi) > 1 else ""
+            row(f"{label:<16}RSSI {rssi[0]:>5.0f}/{rssi[1]:>5.0f}/{rssi[2]:>5.0f} dBm  "
+                f"{meter(rssi[1], -90, -40)}  sila {txt}{mark}", st)
             if snr:
                 sst, stxt = snr_grade(snr[1])
-                row(f"SNR  {snr[0]:>5.0f}/{snr[1]:>5.0f}/{snr[2]:>5.0f} dB   "
+                row(f"{'':<16}SNR  {snr[0]:>5.0f}/{snr[1]:>5.0f}/{snr[2]:>5.0f} dB   "
                     f"{meter(snr[1], 0, 40)}  {stxt}", sst)
             # bez licznika ramek: statystyki anten przychodza osobno dla kazdego
             # strumienia, wiec liczba z jednego wiersza nie jest calym ruchem -
             # ten jest ponizej, w sekcji odbioru
-            where = f"{best['freq']} MHz" if best["freq"] else ""
-            if best["mcs"] is not None:
-                where += ("   " if where else "") + f"MCS {best['mcs']}"
+            where = f"{a['freq']} MHz" if a["freq"] else ""
+            if a["mcs"] is not None:
+                where += ("   " if where else "") + f"MCS {a['mcs']}"
             if where:
-                row(f"kanal  {where}")
-            row("(min / srednia / max w ostatniej sekundzie)")
+                row(f"{'':<16}kanal  {where}")
+        row("(min / srednia / max w ostatniej sekundzie)")
 
     # Bez podzialu na wideo / mavlink / tunel: to jedno lacze IP i moze nim isc
     # cokolwiek, wiec liczy sie suma. Nazwa strumienia mowi tylko, ktorym
