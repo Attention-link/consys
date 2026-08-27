@@ -4077,6 +4077,14 @@ def draw_header(stdscr, title):
     h, w = stdscr.getmaxyx()
     safe_addstr(stdscr, 0, 0, " " * w, curses.color_pair(4))
     safe_addstr(stdscr, 0, 2, title, curses.color_pair(4) | curses.A_BOLD)
+    # Kod parowania (albo skad wziete sa klucze, gdy kodu nie ma) na kazdym
+    # ekranie - zeby dalo sie go poredniczo porownac z drugim urzadzeniem bez
+    # wchodzenia w menu "Klucze i parowanie".
+    mode, code = key_mode()
+    tag = f"kod parowania: {format_pairing_code(code)}" if code else f"klucze: {mode}"
+    x = w - len(tag) - 2
+    if x > len(title) + 4:
+        safe_addstr(stdscr, 0, x, tag, curses.color_pair(4))
 
 
 def pause(stdscr, msg="Nacisnij dowolny klawisz, aby wrocic..."):
@@ -5569,8 +5577,20 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
     we_tx = injected > 0 or any(tx > 0 for _rx, tx in traffic.values())
     one_way = heard and sent >= GRADE_MIN_PINGS and recv == 0
 
+    # "Slyszymy" cos, co pasuje do formatu ramki wfb-ng, ale ANI JEDNA sie nie
+    # rozszyfrowala i ani jedna nie dala statystyk anteny (RSSI). To NIE jest
+    # to samo, co "heard" powyzej - realny, choc slaby sygnal zawsze przepusci
+    # czesc ramek i da choc jedno RSSI. Same bledne/nieodszyfrowane od poczatku
+    # testu to podrecznikowy obraz niezgodnych kluczy/parowania, a nie zerwanego
+    # kierunku - bez tego ekran kazal szukac anteny RX u drugiej strony, choc
+    # naprawde nic tu sie nie deszyfruje.
+    keys_mismatch = (not ants and run.totals["rx"] >= GRADE_MIN_PACKETS
+                      and run.totals["bad"] >= run.totals["rx"])
+
     overall = worst_status([s for s in (rssi_st, run_loss_st, snr_st, run_ping_st) if s])
-    if not ants and rx_pps_total <= 0 and not rtt:
+    if keys_mismatch:
+        overall, overall_txt = "fail", "NIEZGODNE KLUCZE"
+    elif not ants and rx_pps_total <= 0 and not rtt:
         overall, overall_txt = "fail", "BRAK ODBIORU"
     elif one_way:
         overall, overall_txt = "fail", ("TYLKO W DOL" if we_tx else "NIE NADAJEMY")
@@ -5605,7 +5625,7 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
         row("(ocena strat wlaczy sie po kilkunastu sekundach - tyle trzeba, zeby "
             "liczby cokolwiek znaczyly)")
 
-    if overall == "fail" and not ants and rx_pps_total <= 0:
+    if overall == "fail" and not ants and rx_pps_total <= 0 and not keys_mismatch:
         row("Nic nie przychodzi z drugiej strony. Sprawdz po obu stronach: ten sam kanal,", "fail")
         row("ten sam odcisk kluczy, wlaczona usluga i moc TX wieksza od zera.", "fail")
         # Bez kamery jedynym ruchem sa odpowiedzi na nasz ping, wiec zerwany
@@ -5617,7 +5637,15 @@ def link_test_lines(metrics, api_error, nics, used, traffic, ping, worst, run, e
         row(f"Zeby je rozroznic, odpal na {PEER_NAME} test obciazeniowy - on nadaje")
         row("sam z siebie, nie musi niczego odbierac.")
 
-    if one_way and we_tx:
+    if keys_mismatch:
+        row(f"Karty lapia ramki pasujace do formatu wfb-ng, ale ANI JEDNA sie nie"
+            f" rozszyfrowala ({run.totals['bad']:.0f} z {run.totals['rx']:.0f}) i"
+            " zadna nie dala statystyk anteny.", "fail")
+        row(f"To nie slaby sygnal ani zerwany kierunek - klucze/parowanie miedzy"
+            f" nami a {PEER_NAME} sie nie zgadzaja.", "fail")
+        row("Sprawdz na OBU stronach: menu -> Klucze i parowanie -> odcisk kluczy")
+        row("musi byc identyczny; jak nie jest - sparuj urzadzenia ponownie.")
+    elif one_way and we_tx:
         row(f"Slychac {PEER_NAME}, ale nie wrocila ANI JEDNA nasza wiadomosc"
             f" ({recv} z {sent} pingow).", "fail")
         row("Lacze dziala TYLKO W DOL: to, co wysylamy stad, do niego nie dociera.", "fail")
