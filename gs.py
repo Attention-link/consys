@@ -6,15 +6,18 @@ RTL8812AU) robi caly setup: pakiety systemowe, sterownik karty, klucze
 szyfrujace, /etc/wifibroadcast.cfg, usluge systemd. Kolejne uruchomienia
 (setup juz gotowy) od razu otwieraja konfigurator/weryfikator.
 
-Gs ma JEDNA karte, dron dwa dongle (EXPECTED_NICS). Kazdy start sprawdza,
-czy karta jest widoczna, przepieta pod nasz sterownik, w trybie monitor na
-wlasciwym kanale i czy faktycznie przepuszcza ruch.
+Gs ma zwykle JEDNA karte, dron dwa dongle (EXPECTED_NICS to minimum - wpiac
+mozna dowolnie wiecej). Kazdy start sprawdza, czy karty sa widoczne,
+przepiete pod nasz sterownik, w trybie monitor na wlasciwym kanale i czy
+faktycznie przepuszczaja ruch.
 
-Karta dostaje stala nazwe (NIC_NAMES: gs_wfb) zamiast wlanX - przypieta regula
-udev do MAC-a karty, wiec ta sama karta ma zawsze te sama nazwe, niezaleznie
-od portu USB. Jedna nazwa, bo gs ma jedna karte i ta sama karta odbiera wideo
-i nadaje mavlink/RC w gore - nie ma tu podzialu na RX i TX (na dronie jest:
-patrz NIC_ROLES i ekran "Przypisanie rol kart").
+Karty dostaja stale nazwy zamiast wlanX - przypiete regula udev do MAC-a
+karty, wiec ta sama karta ma zawsze te sama nazwe, niezaleznie od portu USB.
+Nazwa niesie role: gs_TXRX nadaje i odbiera (tak startuje jedyna karta gs,
+w starszych instalacjach nazwana gs_wfb), gs_TX nadaje, gs_RX tylko slucha;
+kolejne karty tej samej roli dostaja numer (gs_RX2...). Role KAZDEJ karty
+ustawia sie przelacznikiem na ekranie "Karty na zywo", ktory pokazuje tez chip
+i urzadzenie kazdej wpietej karty.
 
 Menu pokazuje tez, w ktorym gniezdzie USB siedzi kazda karta, a po wypieciu
 dongla mowi, KTORA karta zniknela i z ktorego gniazda - z ewidencji w
@@ -57,7 +60,7 @@ PEER_IP = "10.5.0.2"  # adres drugiej strony (drone) w tunelu
 PEER_NAME = "drone"
 SSH_PORT = 22
 
-EXPECTED_NICS = 1  # gs: jedna karta RTL (dron nadaje z dwoch, tu wystarczy jedna)
+EXPECTED_NICS = 1  # MINIMUM kart na gs (jedna TX+RX); wiecej wolno - role w menu
 
 DRIVER_TAG = "v5.2.20"
 APT_RELEASE = "master"
@@ -115,27 +118,20 @@ AUTOSTART_UNIT_NAME = f"wfb-{ROLE}-autostart.service"
 AUTOSTART_UNIT = Path("/etc/systemd/system") / AUTOSTART_UNIT_NAME
 AUTOSTART_FLAG = "--autostart"
 
-# Zamiast wlanX (numer zalezy od kolejnosci wykrycia i potrafi sie zmienic
-# miedzy bootami) dajemy karcie stala, czytelna nazwe. Nazwa jest przypieta do
-# MAC-a karty, wiec jedzie razem z donglem - takze po przelozeniu do innego
-# portu USB. Gs ma JEDNA karte i ta jedna karta robi oba kierunki (odbiera
-# wideo, nadaje mavlink/RC w gore) - dlatego jedna nazwa bez RX/TX, bo nie ma
-# tu czego rozrozniac. Na dronie, gdzie karty sa dwie, sa to drone_RX/drone_TX.
-NIC_NAMES = ["gs_wfb"]
-
-# Rola przypisana do KAZDEJ nazwy: "tx" = nadaje, "rx" = tylko odbiera,
-# "txrx" = oba kierunki. Rola siedzi w nazwie, a nazwa jest przypieta udevem do
-# MAC-a karty - dzieki temu "przypisanie karty do roli" to po prostu nadanie jej
-# wlasciwej nazwy (assign_nic_role), a przypisanie przezywa reboot i przelozenie
-# dongla do innego portu USB. Gs ma jedna karte robiaca oba kierunki, wiec jest
-# tu jedna pozycja; na dronie sa dwie: drone_TX (nadaje) i drone_RX (slucha).
-NIC_ROLES = {"gs_wfb": "txrx"}
-
-# Nazwy kart DRUGIEJ roli - po nich poznajemy, ze skrypt odpalono na cudzym Pi
-# (patrz refuse_wrong_role). Nazwy sa przypiete do MAC-ow przez udev, wiec
-# drone_RX na maszynie znaczy "to Pi bylo urzadzane jako dron", a nie "ktos
-# przypadkiem tak nazwal interfejs".
-PEER_NIC_NAMES = ["drone_RX", "drone_TX"]
+# Karty dostaja stale, czytelne nazwy zamiast wlanX (numer zalezy od kolejnosci
+# wykrycia i potrafi sie zmienic miedzy bootami). Nazwa jest przypieta regula
+# udev do MAC-a karty, wiec jedzie razem z donglem - takze po przelozeniu do
+# innego portu USB - i niesie ROLE karty: gs_TX nadaje, gs_RX tylko odbiera,
+# gs_TXRX robi oba; kolejne karty tej samej roli dostaja numer (gs_RX2...).
+# Kart moze byc dowolnie duzo, a role kazdej zmienia sie w menu ("Karty na
+# zywo", assign_nic_role) - patrz ROLE_TAGS i plan_nic_names.
+#
+# Tu tylko uklad NA START: jakie role dostaja pierwsze wpiete karty (po kolei
+# wg gniazda USB). Gs ma jedna karte, ktora odbiera wideo i nadaje mavlink/RC
+# w gore, wiec robi oba kierunki. Kazda karta ponad ten uklad dostaje
+# SPARE_NIC_ROLE (tylko odbior). Starsze instalacje maja jeszcze nazwe gs_wfb -
+# rozpoznajemy ja jako txrx (LEGACY_NIC_NAMES).
+DEFAULT_NIC_ROLES = ["txrx"]
 
 # Strumien wideo idzie w JEDNA strone: dron -> gs. Dron wpycha go do wfb-ng na
 # UDP 5602 ([drone_video] peer = 'listen://'), a gs oddaje odebrany strumien na
@@ -145,11 +141,6 @@ PEER_NIC_NAMES = ["drone_RX", "drone_TX"]
 VIDEO_UDP_PORT = 5600
 VIDEO_SENDS = False  # gs odbiera obraz; nadaje dron
 
-# Karty wylaczone z NADAWANIA (wfb-ng: wifi_txpower = 'off', "rx only cards").
-# Na gs pusto: jedna karta i jedna antena nadawczo-odbiorcza, wiec nie ma czego
-# rozdzielac. Na dronie siedzi tu drone_RX, bo tam do drugiej karty idzie
-# jednokierunkowy wzmacniacz i nadawac ma wylacznie ona.
-RX_ONLY_NICS = []
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
 
@@ -362,6 +353,159 @@ def nic_traffic(nics, window=2.0):
     return result
 
 
+# ------------------------- identyfikacja dongli USB -------------------------
+
+# Baza nazw urzadzen USB - ta sama, z ktorej lsusb bierze opisy. Rozne obrazy
+# systemu trzymaja ja w roznych miejscach; bierzemy pierwsza, ktora istnieje.
+USB_IDS_PATHS = (Path("/usr/share/misc/usb.ids"), Path("/usr/share/hwdata/usb.ids"),
+                 Path("/var/lib/usbutils/usb.ids"))
+
+# VID Realteka. Pod nim siedza ID REFERENCYJNE, ktore wstawia do EEPROM kazdy
+# producent bez wlasnego VID-u - pod 0bda:8812 kryje sie i markowa karta, i klon
+# za grosze, a moc maja zupelnie inna. Nazwy urzadzenia z takiego ID nie ma.
+REALTEK_VID = "0bda"
+
+# Chip po ID referencyjnym Realteka - dopiero gdy ani napis z karty, ani usb.ids
+# nie podaja go wprost (np. chip nowszy niz baza w systemie).
+REALTEK_PID_CHIPS = {
+    "8812": "RTL8812AU", "881a": "RTL8812AU", "881b": "RTL8812AU", "881c": "RTL8812AU",
+    "8813": "RTL8814AU", "0811": "RTL8811AU/8821AU", "0821": "RTL8821AU", "0823": "RTL8821AU",
+    "a811": "RTL8811AU", "b812": "RTL8812BU", "a81a": "RTL8812EU",
+}
+
+# Chip po sterowniku - ostatnia deska ratunku, bo jeden sterownik obsluguje cala
+# rodzine chipow. rtw88_<chip> rozpoznajemy po samej nazwie (usb_chip_txt).
+DRIVER_CHIPS = {
+    TARGET_USB_DRIVER: "RTL8812AU/8821AU/8814AU", "88XXau": "RTL8812AU/8821AU/8814AU",
+    "rtl8812au": "RTL8812AU", "8812au": "RTL8812AU", "rtl8814au": "RTL8814AU",
+    "8812eu": "RTL8812EU", "rtl88x2bu": "RTL8812BU/8822BU", "88x2bu": "RTL8812BU/8822BU",
+}
+
+WIFI_DRIVER_RE = re.compile(r"^(rtl8[0-9]|rtw8|88|8812|8814|8821|mt7|ath9k|carl9170|rt2800|rt73)", re.I)
+CHIP_RE = re.compile(r"(?:RTL|Realtek)[\s_-]?(8\d{3}[A-Z]{1,2})\b", re.I)
+# Napisy, ktore nic nie mowia o tym, kto zrobil karte - klony wpisuja wlasnie takie.
+GENERIC_USB_RE = re.compile(r"802\.11|\bnic\b|wlan|wireless|wi-?fi|realtek|rtl ?8\d{3}|adapter|^\s*$", re.I)
+
+_usb_ids_cache = {}
+
+
+def usb_ids_names(vid, pid):
+    """(producent, produkt) z bazy usb.ids albo puste napisy. Plik ma kilkaset
+    kB, wiec wynik trzymamy w pamieci - ekran kart pyta o to co pol sekundy."""
+    key = (vid, pid)
+    if key in _usb_ids_cache:
+        return _usb_ids_cache[key]
+    vendor = product = ""
+    for path in USB_IDS_PATHS:
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                in_vendor = False
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if not line.startswith("\t"):
+                        if in_vendor:
+                            break  # nastepny producent - tego produktu w bazie nie ma
+                        if line[:4].lower() == vid:
+                            vendor, in_vendor = line[4:].strip(), True
+                    elif in_vendor and not line.startswith("\t\t") and line[1:5].lower() == pid:
+                        product = line[5:].strip()
+                        break
+        except OSError:
+            continue
+        break  # pierwsza istniejaca baza wystarczy
+    _usb_ids_cache[key] = (vendor, product)
+    return vendor, product
+
+
+def usb_intf_driver_nics(port):
+    """(sterownik, [interfejsy sieciowe]) urzadzenia USB, zebrane z jego
+    interfejsow <gniazdo>:<konfiguracja>.<numer> w sysfs."""
+    driver, nics = "", []
+    try:
+        intfs = sorted(USB_DEVICES.glob(f"{port}:*"))
+    except (OSError, ValueError):
+        return driver, nics
+    for intf in intfs:
+        try:
+            if not driver and (intf / "driver").exists():
+                driver = (intf / "driver").resolve().name
+            if (intf / "net").is_dir():
+                nics += sorted(p.name for p in (intf / "net").iterdir())
+        except OSError:
+            continue
+    return driver, nics
+
+
+def usb_wifi_dongles():
+    """Dongle Wi-Fi na USB prosto z sysfs: {gniazdo: info}, po kolei gniazd.
+    Bez lsusb i bez wfb-nics - ekran kart na zywo pyta o to dwa razy na
+    sekunde, a tylko sysfs widzi karte od razu po wpieciu: zanim dostanie nazwe
+    i takze wtedy, gdy wisi pod cudzym sterownikiem albo pod zadnym.
+    info: port, vid, pid, manufacturer, product, speed, driver, nics."""
+    try:
+        ports = sorted(p.name for p in USB_DEVICES.iterdir() if ":" not in p.name)
+    except OSError:
+        return {}
+    out = {}
+    for port in ports:
+        vid, pid = _usb_attr(port, "idVendor").lower(), _usb_attr(port, "idProduct").lower()
+        if not vid:
+            continue  # kontroler albo cos, co nie jest urzadzeniem
+        driver, nics = usb_intf_driver_nics(port)
+        product = _usb_attr(port, "product")
+        wifi = (any((Path("/sys/class/net") / n / "phy80211").exists() for n in nics)
+                or WIFI_DRIVER_RE.match(driver)
+                or (vid == REALTEK_VID and pid in REALTEK_PID_CHIPS)
+                or any(mk in f"{vid}:{pid} {product}".lower() for mk in RTL_USB_MARKERS)
+                or re.search(r"802\.11|wlan", usb_ids_names(vid, pid)[1], re.I))
+        if wifi:
+            out[port] = dict(port=port, vid=vid, pid=pid, manufacturer=_usb_attr(port, "manufacturer"),
+                             product=product, speed=_usb_attr(port, "speed"), driver=driver, nics=nics)
+    return out
+
+
+def usb_chip_txt(info):
+    """(chip, skad to wiadomo). Od najpewniejszego: napis z EEPROM karty, baza
+    usb.ids, ID referencyjne Realteka, a na koniec sterownik - ten mowi tylko
+    o rodzinie, bo jeden sterownik obsluguje kilka chipow."""
+    for text, source in ((info["product"], "napis z karty"),
+                         (usb_ids_names(info["vid"], info["pid"])[1], "usb.ids")):
+        m = CHIP_RE.search(text or "")
+        if m:
+            return "RTL" + m.group(1).upper(), source
+    if info["vid"] == REALTEK_VID and info["pid"] in REALTEK_PID_CHIPS:
+        return REALTEK_PID_CHIPS[info["pid"]], "ID USB"
+    m = re.match(r"rtw88_(\d{4}[a-z]{2})$", info["driver"])
+    if m:
+        return "RTL" + m.group(1).upper(), "sterownik"
+    if info["driver"] in DRIVER_CHIPS:
+        return DRIVER_CHIPS[info["driver"]], "sterownik"
+    return "nieznany", ""
+
+
+def usb_device_txt(info):
+    """Nazwa urzadzenia albo "generic". Wygrywa wlasny napis producenta z EEPROM
+    (marka, model); potem nazwa z usb.ids - ale TYLKO dla VID-u innego niz
+    Realteka, bo pod 0bda baza opisuje chip, a nie to, kto zrobil karte."""
+    maker = "" if GENERIC_USB_RE.search(info["manufacturer"]) else info["manufacturer"]
+    product = "" if GENERIC_USB_RE.search(info["product"]) else info["product"]
+    if maker or product:
+        return f"{maker} {product}".strip()
+    if info["vid"] != REALTEK_VID:
+        vendor, db_product = usb_ids_names(info["vid"], info["pid"])
+        if vendor or db_product:
+            return f"{vendor} {db_product}".strip()
+    return "generic"
+
+
+def count_txt(n):
+    """Liczba kart do komunikatow: "1/2", gdy brakuje do minimum, a samo "3",
+    gdy jest ich tyle albo wiecej. Kart moze byc dowolnie duzo - EXPECTED_NICS
+    to tylko minimum, wiec "3/2" wygladaloby jak blad."""
+    return f"{n}/{EXPECTED_NICS}" if n < EXPECTED_NICS else str(n)
+
+
 _nic_status_cache = {"t": 0.0, "val": None}
 
 
@@ -381,18 +525,18 @@ def nic_status_summary(max_age=2.0):
     dongles = len(usb_rtl_dongles())
     remember_cards(nics)  # zeby bylo czym nazwac karte, gdy za chwile zniknie
 
-    txt = (f"Karty: {len(nics)}/{EXPECTED_NICS}"
+    txt = (f"Karty: {count_txt(len(nics))}"
            f"{' [' + ' '.join(nics) + ']' if nics else ''}"
-           f"   USB: {dongles}/{EXPECTED_NICS}"
+           f"   USB: {count_txt(dongles)}"
            f"   w usludze: {len(used)}/{len(nics)}")
 
+    # Sama liczba "1/2" nie mowi nic o tym, ktorej karty brakuje - a przy
+    # rozdziale rol to jest cala roznica miedzy "nie ma czym nadawac"
+    # a "leci bez dywersyfikacji". Nazwe bierzemy z ewidencji, bo po
+    # wypieciu nie ma juz kogo o nia zapytac.
+    gone = missing_cards_txt(nics)
     if len(nics) < EXPECTED_NICS:
         status = "fail"
-        # Sama liczba "1/2" nie mowi nic o tym, ktorej karty brakuje - a przy
-        # rozdziale rol to jest cala roznica miedzy "nie ma czym nadawac"
-        # a "leci bez dywersyfikacji". Nazwe bierzemy z ewidencji, bo po
-        # wypieciu nie ma juz kogo o nia zapytac.
-        gone = missing_cards_txt(nics)
         txt += "   <- BRAK: " + (gone if gone else "KARTY")
         if dongles > len(nics):
             txt += ", dongiel wisi na innym sterowniku"
@@ -404,6 +548,11 @@ def nic_status_summary(max_age=2.0):
     elif len(used) < len(nics):
         status = "warn"
         txt += "   <- zrestartuj usluge"
+    elif gone:
+        # Minimum jest, ale ktoras ze znanych kart zniknela - przy kilku
+        # kartach na probe to wlasnie ta, ktorej teraz szukasz.
+        status = "warn"
+        txt += "   <- BRAK: " + gone
     else:
         status = "ok"
 
@@ -769,9 +918,8 @@ def ensure_video_service_type(nics):
     and/or rx-only wlans. Use udp_proxy for such case." i systemd restartuje go
     w kolko - z zewnatrz widac tylko status "activating", a karty wygladaja na
     sprawne. Przy wiecej niz jednej karcie nadpisujemy w profilu [<rola>] cala
-    liste 'streams' z podmienionym service_type dla wideo. Na gs, z jedna
-    karta, nie robi nic - ale kod jest wspolny z drone.py, gdzie karty sa
-    dwie."""
+    liste 'streams' z podmienionym service_type dla wideo. Na gs z jedna
+    karta nie robi nic - ale wystarczy wpiac druga, zeby byl potrzebny."""
     if len(nics) < 2 or not CFG_PATH.exists():
         return False
 
@@ -801,44 +949,59 @@ def build_config(channel, region):
 
 
 def rx_only_nics(nics):
-    """Karty, ktore maja NIE nadawac: te z przydzialem rx ORAZ te bez zadnego
-    przydzialu (wlanX). Ten drugi przypadek to trzeci dongiel wpiety "na zapas":
-    wfb_tx rozklada pakiety miedzy wszystkie karty z wlaczonym nadawaniem, wiec
-    taka karta zabralaby czesc wideo torowi ze wzmacniaczem - czyli dokladnie to,
-    czemu rozdzial rol ma zapobiegac. Pusto tam, gdzie rol nie rozdzielamy."""
-    if not RX_ONLY_NICS:
-        return []
-    return [n for n in nics if n in RX_ONLY_NICS or not role_of_name(n)]
+    """Karty, ktore maja NIE nadawac: te z rola rx ORAZ te bez zadnego
+    przydzialu (wlanX). wfb-ng ma na to wartosc wifi_txpower = 'off' (w
+    master.cfg "special value for RX only cards"): taka karta jest inicjowana
+    i odbiera, ale nie trafia na liste interfejsow wfb_tx. Bez tego wfb_tx
+    rozklada pakiety miedzy wszystkie karty (mirror jest domyslnie wylaczony),
+    wiec czesc wideo wychodzilaby torem bez wzmacniacza - a karta bez
+    przydzialu to zwykle dongiel wpiety "na probe", ktory tez nie ma nadawac."""
+    return [n for n in nics if role_of_name(n) in ("", "rx")]
+
+
+def muted_nics(nics):
+    """Karty, ktore config NAPRAWDE wycisza ('off'): rx-only, ale tylko gdy jest
+    kim nadawac. Przy jednej karcie albo samych RX bezpiecznik zostawia nadawanie
+    wszystkim - lepiej nadawac torem bez wzmacniacza niz nie nadawac wcale."""
+    rx_only = rx_only_nics(nics)
+    return set(rx_only) if len(nics) >= 2 and len(rx_only) < len(nics) else set()
 
 
 def txpower_cfg_value(nics):
-    """Tresc wpisu wifi_txpower dla sekcji [common] albo None, gdy nie ma czego
-    rozdzielac. 'off' = karta tylko do odbioru, None = moc wedlug sterownika
-    (ustawiamy ja parametrem modulu, a nie tutaj - patrz TX_POWER_SYSFS)."""
-    rx_only = rx_only_nics(nics)
-    if not rx_only or len(nics) < 2 or len(rx_only) >= len(nics):
-        return None  # jedna karta albo same rx-only: nie bylo by czym nadawac
-    entries = ", ".join(f"'{n}': " + ("'off'" if n in rx_only else "None")
-                        for n in sorted(nics))
-    return "{" + entries + "}"
+    """Tresc wpisu wifi_txpower dla sekcji [common] albo None, gdy nie ma w nim
+    nic do powiedzenia. Na karte: 'off' = tylko odbior (muted_nics), liczba =
+    indeks ustawiany karcie osobno (card_power_plan: wlasna moc albo limit;
+    -indeks*100, tak wfb-ng wola 'iw set txpower fixed'), None = moc wspolna,
+    czyli parametr modulu (TX_POWER_SYSFS).
+
+    Liczby piszemy WYLACZNIE przy sterowniku z latka mocy per karta: bez niej iw
+    ustawia moc wszystkim kartom naraz i wygrywalaby ta, ktora wfb-ng ustawi
+    ostatnia. Slownik musi miec wpis dla KAZDEJ karty - inaczej wfb-ng nie wstaje."""
+    muted = muted_nics(nics)
+    powers = card_power_plan(nics) if driver_card_txpower() == "on" else {}
+    entries = {n: "'off'" if n in muted else str(-100 * powers[n]) if n in powers else "None"
+               for n in nics}
+    if all(v == "None" for v in entries.values()):
+        return None
+    return "{" + ", ".join(f"'{n}': {entries[n]}" for n in sorted(nics)) + "}"
 
 
 def ensure_tx_split(nics):
-    """Wymusza rozdzial rol kart: nadaje tylko karta spoza RX_ONLY_NICS.
-    Zwraca True, gdy config zostal zmieniony - wolajacy restartuje usluge
-    i sprawdza, czy wstala (patrz apply_tx_split)."""
+    """Wymusza wpis wifi_txpower zgodny z rolami i mocami kart: karty z rola rx
+    (i bez przydzialu) nie nadaja, karty z wlasna moca dostaja swoja. Zwraca
+    True, gdy config zostal zmieniony - wolajacy restartuje usluge i sprawdza,
+    czy wstala (patrz apply_tx_split)."""
     if not CFG_PATH.exists():
         return False
     want = txpower_cfg_value(nics)
     current = get_cfg_option("common", "wifi_txpower")
 
     if want is None:
-        # Padla karta nadawcza i zostala sama rx-only: wpis 'off' odebralby
-        # dronowi nadawanie W OGOLE. Kasujemy go - lepiej nadawac torem bez
-        # wzmacniacza niz nie nadawac wcale. Ruszamy tylko wpis w formie
-        # slownika, czyli ten, ktory sami piszemy.
-        if (RX_ONLY_NICS and nics and current
-                and current.startswith("{") and "'off'" in current):
+        # Nie ma nic do rozdzielenia ani wlasnych mocy - np. padla karta nadawcza
+        # albo wszystkim ustawiono rx, a wpis 'off' odebralby nadawanie W OGOLE.
+        # Kasujemy go; ruszamy tylko wpis w formie slownika, czyli ten, ktory
+        # sami piszemy.
+        if nics and current and current.startswith("{"):
             backup_config_once()
             return drop_cfg_option("common", "wifi_txpower")
         return False
@@ -858,8 +1021,16 @@ def apply_tx_split(nics, say):
     if not ensure_tx_split(nics):
         return False
 
-    rx_only = ", ".join(sorted(rx_only_nics(nics)))
-    say(f"config: {rx_only} tylko do odbioru (wifi_txpower = 'off')", "warn")
+    muted = muted_nics(nics)
+    if muted:
+        say(f"config: {', '.join(sorted(muted))} tylko do odbioru (wifi_txpower = 'off')", "warn")
+    elif txpower_cfg_value(nics):
+        say("config: wlasna moc kart zapisana w wifi_txpower", "warn")
+    elif nics and len(rx_only_nics(nics)) == len(nics):
+        say("config: zadna karta nie ma roli nadawczej - zdejmuje wifi_txpower,"
+            " nadaja wszystkie", "warn")
+    else:
+        say("config: zdejmuje wifi_txpower - karty nadaja z moca wspolna", "warn")
     run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
     time.sleep(3)
     if service_active():
@@ -868,7 +1039,7 @@ def apply_tx_split(nics, say):
     drop_cfg_option("common", "wifi_txpower")
     run(["systemctl", "restart", f"wifibroadcast@{ROLE}"])
     time.sleep(3)
-    say("ta wersja wfb-ng nie przyjela rozdzialu RX/TX - wycofano zmiane", "fail")
+    say("ta wersja wfb-ng nie przyjela wpisu wifi_txpower - wycofano zmiane", "fail")
     return True
 
 
@@ -924,6 +1095,211 @@ def read_tx_power_live():
         except OSError:
             return None
     return None
+
+
+# Znak latki "moc per karta" (CARD_TXPOWER_PATCH): po nim, a nie po wersji
+# sterownika, poznajemy, czy zaladowany modul umie ustawic moc jednej karcie.
+CARD_TXPOWER_PARAM = Path("/sys/module/88XXau_wfb/parameters/rtw_wfb_card_txpower")
+_card_txpower_cache = {"t": 0.0, "val": None}
+
+
+def driver_card_txpower(max_age=5.0):
+    """Czy sterownik umie moc per karta: "on" - zaladowany modul ma latke (albo
+    modul jest niezaladowany, ale zbudowany z latka, wiec wstanie z nia),
+    "reload" - zbudowany z latka, ale w pamieci siedzi jeszcze stary modul,
+    "" - sterownik bez latki.
+
+    Bez latki 'iw set txpower' na tym sterowniku ustawia moc WSZYSTKIM kartom
+    (jedna zmienna rtw_tx_pwr_idx_override) - dlatego liczby per karta trafiaja
+    do configu tylko przy "on", inaczej karty nadpisywalyby sobie moc."""
+    now = time.monotonic()
+    if _card_txpower_cache["val"] is not None and now - _card_txpower_cache["t"] < max_age:
+        return _card_txpower_cache["val"]
+    if CARD_TXPOWER_PARAM.exists():
+        state = "on"
+    else:
+        code, out = run_tool("modinfo", "-p", "88XXau_wfb")
+        built = code == 0 and CARD_TXPOWER_PARAM.name in out
+        state = ("reload" if TX_POWER_SYSFS.exists() else "on") if built else ""
+    _card_txpower_cache.update(t=now, val=state)
+    return state
+
+
+def _card_numbers(nics, field):
+    """{interfejs: liczba z ewidencji} dla pola karty ("power", "limit") - tylko
+    dla kart, ktore je maja. Liczby wisza na kotwicy karty (MAC), wiec jada z nia
+    tak jak rola. Nigdy ponad TX_POWER_CAP, cokolwiek lezaloby w pliku."""
+    cards = load_cards()
+    anchors = nic_anchors(nics)
+    out = {}
+    for nic in nics:
+        value = cards.get(anchor_key(anchors.get(nic)), {}).get(field)
+        if isinstance(value, int) and value > 0:
+            out[nic] = min(value, TX_POWER_CAP)
+    return out
+
+
+def card_powers(nics):
+    """{interfejs: wlasny indeks mocy karty} - tylko dla kart, ktore go maja."""
+    return _card_numbers(nics, "power")
+
+
+def card_limits(nics):
+    """{interfejs: limit mocy karty} - sufit, ktorego karta nie przekroczy ani
+    wlasna moca, ani wspolna (np. mocny dongiel, ktory na pelnej mocy grzeje sie
+    albo ciagnie za duzo pradu z USB)."""
+    return _card_numbers(nics, "limit")
+
+
+def shared_power_index(live=False):
+    """Moc wspolna jako liczba: zapisana w modprobe.d albo (live) z sysfs. None
+    dla 0 - to nie moc, tylko 'kalibracja EEPROM', ktorej wartosci nie znamy."""
+    txt = str((read_tx_power_live() if live else None) or parse_tx_power())
+    return int(txt) if txt.isdigit() and int(txt) > 0 else None
+
+
+def card_power_plan(nics, live=False):
+    """{interfejs: indeks mocy ustawiany tej karcie OSOBNO}. Wlasna moc zawsze,
+    ale nie ponad limit karty; karta bez wlasnej mocy dostaje swoj limit tylko
+    wtedy, gdy wspolna go przekracza - inaczej zostaje na wspolnej. Przy wspolnej
+    0 (kalibracja EEPROM) nie wiadomo, ile to jest, wiec limit scina wtedy tylko
+    wlasna moc. Z tego planu biora sie config, ustawienie na zywo i weryfikacja."""
+    powers, limits = card_powers(nics), card_limits(nics)
+    shared = shared_power_index(live)
+    plan = {}
+    for nic in nics:
+        limit = limits.get(nic, TX_POWER_CAP)
+        if nic in powers:
+            plan[nic] = min(powers[nic], limit)
+        elif shared and shared > limit:
+            plan[nic] = limit
+    return plan
+
+
+def power_meter(value, limit=None, width=20):
+    """Pasek mocy jak meter(), z kreska '|' na ostatniej kratce, na ktora pozwala
+    limit karty - zeby sufit bylo widac bez czytania liczb."""
+    bar = list(meter(value, 0, TX_POWER_CAP, width))
+    if limit and limit < TX_POWER_CAP:
+        bar[max(1, min(width, int(round(limit / TX_POWER_CAP * width))))] = "|"
+    return "".join(bar)
+
+
+def card_power_live(nic):
+    """Indeks mocy karty tak, jak widzi go sterownik ('iw dev X info' - latka
+    zwraca tam -indeks), 0 = bez nadpisania (kalibracja EEPROM), None = nie wiadomo."""
+    code, out = run_tool("iw", "dev", nic, "info")
+    m = re.search(r"txpower (-?\d+)(?:\.\d+)? dBm", out) if code == 0 else None
+    if not m:
+        return None
+    value = int(m.group(1))
+    return -value if value < 0 else 0
+
+
+def _card_key(nic):
+    """(wfb-nics, klucz karty w ewidencji) albo (None, powod odmowy) - wspolne
+    sprawdzenie dla ustawien mocy: musza trzymac sie karty (MAC), a do tego
+    dzialaja tylko ze sterownikiem z latka mocy per karta."""
+    if driver_card_txpower() != "on":
+        return None, "sterownik nie ma mocy per karta - P = przebuduj/przeladuj sterownik"
+    nics = wfb_nics()
+    if nic not in nics:
+        return None, f"karty {nic} nie ma pod wfb"
+    key = anchor_key(nic_anchors(nics).get(nic))
+    if not key:
+        return None, f"{nic} nie ma ani MAC-a, ani gniazda - nie ma gdzie zapamietac mocy"
+    return nics, key
+
+
+def _save_card_numbers(nics, key, **fields):
+    """Zapis liczb karty do ewidencji; wartosc pusta (None, 0) usuwa pole."""
+    cards = remember_cards(nics)
+    entry = dict(cards.get(key, {}))
+    for field, value in fields.items():
+        if value:
+            entry[field] = value
+        else:
+            entry.pop(field, None)
+    cards[key] = entry
+    return save_cards(cards)
+
+
+def apply_card_power_live(nic, nics):
+    """Ustawia sterownikowi moc karty wedlug card_power_plan: osobny indeks
+    (ujemna wartosc dla iw) albo 1800, ktore zdejmuje osobny indeks - w latce
+    dodatnia wartosc zeruje nadpisanie karty, a 18 to domyslny CurrentTxPwrIdx,
+    wiec 8814AU nie traci przy tym mocy. Zwraca (indeks albo None, kod, wyjscie)."""
+    target = card_power_plan(nics, live=True).get(nic)
+    code, out = run_tool("iw", "dev", nic, "set", "txpower", "fixed",
+                         str(-100 * target) if target else "1800")
+    return target, code, out
+
+
+def set_card_power(nic, power):
+    """Wlasna moc karty (1..limit karty) albo 0 = powrot do wspolnej. Zapis idzie
+    w trzy miejsca: ewidencja (moc jedzie z karta po MAC-u), config (wfb-ng
+    ustawi ja przy kazdym starcie) i od razu sterownik przez iw - bez restartu
+    uslugi, wiec link nie staje. Zwraca (ok, komunikat)."""
+    nics, key = _card_key(nic)
+    if nics is None:
+        return False, key
+    limit = card_limits(nics).get(nic, TX_POWER_CAP)
+    power = max(0, min(int(power), limit))
+    if not _save_card_numbers(nics, key, power=power):
+        return False, f"nie moge zapisac {WFB_CARDS}"
+    target, code, out = apply_card_power_live(nic, nics)
+    ensure_tx_split(nics)  # config na nastepny start uslugi; restartu nie trzeba
+    if code != 0:
+        return False, f"{nic}: moc zapisana, ale iw odmowilo: {out.strip()[:60]}"
+    if power:
+        return True, (f"{nic}: moc {power}/{TX_POWER_CAP} - tylko ta karta"
+                      + (f" (limit {limit})" if limit < TX_POWER_CAP else ""))
+    if target:
+        return True, f"{nic}: moc wspolna, ale scieta limitem do {target}"
+    return True, f"{nic}: moc wspolna ({read_tx_power_live() or '?'}/{TX_POWER_CAP})"
+
+
+def set_card_limit(nic, limit):
+    """Limit mocy karty (1..TX_POWER_CAP; TX_POWER_CAP albo 0 = bez limitu) - sufit,
+    ktorego karta nie przekroczy ani wlasna moca, ani wspolna. Wlasna moc ponad
+    nowy limit od razu schodzi do niego, zeby zapis nie obiecywal wiecej, niz
+    karta dostanie. Zapis jak w set_card_power. Zwraca (ok, komunikat)."""
+    nics, key = _card_key(nic)
+    if nics is None:
+        return False, key
+    limit = max(0, min(int(limit), TX_POWER_CAP))
+    if limit == TX_POWER_CAP:
+        limit = 0  # sufit rowny pulapowi to po prostu brak limitu
+    own = card_powers(nics).get(nic)
+    lowered = bool(limit and own and own > limit)
+    fields = {"limit": limit, **({"power": limit} if lowered else {})}
+    if not _save_card_numbers(nics, key, **fields):
+        return False, f"nie moge zapisac {WFB_CARDS}"
+    target, code, out = apply_card_power_live(nic, nics)
+    ensure_tx_split(nics)
+    if code != 0:
+        return False, f"{nic}: limit zapisany, ale iw odmowilo: {out.strip()[:60]}"
+    msg = f"{nic}: limit {limit}/{TX_POWER_CAP}" if limit else f"{nic}: bez limitu (pulap {TX_POWER_CAP})"
+    if lowered:
+        msg += f", wlasna moc {own} -> {limit}"
+    return True, msg + (f" - nadaje z {target}" if target else " - nadaje z moca wspolna")
+
+
+def reapply_card_powers():
+    """Po zmianie mocy WSPOLNEJ na zywo: karty z limitem ponizej nowej wspolnej
+    musza dostac limit osobno, a te, ktorych wspolna juz nie przekracza - wrocic
+    do niej. Bez tego limit bylby lamany az do restartu uslugi, bo wfb-ng czyta
+    config tylko przy starcie. Zwraca linijki do komunikatu (pusto, gdy nic)."""
+    if driver_card_txpower() != "on":
+        return []
+    nics = wfb_nics()
+    if not nics:
+        return []
+    for nic in nics:
+        apply_card_power_live(nic, nics)
+    ensure_tx_split(nics)  # config na nastepny start uslugi
+    plan = card_power_plan(nics, live=True)
+    return [f"osobno: {nic} = {power}/{TX_POWER_CAP}" for nic, power in sorted(plan.items())]
 
 
 def channel_freq(channel):
@@ -2518,6 +2894,250 @@ def step_rfkill():
     run_tool("rfkill", "unblock", "all")
 
 
+# ------------------------- sterownik: moc per karta (latka) -------------------------
+
+DRIVER_DKMS_NAME = "rtl8812au"
+DRIVER_DKMS_VERSION = "5.2.20.2"  # pod ta wersja rejestruje sterownik jego dkms-install.sh
+# Przebudowa z latka idzie OBOK zainstalowanego sterownika, pod inna wersja dkms:
+# stary modul zostaje, dopoki nowy sie nie skompiluje (rebuild_driver_card_txpower).
+DRIVER_DKMS_VERSION_CARD = "5.2.20.2.1"
+
+# svpcom/rtl8812au trzyma moc w JEDNEJ zmiennej calego modulu
+# (rtw_tx_pwr_idx_override), a 'iw dev X set txpower fixed -N00' wpisuje N wlasnie
+# tam - czyli zmienia moc WSZYSTKIM kartom, nie tylko X. Dodatnia wartosc trafia do
+# CurrentTxPwrIdx karty, ale ten czyta tylko kod 8814AU. Latka dodaje do danych HAL
+# karty wlasny indeks mocy (TxPwrIdxCard): niezerowy wygrywa ze wspolnym we
+# wszystkich 6 miejscach, w ktorych sterownik podmienia moc, a iw pisze juz tylko
+# do tej karty. Parametr rtw_wfb_card_txpower to znak, ze latka siedzi w module.
+# Kazda trojka (plik, stary tekst, nowy tekst) musi pasowac DOKLADNIE raz - inaczej
+# nie ruszamy niczego (card_txpower_patched).
+CARD_TXPOWER_PATCH = (
+    ("include/hal_data.h",
+     "\tu8\tCurrentTxPwrIdx;\n",
+     "\tu8\tCurrentTxPwrIdx;\n"
+     "\tu8\tTxPwrIdxCard;\t/* wfb: tx power index of this card only, 0 = module-wide */\n"),
+    ("include/drv_types.h",
+     "\t\treturn (u8)override_index;\n\treturn index;\n}\n",
+     "\t\treturn (u8)override_index;\n\treturn index;\n}\n"
+     "\n"
+     "/* wfb: per-card tx power index (iw dev X set txpower fixed -N00) wins over the\n"
+     " * module-wide rtw_tx_pwr_idx_override. A macro, because HAL_DATA_TYPE is not\n"
+     " * complete yet at this point of the header. */\n"
+     "#define get_card_tx_power_index(adapter, index) \\\n"
+     "\t(GET_HAL_DATA(adapter)->TxPwrIdxCard ? GET_HAL_DATA(adapter)->TxPwrIdxCard \\\n"
+     "\t : get_overridden_tx_power_index(index))\n"),
+    ("os_dep/linux/os_intfs.c",
+     'MODULE_PARM_DESC(rtw_tx_pwr_idx_override, "0-63 int value to force-set all power index values to");\n',
+     'MODULE_PARM_DESC(rtw_tx_pwr_idx_override, "0-63 int value to force-set all power index values to");\n'
+     "int rtw_wfb_card_txpower = 1;\n"
+     "module_param(rtw_wfb_card_txpower, int, 0444);\n"
+     'MODULE_PARM_DESC(rtw_wfb_card_txpower, "wfb: iw set txpower fixed -N00 sets index N for that card only");\n'),
+    ("os_dep/linux/ioctl_cfg80211.c",
+     "\t\trtw_tx_pwr_idx_override = -value;\n",
+     "\t\tpHalData->TxPwrIdxCard = (-value > MAX_POWER_INDEX) ? MAX_POWER_INDEX : -value;\n"),
+    ("os_dep/linux/ioctl_cfg80211.c",
+     "\t\trtw_tx_pwr_idx_override = 0;\n",
+     "\t\tpHalData->TxPwrIdxCard = 0;\n"),
+    ("os_dep/linux/ioctl_cfg80211.c",
+     "\toverride = get_overridden_tx_power_index(0);\n",
+     "\toverride = get_card_tx_power_index(padapter, 0);\n"),
+    ("hal/hal_com_phycfg.c",
+     "\tValue = get_overridden_tx_power_index(Value);\n",
+     "\tValue = get_card_tx_power_index(Adapter, Value);\n"),
+    ("hal/hal_com_phycfg.c",
+     "\tif (get_overridden_tx_power_index(0)) Value = 0;\n",
+     "\tif (get_card_tx_power_index(pAdapter, 0)) Value = 0;\n"),
+    ("hal/hal_com_phycfg.c",
+     "\t\tpowerIndex = (u32)get_overridden_tx_power_index((u8)powerIndex);\n",
+     "\t\tpowerIndex = (u32)get_card_tx_power_index(pAdapter, (u8)powerIndex);\n"),
+    ("hal/hal_com_phycfg.c",
+     "\tPowerIndex = (u32)get_overridden_tx_power_index((u8)PowerIndex);\n",
+     "\tPowerIndex = (u32)get_card_tx_power_index(pAdapter, (u8)PowerIndex);\n"),
+    ("hal/rtl8812a/rtl8812a_phycfg.c",
+     "\tpower_idx = get_overridden_tx_power_index(power_idx);\n",
+     "\tpower_idx = get_card_tx_power_index(pAdapter, power_idx);\n"),
+    ("hal/rtl8812a/rtl8812a_phycfg.c",
+     "\tPowerIndex = (u32)get_overridden_tx_power_index((u8)PowerIndex);\n",
+     "\tPowerIndex = (u32)get_card_tx_power_index(Adapter, (u8)PowerIndex);\n"),
+)
+
+
+def card_txpower_patched(texts):
+    """Latka CARD_TXPOWER_PATCH na tekstach zrodel {sciezka: tresc}. Zwraca
+    (ok, komunikat, teksty). Przy jakimkolwiek niedopasowaniu ok=False i teksty
+    NIETKNIETE - pol latki (np. pole w HAL bez makra) nie skompiluje sie albo,
+    gorzej, skompiluje sie i zadziala tylko w czesci miejsc."""
+    if any("rtw_wfb_card_txpower" in text for text in texts.values()):
+        return True, "latka mocy per karta juz nalozona", texts
+    out = dict(texts)
+    for path, old, new in CARD_TXPOWER_PATCH:
+        if path not in out:
+            return False, f"brak pliku {path} w zrodlach", texts
+        hits = out[path].count(old)
+        if hits != 1:
+            return False, (f"{path}: wzorzec latki pasuje {hits} razy zamiast 1"
+                           " (inna wersja zrodel?)"), texts
+        out[path] = out[path].replace(old, new)
+    return True, f"latka mocy per karta nalozona ({len(CARD_TXPOWER_PATCH)} zmian)", out
+
+
+def patch_driver_card_txpower(src_dir):
+    """Latka mocy per karta na sklonowanych zrodlach. Zwraca (ok, komunikat).
+    surrogateescape, bo zrodla Realteka maja komentarze w roznych kodowaniach -
+    bajty, ktorych nie ruszamy, maja wrocic do pliku dokladnie takie same."""
+    root = Path(src_dir)
+    names = sorted({p for p, _, _ in CARD_TXPOWER_PATCH})
+    try:
+        texts = {p: (root / p).read_text(encoding="utf-8", errors="surrogateescape") for p in names}
+    except OSError as e:
+        return False, f"nie moge przeczytac zrodel: {e}"
+    ok, msg, new = card_txpower_patched(texts)
+    if ok and new is not texts:
+        try:
+            for p in names:
+                (root / p).write_text(new[p], encoding="utf-8", errors="surrogateescape")
+        except OSError as e:
+            return False, f"nie moge zapisac zrodel: {e}"
+    return ok, msg
+
+
+def clone_driver_source(src_dir):
+    """Zrodla sterownika (DRIVER_TAG) do src_dir, z poprawka dkms.conf pod
+    naglowki Raspberry Pi OS. Zwraca (ok, wyjscie gita albo blad)."""
+    run(["rm", "-rf", src_dir])
+    code, out = run(["git", "clone", "-b", DRIVER_TAG, "--depth", "1",
+                     "https://github.com/svpcom/rtl8812au.git", src_dir], timeout=120)
+    if code != 0:
+        return False, out
+
+    # Raspberry Pi OS (trixie+) dzieli naglowki jadra na common+wariant.
+    # dkms.conf tego sterownika nie ustawia KBUILD_OUTPUT, wiec jego
+    # Makefile przekazuje "O=''" do sub-make, co kasuje KBUILD_OUTPUT
+    # wariantu i psuje build (blad: "auto.conf: No such file or
+    # directory"). Wymuszamy poprawna wartosc.
+    dkms_conf = Path(src_dir) / "dkms.conf"
+    try:
+        dkms_conf.write_text(dkms_conf.read_text().replace(
+            'KSRC=/lib/modules/${kernelver}/build"',
+            'KSRC=/lib/modules/${kernelver}/build KBUILD_OUTPUT=/usr/src/linux-headers-${kernelver}"',
+        ))
+    except OSError as e:
+        return False, f"dkms.conf: {e}"
+
+    # Tag v5.2.20 w svpcom/rtl8812au bywa przesuwany na nowsze commity
+    # w gore (bez zmiany nazwy taga). Jeden z takich commitow dodal w
+    # core/rtw_br_ext.c blok "#if LINUX_VERSION_CODE >= KERNEL_VERSION(...)"
+    # pod kernele 7.1+, ale zapomnial dolaczyc <linux/version.h> - bez
+    # tego makra sa nieokreslone i build pada bledem "missing binary
+    # operator". Dopisujemy brakujacy include, jesli go nie ma. Tutaj, a nie
+    # w step_driver: kazda droga budowania (swieza instalacja, powtorka bez
+    # latki, przebudowa z latka mocy) klonuje zrodla osobno.
+    br_ext = Path(src_dir) / "core" / "rtw_br_ext.c"
+    try:
+        br_ext_src = br_ext.read_text(encoding="utf-8", errors="surrogateescape")
+        if "#include <linux/version.h>" not in br_ext_src:
+            br_ext.write_text(br_ext_src.replace(
+                "#ifdef __KERNEL__\n\t#include <linux/if_arp.h>",
+                "#ifdef __KERNEL__\n\t#include <linux/version.h>\n\t#include <linux/if_arp.h>",
+                1,
+            ), encoding="utf-8", errors="surrogateescape")
+    except OSError as e:
+        return False, f"core/rtw_br_ext.c: {e}"
+    return True, out
+
+
+def dkms_driver_versions():
+    """Wersje sterownika zarejestrowane w dkms. 'dkms status' pisze to roznie
+    zaleznie od wersji dkms ("rtl8812au/5.2.20.2, ..." albo "rtl8812au, 5.2.20.2, ..."),
+    stad luzne dopasowanie."""
+    code, out = run(["dkms", "status", DRIVER_DKMS_NAME])
+    if code != 0:
+        return []
+    return sorted(set(re.findall(rf"\b{DRIVER_DKMS_NAME}[/,]\s*([0-9][^,:\s]*)", out)))
+
+
+def rebuild_driver_card_txpower(say=None):
+    """Przebudowa zainstalowanego sterownika z latka mocy per karta - dla Pi
+    zainstalowanych, zanim latka powstala. Nowy modul buduje sie OBOK starego
+    (DRIVER_DKMS_VERSION_CARD) i zastepuje go dopiero po udanej kompilacji, a gdy
+    instalacja nie wyjdzie, stary wraca na miejsce: Pi nie moze zostac bez
+    sterownika. Zaladowanego modulu nie rusza - to robi reload_wfb_driver.
+    Zwraca (ok, komunikat)."""
+    say = say or _default_say  # zdefiniowane nizej w pliku, wiec nie jako domyslny argument
+    name, ver = DRIVER_DKMS_NAME, DRIVER_DKMS_VERSION_CARD
+    src, dest = f"/tmp/rtl8812au-card-{os.getpid()}", f"/usr/src/{name}-{ver}"
+    say(f"pobieram zrodla sterownika ({DRIVER_TAG}) z GitHuba...")
+    ok, out = clone_driver_source(src)
+    if not ok:
+        return False, "nie udalo sie pobrac zrodel (brak sieci?): " + out.strip()[-120:]
+    ok, msg = patch_driver_card_txpower(src)
+    if not ok:
+        run(["rm", "-rf", src])
+        return False, msg
+    say(msg)
+    run(["dkms", "remove", f"{name}/{ver}", "--all"])  # slady po wczesniejszej nieudanej probie
+    run(["rm", "-rf", dest])
+    run(["cp", "-r", src, dest])
+    run(["rm", "-rf", src])
+
+    say("kompiluje modul (dkms) - kilka minut; link w tym czasie dziala dalej...")
+    run(["dkms", "add", "-m", name, "-v", ver], timeout=120)
+    code, out = run(["dkms", "build", "-m", name, "-v", ver], timeout=1800)
+    if code != 0:
+        run(["dkms", "remove", f"{name}/{ver}", "--all"])
+        run(["rm", "-rf", dest])
+        return False, "kompilacja z latka nie wyszla, zostaje stary sterownik: " + out.strip()[-160:]
+
+    old = [v for v in dkms_driver_versions() if v != ver]
+    for v in old:
+        run(["dkms", "uninstall", "-m", name, "-v", v], timeout=300)
+    code, out = run(["dkms", "install", "-m", name, "-v", ver], timeout=300)
+    if code != 0 or not driver_card_txpower(max_age=0):
+        run(["dkms", "remove", f"{name}/{ver}", "--all"])
+        for v in old:
+            run(["dkms", "install", "-m", name, "-v", v], timeout=300)
+        return False, "instalacja nowego modulu nie wyszla, przywrocono stary: " + out.strip()[-160:]
+    for v in old:
+        run(["dkms", "remove", f"{name}/{v}", "--all"])
+        run(["rm", "-rf", f"/usr/src/{name}-{v}"])
+    return True, "sterownik z moca per karta zainstalowany"
+
+
+def reload_wfb_driver(say=None):
+    """Laduje od nowa modul 88XXau_wfb - po przebudowie nowy kod dziala dopiero
+    po wyladowaniu starego. Usluga stoi przez te kilkanascie sekund; karty wracaja
+    pod swoimi nazwami (reguly udev), moc wspolna z modprobe.d, a wlasna moc kart
+    z configu przy starcie uslugi. Zwraca (ok, komunikat)."""
+    say = say or _default_say  # zdefiniowane nizej w pliku, wiec nie jako domyslny argument
+    was_active = service_active()
+    say(f"zatrzymuje wifibroadcast@{ROLE} i przeladowuje modul 88XXau_wfb...")
+    run(["systemctl", "stop", f"wifibroadcast@{ROLE}"])
+    code, out = run(["modprobe", "-r", "88XXau_wfb"], timeout=60)
+    if code != 0:
+        if was_active:
+            run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
+        return False, "modulu nie da sie wyladowac (zajety) - zrob reboot: " + out.strip()[:80]
+    run(["modprobe", "88XXau_wfb"], timeout=60)
+    run(["udevadm", "settle"], timeout=15)
+    time.sleep(3)
+    _card_txpower_cache["val"] = None
+    nics = ensure_nic_names()  # karty wracaja pod swoimi nazwami
+    if nics:
+        release_nics_from_network_stack(nics)
+        ensure_tx_split(nics)  # sterownik juz "on", wiec wlasne moce ida do configu
+    if was_active:
+        run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
+        time.sleep(3)
+    _nic_status_cache["val"] = None
+    if driver_card_txpower(max_age=0) != "on":
+        return False, "modul przeladowany, ale dalej bez mocy per karta"
+    if not nics:
+        return False, "modul przeladowany, ale wfb-nics nie widzi kart - 'Wykryj karty ponownie'"
+    if was_active and not service_active():
+        return False, f"usluga nie wstala po przeladowaniu: {service_state_txt()}"
+    return True, f"sterownik z moca per karta dziala ({len(nics)} kart)"
+
+
 def step_driver():
     log("==> [3/7] Sterownik RTL8812AU")
     if driver_loaded() and wfb_nics():
@@ -2530,54 +3150,36 @@ def step_driver():
             log("    UWAGA: nie widac karty 8812 w lsusb - podlacz ja przed dalszym krokiem")
 
         src_dir = f"/tmp/rtl8812au-build-{os.getpid()}"
-        run(["rm", "-rf", src_dir])
         log(f"    Klonuje sterownik ({DRIVER_TAG})...")
-        code, out = run(
-            ["git", "clone", "-b", DRIVER_TAG, "--depth", "1",
-             "https://github.com/svpcom/rtl8812au.git", src_dir],
-            timeout=120,
-        )
-        if code != 0:
+        ok, out = clone_driver_source(src_dir)
+        if not ok:
             log("    BLAD klonowania sterownika:")
             log(out)
             return
-
-        # Raspberry Pi OS (trixie+) dzieli naglowki jadra na common+wariant.
-        # dkms.conf tego sterownika nie ustawia KBUILD_OUTPUT, wiec jego
-        # Makefile przekazuje "O=''" do sub-make, co kasuje KBUILD_OUTPUT
-        # wariantu i psuje build (blad: "auto.conf: No such file or
-        # directory"). Wymuszamy poprawna wartosc.
-        dkms_conf = Path(src_dir) / "dkms.conf"
-        content = dkms_conf.read_text().replace(
-            'KSRC=/lib/modules/${kernelver}/build"',
-            'KSRC=/lib/modules/${kernelver}/build KBUILD_OUTPUT=/usr/src/linux-headers-${kernelver}"',
-        )
-        dkms_conf.write_text(content)
-
-        # Tag v5.2.20 w svpcom/rtl8812au bywa przesuwany na nowsze commity
-        # w gorę (bez zmiany nazwy taga). Jeden z takich commitow dodal w
-        # core/rtw_br_ext.c blok "#if LINUX_VERSION_CODE >= KERNEL_VERSION(...)"
-        # pod kernele 7.1+, ale zapomnial dolaczyc <linux/version.h> - bez
-        # tego makra sa nieokreslone i build pada bledem "missing binary
-        # operator". Dopisujemy brakujacy include, jesli go nie ma.
-        br_ext = Path(src_dir) / "core" / "rtw_br_ext.c"
-        br_ext_src = br_ext.read_text()
-        if "#include <linux/version.h>" not in br_ext_src:
-            br_ext.write_text(br_ext_src.replace(
-                "#ifdef __KERNEL__\n\t#include <linux/if_arp.h>",
-                "#ifdef __KERNEL__\n\t#include <linux/version.h>\n\t#include <linux/if_arp.h>",
-                1,
-            ))
+        patched, msg = patch_driver_card_txpower(src_dir)
+        log(f"    {msg}" if patched else f"    Bez mocy per karta: {msg}")
 
         # dkms-install.sh robi "cp -r $(pwd) /usr/src/rtl8812au-5.2.20.2" -
         # jesli ten katalog juz istnieje (np. po wczesniejszej nieudanej
         # probie), cp wklei tam nowe zrodla jako PODFOLDER zamiast nadpisac,
-        # wiec dkms i tak przeczyta stary dkms.conf bez powyzszej poprawki.
-        run(["rm", "-rf", "/usr/src/rtl8812au-5.2.20.2"])
+        # wiec dkms i tak przeczyta stary dkms.conf bez poprawki z clone_driver_source.
+        run(["rm", "-rf", f"/usr/src/{DRIVER_DKMS_NAME}-{DRIVER_DKMS_VERSION}"])
 
         log("    Buduje modul (dkms) - to moze potrwac kilka minut...")
         code, out = run(["bash", "-c", f"cd {src_dir} && ./dkms-install.sh"], timeout=600)
         run(["rm", "-rf", src_dir])
+
+        if not driver_built() and patched:
+            # Latka nie jest sprawdzona kompilacja na kazdym jadrze. Sterownik bez
+            # mocy per karta jest lepszy niz zaden - drugi raz, z czystych zrodel.
+            log("    Budowanie z latka mocy per karta nie wyszlo - buduje bez niej:")
+            log(out[-1500:])
+            run(["dkms", "remove", f"{DRIVER_DKMS_NAME}/{DRIVER_DKMS_VERSION}", "--all"])
+            run(["rm", "-rf", f"/usr/src/{DRIVER_DKMS_NAME}-{DRIVER_DKMS_VERSION}"])
+            ok, out = clone_driver_source(src_dir)
+            if ok:
+                code, out = run(["bash", "-c", f"cd {src_dir} && ./dkms-install.sh"], timeout=600)
+            run(["rm", "-rf", src_dir])
 
         if not driver_built():
             log("    BLAD budowania sterownika:")
@@ -2930,17 +3532,68 @@ EMPTY_MACS = ("", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
 # ------------------------- role kart (TX / RX) -------------------------
 
+# Rola karty -> znacznik w jej nazwie. Nazwa = <ROLE>_<znacznik>[numer]:
+# pierwsza karta danej roli jest bez numeru, kolejne od 2 (drone_RX, drone_RX2,
+# drone_RX3...). Dzieki numerom kart moze byc dowolnie duzo i kazda moze miec
+# dowolna role. Jadro pozwala na 15 znakow nazwy - drone_TXRX99 ma 12.
+ROLE_TAGS = {"tx": "TX", "rx": "RX", "txrx": "TXRX"}
+
+# wfb-ng nie ma trybu "tylko nadawanie": kazda karta trafia do wfb_rx, a z
+# wfb_tx da sie wylaczyc tylko karte rx-only (wifi_txpower = 'off'). Dlatego
+# tx i txrx konfiguruja wfb-ng TAK SAMO - tx to oznaczenie karty, ktora MA
+# nadawac (np. ze wzmacniaczem), i tak jest opisane, zeby nikt nie liczyl na
+# karte glucha.
 ROLE_LABELS = {
-    "tx": ("NADAJE", "nadaje (i odbiera)"),
+    "tx": ("NADAJE", "nadaje (odbiera tez - wfb-ng nie ma trybu tylko-TX)"),
     "rx": ("TYLKO ODBIOR", "tylko odbior - nie nadaje"),
     "txrx": ("TX+RX", "nadaje i odbiera"),
 }
 
+# Nazwy sprzed rol w nazwie: gs mial jedna karte "gs_wfb" robiaca oba kierunki.
+# Instalacje z tamtych czasow maja ja w regulach udev - rozpoznajemy ja dalej
+# (jako swoja na gs i jako cudza na dronie), zamiast przemianowywac po cichu.
+LEGACY_NIC_NAMES = {"gs_wfb": ("gs", "txrx")}
+
+# Rola karty wpietej ponad DEFAULT_NIC_ROLES. Tylko odbior: wfb_tx rozklada
+# pakiety miedzy wszystkie karty nadawcze, wiec dongiel wpiety "na probe"
+# zabralby czesc wideo torowi ze wzmacniaczem. Nadawac zacznie dopiero wtedy,
+# gdy ktos mu to swiadomie ustawi w menu.
+SPARE_NIC_ROLE = "rx"
+
+_NIC_NAME_RE = re.compile(r"^([a-z]+)_(TXRX|TX|RX)([2-9]|[1-9][0-9]+)?$")
+
+
+def parse_nic_name(name):
+    """(rola urzadzenia, rola karty, numer) odczytane z nazwy karty albo None
+    dla wlanX i wszystkiego, czego nie nazywamy sami. Rozpoznaje tez nazwy
+    DRUGIEJ roli - po nich refuse_wrong_role poznaje cudze Pi."""
+    if name in LEGACY_NIC_NAMES:
+        owner, role = LEGACY_NIC_NAMES[name]
+        return owner, role, 1
+    m = _NIC_NAME_RE.match(name or "")
+    if not m or m.group(1) not in (ROLE, PEER_NAME):
+        return None
+    role = next(r for r, tag in ROLE_TAGS.items() if tag == m.group(2))
+    return m.group(1), role, int(m.group(3) or 1)
+
 
 def role_of_name(name):
-    """Rola przypisana do nazwy karty. Pusta dla wlanX i wszystkiego, czego
-    nie rozdajemy sami - taka karta jeszcze nie ma przydzialu."""
-    return NIC_ROLES.get(name, "")
+    """Rola karty TEJ maszyny zapisana w nazwie. Pusta dla wlanX i dla nazw
+    drugiej roli - taka karta nie ma u nas przydzialu."""
+    parsed = parse_nic_name(name)
+    return parsed[1] if parsed and parsed[0] == ROLE else ""
+
+
+def free_role_name(role, taken):
+    """Pierwsza wolna nazwa dla roli: drone_TX, potem drone_TX2, drone_TX3...
+    'taken' to nazwy trzymane przez reguly udev i przez istniejace interfejsy -
+    takze przez karty chwilowo wypiete, bo ich regula wciaz trzyma nazwe."""
+    base = f"{ROLE}_{ROLE_TAGS[role]}"
+    for num in range(1, 100):
+        name = base if num == 1 else f"{base}{num}"
+        if name not in taken:
+            return name
+    return ""
 
 
 def role_txt(role, short=False):
@@ -2950,26 +3603,13 @@ def role_txt(role, short=False):
     return labels[0] if short else labels[1]
 
 
-def names_for_role(role):
-    return [n for n in NIC_NAMES if NIC_ROLES.get(n) == role]
-
-
 def role_tag(name, fallback=""):
-    """Etykieta roli doklejana po nazwie karty, np. "[NADAJE]". Pusta tam, gdzie
-    rol nie rozdzielamy (gs): jedna karta robi oba kierunki, wiec przydzial
-    niczego nie rozroznia i byl by tylko szumem. Jedno miejsce na te decyzje,
-    bo etykieta wychodzi w naglowku menu, na trzech ekranach i w weryfikacji."""
-    if not role_split_used():
-        return ""
+    """Etykieta roli doklejana po nazwie karty, np. "[NADAJE]". Jedno miejsce
+    na jej wyglad, bo wychodzi w naglowku menu, na trzech ekranach i w
+    weryfikacji. 'fallback' to rola z ewidencji - dla karty, ktorej juz nie ma
+    i ktorej nazwa moze byc sprzed zmiany."""
     role = role_of_name(name) or fallback
     return f"[{role_txt(role, short=True)}]" if role else "[bez przydzialu]"
-
-
-def role_split_used():
-    """Czy na tej roli w ogole jest co rozdzielac. Gs ma jedna karte robiaca
-    oba kierunki, wiec caly ekran przypisania jest tam tylko informacyjny -
-    na dronie karty sa dwie i przydzial decyduje, ktora nadaje."""
-    return len(NIC_NAMES) > 1
 
 
 def parse_name_rules():
@@ -3073,10 +3713,20 @@ def remember_cards(nics=None):
 
 
 def forget_card(key):
+    """Usuwa karte z ewidencji RAZEM z jej regula nazwy - dla dongla wymienionego
+    na inny albo wpietego tylko na probe. Bez tego wisialby wiecznie jako
+    brakujacy i trzymal nazwe; jesli kiedys wroci, dostanie role jak nowa karta."""
     cards = load_cards()
     if cards.pop(key, None) is None:
         return False
     save_cards(cards)
+    kind, _, value = key.partition(":")
+    rules = parse_name_rules()
+    if rules.pop((kind, value), None) is not None:
+        try:
+            write_name_rules(rules)
+        except OSError:
+            pass  # bez roota regula zostaje - nic nie psuje, karty i tak nie ma
     return True
 
 
@@ -3118,15 +3768,16 @@ def missing_cards_txt(nics=None, sep="; "):
 
 
 def plan_nic_names(nics):
-    """Przydziela nazwy kartom. Raz ustalone przypisanie karta->nazwa zostaje
-    (lezy w regulach udev), nowa karta dostaje pierwsza wolna nazwe. Dzieki
-    temu przy jednej wypietej karcie druga NIE przejmuje jej nazwy - inaczej po
-    kazdym przepieciu dongla nazwy mowilyby co innego niz poprzednio.
+    """Przydziela kartom nazwy, czyli role. Raz ustalone przypisanie karta->nazwa
+    zostaje (lezy w regulach udev) - takze dla karty chwilowo wypietej, zeby po
+    ponownym wpieciu wrocila do SWOJEJ roli, a nie do tej, ktora akurat zostala.
+    Nowa karta dostaje pierwsza nieobsadzona role z DEFAULT_NIC_ROLES, a gdy
+    uklad startowy jest juz obsadzony - SPARE_NIC_ROLE. Nazw nie brakuje nigdy
+    (kolejne karty roli dostaja numer), wiec zadna karta nie oddaje swojej.
     Zwraca (mapa kotwica->nazwa, mapa interfejs->nazwa)."""
     by_anchor = parse_name_rules()
     anchors = nic_anchors(nics)
     slots = {nic: nic_usb_slot(nic) for nic in nics}
-    live = {a for a in anchors.values() if a}
 
     # Przejscie ze starych regul (na gniazdo) na nowe (na MAC): karta, ktora ma
     # juz nazwe z gniazda, zabiera ja ze soba na swoj MAC. Bez tego pierwsze
@@ -3136,25 +3787,33 @@ def plan_nic_names(nics):
         if anchor and anchor[0] == "mac" and anchor not in by_anchor and old in by_anchor:
             by_anchor[anchor] = by_anchor.pop(old)
 
-    # Nieobecna karta nie moze w nieskonczonosc trzymac nazwy - inaczej po
-    # wymianie dongla nowy zostawalby przy wlanX. Ale zwalniamy ja TYLKO gdy
-    # jest jakas karta bez nazwy, czyli jest komu te nazwe oddac: sam chwilowy
-    # brak dongla (zly kabel, port nie wstal po boocie) niczego nie przestawia
-    # i po ponownym wpieciu karta wraca do swojej nazwy.
-    if any(a not in by_anchor for a in live):
-        for anchor in [a for a in by_anchor if a not in live]:
-            del by_anchor[anchor]
+    # Karta, ktora juz nosi nasza nazwe, a nie ma reguly (np. ktos skasowal plik
+    # regul), zostaje przy swojej nazwie - inaczej zmienilaby role po cichu.
+    for nic, anchor in anchors.items():
+        if (anchor and anchor not in by_anchor and role_of_name(nic)
+                and nic not in by_anchor.values()):
+            by_anchor[anchor] = nic
 
-    free = [n for n in NIC_NAMES if n not in by_anchor.values()]
+    # Nieobecnej karcie NIE zabieramy nazwy: nazw jest bez liku, wiec nowa karta
+    # jej nie potrzebuje, a karta ze wzmacniaczem po zlym kablu ma wrocic jako
+    # nadajaca. Regule zmiata dopiero "zapomnij" (forget_card).
+    pending = list(DEFAULT_NIC_ROLES)
+    for name in by_anchor.values():
+        if role_of_name(name) in pending:
+            pending.remove(role_of_name(name))
+
+    taken = set(by_anchor.values()) | set(nics)
     per_nic = {}
-    for nic in sorted(nics, key=lambda n: (slots[n], n)):
+    for nic in sorted(nics, key=lambda n: (slots[n] or "", n)):
         anchor = anchors[nic]
         if not anchor:
             continue  # nie ma czego zakotwiczyc w regule
         if anchor not in by_anchor:
-            if not free:
-                continue  # wiecej kart niz nazw - reszta zostaje przy wlanX
-            by_anchor[anchor] = free.pop(0)
+            name = free_role_name(pending.pop(0) if pending else SPARE_NIC_ROLE, taken)
+            if not name:
+                continue  # 99 kart jednej roli - reszta zostaje przy wlanX
+            by_anchor[anchor] = name
+            taken.add(name)
         per_nic[nic] = by_anchor[anchor]
     return by_anchor, per_nic
 
@@ -3203,11 +3862,12 @@ def update_wfb_defaults(renames):
 
 
 def ensure_nic_names():
-    """Nadaje kartom stale nazwy z NIC_NAMES zamiast wlanX. Zmiana nazwy nie
-    powiedzie sie na pracujacym interfejsie, wiec na czas operacji zatrzymujemy
-    usluge. Gdyby po zmianie wfb-nics przestalo widziec karty (jakas wersja
-    szukajaca ich po nazwie "wlan*"), wycofujemy wszystko - dzialajace lacze
-    jest wazniejsze niz ladna nazwa. Zwraca aktualna liste interfejsow."""
+    """Nadaje kartom stale nazwy z rola (plan_nic_names) zamiast wlanX. Zmiana
+    nazwy nie powiedzie sie na pracujacym interfejsie, wiec na czas operacji
+    zatrzymujemy usluge. Gdyby po zmianie wfb-nics przestalo widziec karty
+    (jakas wersja szukajaca ich po nazwie "wlan*"), wycofujemy wszystko -
+    dzialajace lacze jest wazniejsze niz ladna nazwa. Zwraca aktualna liste
+    interfejsow."""
     nics = wfb_nics()
     if not nics:
         return nics
@@ -3222,14 +3882,9 @@ def ensure_nic_names():
     if was_active:
         run(["systemctl", "stop", f"wifibroadcast@{ROLE}"])
 
-    done = []
-    for old, name in todo:
-        ok, err = rename_nic(old, name)
-        if ok:
-            log(f"    nazwa karty: {old} -> {name}")
-            done.append((old, name))
-        else:
-            log(f"    nie udalo sie przemianowac {old} na {name}: {err}")
+    # apply_nic_renames, a nie rename_nic po kolei: reguly mogly zamienic dwie
+    # karty nazwami, a tego wprost jadro nie przepusci ("File exists")
+    done = apply_nic_renames(dict(todo))
 
     nics = wfb_nics()
     if done and not nics:
@@ -3251,23 +3906,6 @@ def ensure_nic_names():
         time.sleep(2)
     remember_cards(nics)  # nazwy sa juz ustalone, wiec ewidencja zapisze te wlasciwe
     return nics
-
-
-def free_ifname(taken=()):
-    """Wolna nazwa wlanN dla karty, ktora wlasnie stracila przydzial. Jadro nie
-    zabierze jej nazwy samo - interfejs zostaje przy tej, ktora ma, a ta jest
-    wlasnie potrzebna innej karcie. Nazw z NIC_NAMES nie ruszamy, bo to sa
-    przydzialy, a nie nazwy zastepcze."""
-    try:
-        busy = {p.name for p in Path("/sys/class/net").iterdir()}
-    except OSError:
-        busy = set()
-    busy.update(taken)
-    busy.update(NIC_NAMES)
-    for i in range(64):
-        if f"wlan{i}" not in busy:
-            return f"wlan{i}"
-    return ""
 
 
 def _default_say(msg, status=None):
@@ -3309,21 +3947,21 @@ def apply_nic_renames(wanted, say=_default_say):
     return done
 
 
-def assign_nic_role(nic, target_name, say=_default_say):
-    """Przypisuje karcie role, czyli nadaje jej nazwe z NIC_NAMES (rola siedzi
-    w nazwie - patrz NIC_ROLES). Jesli nazwa jest zajeta przez druga karte,
-    karty zamieniaja sie nazwami: przydzialow jest tyle co kart, wiec kazde inne
-    zachowanie zostawiloby jedna karte bez roli.
+def assign_nic_role(nic, role, say=_default_say):
+    """Ustawia karcie role ("tx", "rx" albo "txrx"), czyli nadaje jej pierwsza
+    wolna nazwe tej roli (drone_TX, drone_TX2...). Pozostale karty zostaja bez
+    zmian: kazda ma wlasna nazwe, wiec nic nie trzeba zamieniac, a kilka kart
+    moze miec te sama role (np. dwie nadajace do porownania anten).
 
     Przypisanie zapisujemy w regulach udev (przypiete do MAC-a), wiec przezywa
     reboot i przelozenie dongla do innego portu USB. Zwraca (ok, komunikat)."""
     nics = wfb_nics()
     if nic not in nics:
         return False, f"karty {nic} juz nie ma"
-    if target_name not in NIC_NAMES:
-        return False, f"nieznana nazwa {target_name}"
-    if nic == target_name:
-        return True, f"{nic} juz ma te role"
+    if role not in ROLE_TAGS:
+        return False, f"nieznana rola {role}"
+    if role_of_name(nic) == role:
+        return True, f"{nic} juz ma role {role_txt(role, short=True)}"
 
     anchors = nic_anchors(nics)
     mine = anchors.get(nic)
@@ -3331,69 +3969,45 @@ def assign_nic_role(nic, target_name, say=_default_say):
         return False, (f"{nic} nie ma ani czytelnego MAC-a, ani gniazda USB - "
                        "nie ma czego zakotwiczyc w regule udev")
 
-    before = parse_name_rules()  # do wycofania, gdyby po zmianie karty przepadly
+    before = parse_name_rules()  # do wycofania, gdyby zmiana sie nie udala
     by_anchor = dict(before)
-    old_name = by_anchor.get(mine)  # None, gdy karta nie miala jeszcze przydzialu
-    by_anchor[mine] = target_name
-
-    # Wybrana nazwe moze trzymac druga karta - takze taka, ktorej akurat nie ma
-    # w systemie. Zostawiona w regulach robilaby duplikat: udev mialby dwie
-    # karty do jednej nazwy i po wpieciu tej wypietej nie nazwalby zadnej z nich.
-    # Dostaje wiec nazwe po tej karcie, a jak ta nie miala jeszcze zadnej -
-    # pierwsza wolna. Gdy wolnej nie ma, wypada z regul i zostanie przy wlanX.
-    spare = old_name if old_name in NIC_NAMES else None
-    dropped = []
-    for anchor in [a for a, name in list(by_anchor.items())
-                   if name == target_name and a != mine]:
-        if not spare:
-            spare = next((n for n in NIC_NAMES if n not in by_anchor.values()), None)
-        if spare:
-            by_anchor[anchor], spare = spare, None
-        else:
-            del by_anchor[anchor]
-            dropped.append(anchor)
+    try:
+        present = {p.name for p in Path("/sys/class/net").iterdir()}
+    except OSError:
+        present = set(nics)
+    # Nazwy kart wypietych tez sa zajete: ich regula dalej je trzyma, a dwie
+    # reguly na jedna nazwe to po wpieciu karta, ktorej udev nie nazwie wcale.
+    target = free_role_name(role, (set(by_anchor.values()) | present)
+                            - {nic, by_anchor.get(mine)})
+    if not target:
+        return False, f"brak wolnej nazwy dla roli {role_txt(role, short=True)}"
+    by_anchor[mine] = target
 
     was_active = service_active()
     if was_active:
         run(["systemctl", "stop", f"wifibroadcast@{ROLE}"])
 
     write_name_rules(by_anchor)
-    # Docelowe nazwy czytamy juz z gotowych regul - dzieki temu ta sama sciezka
-    # obsluguje zwykle nadanie nazwy i zamiane rol miedzy dwiema kartami.
-    wanted = {n: by_anchor[anchors[n]] for n in nics
-              if anchors.get(n) and anchors[n] in by_anchor}
-
-    # Karta, ktora stracila przydzial i jest wpieta, MUSI oddac swoja nazwe:
-    # to wlasnie jej chce teraz inna karta, a jadro nie pozwoli na dwa
-    # interfejsy o tym samym imieniu i cala zmiana staneloby na "nazwa zajeta".
-    # Dzieje sie tak przy trzech kartach na dwie role - wtedy nie ma dla niej
-    # wolnego przydzialu i wraca do wlanX.
-    by_anchor_nic = {a: n for n, a in anchors.items() if a}
-    for anchor in dropped:
-        loser = by_anchor_nic.get(anchor)
-        spare_name = free_ifname(set(wanted.values())) if loser else ""
-        if spare_name:
-            wanted[loser] = spare_name
-            say(f"{loser} traci przydzial - wraca do {spare_name}", "warn")
-
-    done = apply_nic_renames(wanted, say)
+    done = apply_nic_renames({nic: target}, say)
 
     nics = wfb_nics()
-    if done and not nics:
+    if not done or not nics:
         # Ten sam bezpiecznik co w ensure_nic_names: dzialajace lacze jest
-        # wazniejsze niz przydzial rol, wiec cofamy wszystko.
-        for old, new in done:
+        # wazniejsze niz przydzial rol, wiec cofamy wszystko - takze regule,
+        # bo inaczej karta zmienilaby role dopiero po reboocie, niespodzianie.
+        for old, new in reversed(done):
             rename_nic(new, old)
         write_name_rules(before)
         if was_active:
             run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
-        return False, "po zmianie nazw wfb-nics nie widzi kart - wycofano"
+        if not done:
+            return False, f"nie udalo sie przemianowac {nic} - rola bez zmian"
+        return False, "po zmianie nazwy wfb-nics nie widzi kart - wycofano"
 
-    if done:
-        update_wfb_defaults(done)
-        release_nics_from_network_stack(nics)
+    update_wfb_defaults(done)
+    release_nics_from_network_stack(nics)
     remember_cards(nics)
-    ensure_tx_split(nics)  # 'off' w wifi_txpower musi trafic na NOWA karte rx-only
+    ensure_tx_split(nics)  # 'off' w wifi_txpower musi trafic na karty rx wg NOWYCH nazw
 
     if was_active:
         run(["systemctl", "start", f"wifibroadcast@{ROLE}"])
@@ -3401,7 +4015,7 @@ def assign_nic_role(nic, target_name, say=_default_say):
         if not service_active():
             return False, f"usluga nie wstala po zmianie: {service_state_txt()}"
     _nic_status_cache["val"] = None
-    return True, f"{nic} -> {target_name} ({role_txt(role_of_name(target_name))})"
+    return True, f"{nic} -> {target} ({role_txt(role)})"
 
 
 def step_config():
@@ -3550,17 +4164,19 @@ def autostart_status():
 # ------------------------- ochrona przed zla rola -------------------------
 
 def peer_role_nics():
-    """Interfejsy nalezace do DRUGIEJ roli - ale tylko wtedy, gdy zadnego
-    naszego tu nie ma. Gdy sa obie nazwy naraz, nie orzekamy niczego: to stan
-    po recznym grzebaniu i lepiej puscic uzytkownika dalej, niz zablokowac mu
-    jedyne narzedzie do posprzatania."""
+    """Interfejsy nazwane jak karty DRUGIEJ roli (np. gs_TXRX, drone_RX2) - ale
+    tylko wtedy, gdy zadnego naszego tu nie ma. Nazwy sa przypiete do MAC-ow
+    przez udev, wiec cudza nazwa na maszynie znaczy "to Pi bylo urzadzane jako
+    druga strona", a nie "ktos przypadkiem tak nazwal interfejs". Gdy sa nazwy
+    obu rol naraz, nie orzekamy niczego: to stan po recznym grzebaniu i lepiej
+    puscic uzytkownika dalej, niz zablokowac mu jedyne narzedzie do posprzatania."""
     try:
-        present = {p.name for p in Path("/sys/class/net").iterdir()}
+        present = sorted(p.name for p in Path("/sys/class/net").iterdir())
     except OSError:
         return []
-    if any(n in present for n in NIC_NAMES):
+    if any(role_of_name(n) for n in present):
         return []
-    return [n for n in PEER_NIC_NAMES if n in present]
+    return [n for n in present if (parse_nic_name(n) or ("",))[0] == PEER_NAME]
 
 
 def refuse_wrong_role():
@@ -3678,7 +4294,7 @@ def detect_nics_startup():
     ich uzywa. Jesli czegos brakuje - proba naprawy (przepiecie sterownika,
     udev, restart uslugi), bo to sa dokladnie te trzy powody, dla ktorych
     druga karta "jest, a nie dziala"."""
-    log(f"==> Wykrywanie kart RTL88xx (oczekiwano: {EXPECTED_NICS})")
+    log(f"==> Wykrywanie kart RTL88xx (minimum: {EXPECTED_NICS})")
 
     dongles = usb_rtl_dongles()
     log(f"    lsusb: {len(dongles)} szt.")
@@ -3776,7 +4392,7 @@ def collect_checks():
 
     dongles = usb_rtl_dongles()
     if len(dongles) >= EXPECTED_NICS:
-        checks.append(("Dongle USB RTL88xx", "ok", f"{len(dongles)} szt. w lsusb (oczekiwano {EXPECTED_NICS})"))
+        checks.append(("Dongle USB RTL88xx", "ok", f"{len(dongles)} szt. w lsusb (minimum {EXPECTED_NICS})"))
     elif dongles:
         checks.append(("Dongle USB RTL88xx", "fail",
                        f"tylko {len(dongles)} z {EXPECTED_NICS} - sprawdz drugi port USB, kabel i zasilanie"))
@@ -3808,7 +4424,7 @@ def collect_checks():
     nics = wfb_nics()
     remember_cards(nics)
     if len(nics) >= EXPECTED_NICS:
-        checks.append(("Interfejsy wfb", "ok", f"{len(nics)} z {EXPECTED_NICS}: {' '.join(nics)}"))
+        checks.append(("Interfejsy wfb", "ok", f"{len(nics)} (minimum {EXPECTED_NICS}): {' '.join(nics)}"))
     elif nics:
         checks.append(("Interfejsy wfb", "fail",
                        f"tylko {len(nics)} z {EXPECTED_NICS}: {' '.join(nics)} "
@@ -3842,6 +4458,7 @@ def collect_checks():
     cfg_channel = wfb_effective_common()[0] if CFG_PATH.exists() else None
     used_by_service = service_nics(set(nics))
     traffic = nic_traffic(nics) if nics else {}
+    quiet = muted_nics(nics)  # karty, ktore config naprawde wycisza
 
     for i, nic in enumerate(nics, 1):
         d = nic_details(nic)
@@ -3857,6 +4474,8 @@ def collect_checks():
             status, detail = "fail", detail + f" - config mowi {cfg_channel}"
         elif rx_pps == 0 and tx_pps == 0:
             status, detail = "fail", detail + " - brak jakiegokolwiek ruchu"
+        elif tx_pps == 0 and nic in quiet:
+            status, detail = "ok", detail + " - tylko odbior (rola RX)"
         elif tx_pps == 0:
             # przy dwoch kartach wfb_tx potrafi nadawac tylko przez jedna,
             # wiec sam brak TX przy dzialajacym RX to jeszcze nie awaria
@@ -3911,7 +4530,7 @@ def collect_checks():
         # Pi poborem pradu z USB - wiec fail, a nie warn.
         checks.append(("Moc nadawania (TX)", "fail",
                        f"{live_tx} przekracza pulap {TX_POWER_CAP} (90% z {TX_POWER_MAX}) - "
-                       "wejdz w 'Region i moc nadawania' i zapisz od nowa"))
+                       "wejdz w 'Moc nadawania (TX)' i zapisz od nowa"))
     elif live_tx.isdigit() and int(live_tx) < 10:
         # Spojna, ale bardzo niska wartosc to typowy cichy zabojca zasiegu -
         # link "dziala na biurku" i pada kilka metrow dalej. Zostaje warn,
@@ -3922,12 +4541,48 @@ def collect_checks():
         checks.append(("Moc nadawania (TX)", "ok",
                        f"{live_tx}/{TX_POWER_CAP} (pulap = 90% z {TX_POWER_MAX})"))
 
+    # Moc per karta i limity: bez latki sterownika jest tylko moc wspolna
+    # (CARD_TXPOWER_PATCH). Zgodnosc ze sterownikiem sprawdzamy na zywo - config
+    # wfb-ng czyta tylko przy starcie, wiec sam wpis niczego nie dowodzi.
+    card_state = driver_card_txpower()
+    powers = card_powers(nics) if nics else {}
+    limits = card_limits(nics) if nics else {}
+    if card_state == "on":
+        plan = card_power_plan(nics, live=True)
+        live = {n: card_power_live(n) for n in plan}
+        wrong = {n: v for n, v in live.items() if v is not None and v != plan[n]}
+        if wrong:
+            checks.append(("Moc per karta", "warn",
+                           "; ".join(f"{n}: powinno byc {plan[n]}, sterownik ma {v}"
+                                     for n, v in sorted(wrong.items()))
+                           + " - ustaw ponownie w 'Karty na zywo' albo zrestartuj usluge"))
+        else:
+            bits = [f"{n}={p}/{TX_POWER_CAP}" + (f" (limit {limits[n]})" if n in limits else "")
+                    for n, p in sorted(plan.items())]
+            bits += [f"{n}: limit {lim}, nadaje z wspolnej" for n, lim in sorted(limits.items())
+                     if n not in plan]
+            checks.append(("Moc per karta", "ok",
+                           ("osobno: " + "; ".join(bits)) if bits
+                           else "sterownik z latka; wszystkie karty na mocy wspolnej"))
+    elif card_state == "reload":
+        checks.append(("Moc per karta", "warn",
+                       "sterownik z latka zbudowany, ale zaladowany jest stary - 'Karty na zywo' -> P"))
+    else:
+        checks.append(("Moc per karta", "warn" if powers or limits else "ok",
+                       "sterownik bez latki - moc tylko wspolna dla wszystkich kart"
+                       + (", zapisane moce i limity NIE dzialaja" if powers or limits else "")
+                       + " ('Karty na zywo' -> P)"))
+
     # Rozdzial rol sprawdzamy na LICZNIKACH KARTY, a nie w configu ani w linii
     # polecen wfb_tx: wfb-ng podaje procesowi wszystkie interfejsy i dopiero
     # w srodku pomija te oznaczone jako rx-only (rx_only_wlan_ids). Jedynym
     # wiarygodnym dowodem jest wiec to, czy z karty cokolwiek wychodzi -
     # a przy wzmacniaczu jednokierunkowym "nadaje nie ta karta" to zepsuty lot.
-    rx_only = set(rx_only_nics(nics))
+    if nics and len(rx_only_nics(nics)) == len(nics) and any(role_of_name(n) for n in nics):
+        checks.append(("Rozdzial RX/TX", "warn",
+                       "zadna karta nie ma roli TX ani TX+RX - bezpiecznik zostawia nadawanie"
+                       " na wszystkich; ustaw role w 'Karty na zywo'"))
+    rx_only = quiet
     if rx_only:
         traffic = nic_traffic(nics)
         sending = {n: traffic[n][1] for n in rx_only if traffic.get(n, (0, 0))[1] > 0}
@@ -4337,12 +4992,13 @@ def tx_power_screen(stdscr):
 
     write_modprobe_wfb(tx_power)
     live_ok = apply_tx_power_live(tx_power)
+    cards = reapply_card_powers()  # limity i wlasna moc kart wzgledem NOWEJ wspolnej
 
     if live_ok:
-        popup(stdscr, "Zapisano", ["moc zastosowana natychmiast"], status="ok")
+        popup(stdscr, "Zapisano", ["moc zastosowana natychmiast"] + cards, status="ok")
     else:
         popup(stdscr, "Zapisano",
-              ["modul niezaladowany - moc zadziala po nast. zaladowaniu modulu"],
+              ["modul niezaladowany - moc zadziala po nast. zaladowaniu modulu"] + cards,
               status="warn")
 
 
@@ -4445,7 +5101,7 @@ def redetect_screen(stdscr):
         stdscr.refresh()
 
     dongles = usb_rtl_dongles()
-    say(f"lsusb: {len(dongles)} dongli RTL88xx (oczekiwano {EXPECTED_NICS})")
+    say(f"lsusb: {len(dongles)} dongli RTL88xx (minimum {EXPECTED_NICS})")
 
     def quietly(fn):
         """Funkcje z czesci instalacyjnej pisza przez log() na stdout, co
@@ -4584,8 +5240,8 @@ def nic_identify_screen(stdscr):
 
             row = 4
             safe_addstr(stdscr, row, 2,
-                        f"Karty: {len(current)}/{EXPECTED_NICS}    dongle w lsusb: {dongles}/{EXPECTED_NICS}",
-                        color_for("ok" if len(current) == EXPECTED_NICS else "fail") | curses.A_BOLD)
+                        f"Karty: {count_txt(len(current))}    dongle w lsusb: {count_txt(dongles)}",
+                        color_for("ok" if len(current) >= EXPECTED_NICS else "fail") | curses.A_BOLD)
             row += 2
 
             used = service_nics(set(current)) if current else set()
@@ -4634,7 +5290,7 @@ def nic_identify_screen(stdscr):
 
             h, _ = stdscr.getmaxyx()
             safe_addstr(stdscr, h - 1, 2,
-                        "q = powrot" + ("   |   z = zapomnij brakujace karty" if gone else ""),
+                        "q = powrot" + ("   |   z = zapomnij brakujace karty (i ich role)" if gone else ""),
                         curses.A_DIM)
             stdscr.refresh()
 
@@ -4652,136 +5308,385 @@ def nic_identify_screen(stdscr):
         stdscr.timeout(-1)  # z powrotem na blokujace getch, inaczej menu zwariuje
 
 
-def role_apply_screen(stdscr, nic, target_name):
-    """Wykonanie zmiany przydzialu z widocznym przebiegiem. Zmiana zatrzymuje
-    usluge, przemianowuje interfejsy i poprawia config, wiec przez kilka sekund
-    link nie stoi - lepiej, zeby bylo widac, na czym to stoi, niz zeby ekran
-    zamarl bez slowa."""
+def run_quietly(fn, say):
+    """Funkcje instalatora pisza przez log() na stdout, co rozjechaloby ekran
+    curses - przechwytujemy to i oddajemy przez say(). Zwraca wynik fn()."""
+    buf, old_stdout = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        return fn()
+    finally:
+        sys.stdout = old_stdout
+        for line in buf.getvalue().splitlines():
+            if line.strip():
+                say("  " + line.strip())
+
+
+def card_txpower_driver_screen(stdscr):
+    """Sterownik z moca per karta: przebudowa (gdy latki nie ma) i przeladowanie
+    modulu. Pytamy przed, bo przebudowa trwa kilka minut i potrzebuje internetu,
+    a przeladowanie zrywa link na kilkanascie sekund - to trzeba wiedziec
+    zawczasu, a nie w polowie lotu."""
+    state = driver_card_txpower(max_age=0)
+    if state == "on":
+        popup(stdscr, "Moc per karta", ["Sterownik juz ma moc per karta - nic do zrobienia."], status="ok")
+        return
+    if state == "reload":
+        lines = ["Sterownik z moca per karta jest zbudowany, ale w pamieci",
+                 "siedzi jeszcze stary modul. Przeladuje go teraz -",
+                 f"usluga wifibroadcast@{ROLE} stanie na kilkanascie sekund."]
+    else:
+        lines = ["Ten sterownik ma jedna moc dla wszystkich kart: 'iw set",
+                 "txpower' na jednej karcie zmienia moc kazdej.",
+                 "",
+                 "Przebuduje go z latka mocy per karta:",
+                 f"  - pobiore zrodla svpcom/rtl8812au {DRIVER_TAG} z GitHuba,",
+                 "  - kompilacja trwa kilka minut, link w tym czasie dziala,",
+                 "  - gdy sie nie skompiluje, zostaje stary sterownik,",
+                 "  - na koniec przeladowanie modulu: usluga stoi kilkanascie sekund.",
+                 "",
+                 "Zrob to na OBU Pi - moc ustawia sie po kazdej stronie osobno."]
+    if popup(stdscr, "Moc per karta", lines, ("Tak", "Nie"), status="warn", default=1) != 0:
+        return
+
+    title = f"WFB-NG [{ROLE}] - sterownik z moca per karta"
     stdscr.clear()
-    draw_header(stdscr, f"WFB-NG [{ROLE}] - zmiana przydzialu karty")
+    draw_header(stdscr, title)
     row = 2
 
     def say(text, status=None):
         nonlocal row
-        safe_addstr(stdscr, row, 2, text,
-                    (color_for(status) | curses.A_BOLD) if status else 0)
+        if row >= stdscr.getmaxyx()[0] - 2:  # przebudowa potrafi wypisac wiecej niz ekran
+            stdscr.clear()
+            draw_header(stdscr, title)
+            row = 2
+        safe_addstr(stdscr, row, 2, text, (color_for(status) | curses.A_BOLD) if status else 0)
         row += 1
         stdscr.refresh()
 
-    say(f"{nic} -> {target_name} ({role_txt(role_of_name(target_name))})", "warn")
-    say("zatrzymuje usluge, zmieniam nazwy, wracam...")
-    row += 1
-
-    ok, msg = assign_nic_role(nic, target_name, say)
-    row += 1
+    if state == "":
+        ok, msg = run_quietly(lambda: rebuild_driver_card_txpower(say), say)
+        say(msg, "ok" if ok else "fail")
+        if not ok:
+            pause(stdscr)
+            return
+    ok, msg = run_quietly(lambda: reload_wfb_driver(say), say)
     say(msg, "ok" if ok else "fail")
     if ok:
-        say("przypisanie siedzi w regulach udev (na MAC-u karty) - przezyje")
-        say("reboot i przelozenie dongla do innego gniazda USB.")
+        say("Moc kazdej karty ustawisz teraz na ekranie kart: -/+ moc, [ ] limit.")
     pause(stdscr)
 
 
-def nic_roles_screen(stdscr):
-    """Przypisanie kart do rol TX / RX.
+# Kolejnosc jak na przelaczniku: od "tylko slucha" do "robi oba".
+ROLE_SWITCH = (("rx", "RX"), ("tx", "TX"), ("txrx", "RXTX"))
+POWER_STEP = 2  # o tyle indeksu zmienia jedno -/+ (moc) albo [ ] (limit) na ekranie kart
 
-    Rola karty siedzi w jej NAZWIE (NIC_ROLES), a nazwa jest przypieta udevem do
-    MAC-a karty - wiec zmiana przydzialu to zmiana nazwy, i dlatego przydzial
-    trzyma sie karty, a nie gniazda. Ma to znaczenie tam, gdzie do jednej karty
-    przykrecony jest jednokierunkowy wzmacniacz albo antena kierunkowa: nadawac
-    ma dokladnie ta karta, niezaleznie od tego, w ktory port USB trafi."""
-    stdscr.timeout(1000)
-    idx = 0
+
+def cards_live_screen(stdscr):
+    """Karty na zywo: kazdy dongiel Wi-Fi wpiety w USB, jego chip, nazwa
+    urzadzenia (albo "generic") i przelacznik roli RX / TX / RXTX.
+
+    Liste bierzemy z sysfs (usb_wifi_dongles), a nie z wfb-nics, wiec wpieta
+    karta pojawia sie od razu - takze zanim dostanie nazwe i takze pod cudzym
+    sterownikiem. Swieza karta nie ma jeszcze roli (wlanX), wiec nie nadaje,
+    dopoki nie wybierzesz jej na przelaczniku. Urzadzenie jest na widoku, bo
+    rozne dongle maja rozna moc - a od tego zalezy, ktora karta ma nadawac.
+
+    Rola siedzi w nazwie karty przypietej udevem do MAC-a (assign_nic_role),
+    wiec zostaje przy karcie takze po przelozeniu do innego gniazda. Wolne
+    rzeczy (wfb-nics, usluga, ewidencja) liczymy tylko po zmianie w sysfs albo
+    co kilka sekund; reszta to odczyty plikow, tanie przy odswiezaniu co 0.5 s."""
+    stdscr.timeout(500)
+    slow = {"t": 0.0, "sig": None, "wfb": [], "used": set(), "gone": [],
+            "muted": set(), "card_state": "", "powers": {}, "limits": {}, "plan": {},
+            "live_power": {}}
+    known, counters, events = None, {}, []
+    sel, cursor, flash, scroll = None, None, None, 0
+
+    def note(text, status):
+        events.insert(0, (time.strftime("%H:%M:%S"), text, status))
+        del events[4:]
+
+    def card_nic(card):
+        # interfejs pod wfb, jesli karta ma ich kilka; inaczej jakikolwiek
+        return next((n for n in card["nics"] if n in slow["wfb"]),
+                    card["nics"][0] if card["nics"] else "")
+
+    def set_role(nic, role):
+        label = dict(ROLE_SWITCH)[role]
+        if not nic or nic not in slow["wfb"]:
+            return f"{nic or 'ta karta'} nie jest pod sterownikiem wfb - najpierw w (przepiecie)", "warn"
+        if role_of_name(nic) == role:
+            return f"{nic} juz ma role {label}", "ok"
+        width = stdscr.getmaxyx()[1]
+
+        def say(text, status=None):
+            # assign_nic_role trzyma ekran kilka sekund - przebieg idzie w linijke komunikatu
+            safe_addstr(stdscr, 4, 2, text.ljust(width),
+                        (color_for(status) if status else 0) | curses.A_BOLD)
+            stdscr.refresh()
+
+        say(f"{nic} -> {label}: zatrzymuje usluge, zmieniam nazwe karty...", "warn")
+        ok, msg = assign_nic_role(nic, role, say)
+        note(("ROLA: " if ok else "BLAD ROLI: ") + msg, "ok" if ok else "fail")
+        slow["sig"] = None  # nazwa i stan uslugi sie zmienily
+        return msg, "ok" if ok else "fail"
+
     try:
         while True:
-            nics = sorted(wfb_nics())
-            used = service_nics(set(nics)) if nics else set()
-            gone = missing_cards(nics)
-            idx = min(idx, max(0, len(nics) - 1))
+            now = time.monotonic()
+            cards = usb_wifi_dongles()
+            sig = tuple((p, c["driver"], tuple(c["nics"])) for p, c in cards.items())
+            if sig != slow["sig"] or now - slow["t"] > 3.0:
+                wfb = wfb_nics()
+                remember_cards(wfb)  # zeby po wypieciu bylo czym nazwac brakujaca karte
+                card_state = driver_card_txpower()
+                plan = card_power_plan(wfb, live=True) if wfb and card_state == "on" else {}
+                slow.update(t=now, sig=sig, wfb=wfb, gone=missing_cards(wfb),
+                            used=service_nics(set(wfb)) if wfb else set(),
+                            muted=muted_nics(wfb), card_state=card_state,
+                            powers=card_powers(wfb) if wfb else {},
+                            limits=card_limits(wfb) if wfb else {}, plan=plan,
+                            live_power={n: card_power_live(n) for n in plan})
+
+            if known is not None:
+                for port in [p for p in cards if p not in known]:
+                    note(f"WPIETO: gniazdo {port}   {usb_chip_txt(cards[port])[0]}"
+                         f"   {usb_device_txt(cards[port])}", "ok")
+                    sel, cursor = port, None  # nowa karta od razu pod kursorem
+                for port in [p for p in known if p not in cards]:
+                    note(f"WYPIETO: gniazdo {port}   "
+                         f"{' '.join(known[port]['nics']) or 'bez interfejsu'}", "fail")
+            known = cards
+
+            ports = list(cards)
+            if sel not in cards:
+                sel, cursor = (ports[0] if ports else None), None
+            idx = ports.index(sel) if ports else 0
 
             stdscr.erase()
-            draw_header(stdscr, f"WFB-NG [{ROLE}] - przypisanie rol kart (TX / RX)")
-            row = 2
-
-            if role_split_used():
-                safe_addstr(stdscr, row, 2,
-                            "Rola jedzie z karta (przypieta do MAC-a), nie z gniazdem USB.",
-                            curses.A_BOLD)
+            h, w = stdscr.getmaxyx()
+            draw_header(stdscr, f"WFB-NG [{ROLE}] - karty na zywo: chip, urzadzenie, rola")
+            live_tx = read_tx_power_live()
+            safe_addstr(stdscr, 2, 2,
+                        f"Karty Wi-Fi na USB: {len(cards)}"
+                        + (f" (karta {idx + 1}/{len(ports)})" if ports else "")
+                        + f"   pod wfb: {len(slow['wfb'])}   w usludze: {len(slow['used'])}"
+                        f"   moc wspolna: {live_tx or '?'}/{TX_POWER_CAP}   moc per karta: "
+                        + {"on": "tak", "reload": "po przeladowaniu sterownika (P)"}.get(
+                            slow["card_state"], "nie - P = przebuduj sterownik"),
+                        curses.A_BOLD)
+            senders = [n for n in slow["wfb"] if role_of_name(n) in ("tx", "txrx")]
+            if senders:
+                safe_addstr(stdscr, 3, 2, f"Nadaja: {' '.join(senders)}", color_for("ok"))
+            elif slow["wfb"]:
+                # to samo, co robi txpower_cfg_value: bez karty nadawczej 'off' nie powstaje
+                safe_addstr(stdscr, 3, 2,
+                            "Zadna karta nie ma roli nadawczej - bezpiecznik: nadaja wszystkie.",
+                            color_for("warn") | curses.A_BOLD)
+            if flash and now < flash[2]:
+                safe_addstr(stdscr, 4, 2, flash[0], color_for(flash[1]) | curses.A_BOLD)
             else:
-                safe_addstr(stdscr, row, 2,
-                            f"Rola {ROLE} ma jedna karte i robi nia oba kierunki - "
-                            "nie ma tu czego rozdzielac.", color_for("warn"))
-            row += 2
+                flash = None
 
-            for i, nic in enumerate(nics):
-                mark = ">" if i == idx else " "
-                attr = curses.color_pair(5) if i == idx else curses.A_BOLD
+            gone = slow["gone"]
+            foot = 2 + (len(events) + 1 if events else 0) + (min(len(gone), 3) + 1 if gone else 0)
+            top, block = 6, 5
+            per_page = max(1, (h - top - foot) // block)
+            scroll = min(max(scroll, idx - per_page + 1), idx)
+            scroll = max(0, min(scroll, len(ports) - per_page))
+
+            row = top
+            if not ports:
+                safe_addstr(stdscr, row, 2,
+                            "Nie widac zadnej karty Wi-Fi na USB - wepnij dongla, pojawi sie tutaj od razu.",
+                            color_for("warn") | curses.A_BOLD)
+            for port in ports[scroll:scroll + per_page]:
+                card = cards[port]
+                nic = card_nic(card)
+                in_wfb = nic in slow["wfb"]
                 role = role_of_name(nic)
-                safe_addstr(stdscr, row, 2,
-                            f"{mark} {nic:<12} {role_txt(role, short=True):<14}"
-                            f" mac={nic_mac(nic) or '?'}".ljust(60), attr)
+                chosen = port == sel
+
+                rx_pps = tx_pps = 0.0
+                if nic:
+                    rx, tx = nic_counters(nic)
+                    prev = counters.get(nic)
+                    if prev and now > prev[2]:
+                        rx_pps = max(0.0, (rx - prev[0]) / (now - prev[2]))
+                        tx_pps = max(0.0, (tx - prev[1]) / (now - prev[2]))
+                    counters[nic] = (rx, tx, now)
+
+                # wiersz 1: nazwa karty i przelacznik roli
+                safe_addstr(stdscr, row, 2, f"{'>' if chosen else ' '} {nic or '(bez interfejsu)':<16}",
+                            (curses.color_pair(5) if chosen else 0) | curses.A_BOLD)
+                x = 22
+                for i, (r, label) in enumerate(ROLE_SWITCH):
+                    cell = f"[{label}]" if r == role else f" {label} "
+                    if chosen and cursor == i:
+                        attr = curses.color_pair(5) | curses.A_BOLD
+                    elif r == role and in_wfb:
+                        attr = color_for("ok") | curses.A_BOLD
+                    else:
+                        attr = curses.A_DIM
+                    safe_addstr(stdscr, row, x, cell, attr)
+                    x += len(cell) + 1
+                if not in_wfb:
+                    state_txt, state = "rola niedostepna - karta nie jest pod wfb", "warn"
+                elif chosen and cursor is not None and ROLE_SWITCH[cursor][0] != role:
+                    state_txt, state = f"<- Enter = ustaw {ROLE_SWITCH[cursor][1]}", "warn"
+                elif not role:
+                    state_txt, state = "bez roli - nie nadaje, wybierz RX / TX / RXTX", "warn"
+                elif nic in slow["used"]:
+                    state_txt, state = "w usludze", "ok"
+                else:
+                    state_txt, state = "usluga jej jeszcze nie uzywa (w = restart)", "warn"
+                safe_addstr(stdscr, row, x + 2, state_txt, color_for(state))
+
+                # wiersz 2: chip i urzadzenie - od nich zalezy moc karty
+                chip, source = usb_chip_txt(card)
+                device = usb_device_txt(card)
                 safe_addstr(stdscr, row + 1, 4,
-                            f"gniazdo USB {nic_usb_txt(nic)}")
-                safe_addstr(stdscr, row + 2, 4,
-                            f"{role_txt(role)}   w usludze="
-                            f"{'tak' if nic in used else 'NIE'}",
-                            color_for("ok" if nic in used else "warn"))
-                row += 4
+                            f"chip: {chip}" + (f" ({source})" if source else "")
+                            + f"   urzadzenie: {device}",
+                            curses.A_BOLD if device != "generic" else 0)
 
-            if not nics:
-                safe_addstr(stdscr, row, 2, "wfb-nics nie zwraca zadnego interfejsu",
-                            color_for("fail"))
-                row += 2
+                # wiersz 3: moc - rozne dongle przy tym samym indeksie daja rozna moc
+                own = slow["powers"].get(nic)
+                limit = slow["limits"].get(nic)
+                planned = slow["plan"].get(nic)
+                shared = int(live_tx) if live_tx and live_tx.isdigit() else None
+                limit_txt = f"   limit {limit}" if limit else ""
+                if not in_wfb:
+                    power_txt, power_attr = "moc: -", curses.A_DIM
+                elif nic in slow["muted"]:
+                    power_txt, power_attr = "moc: nie nadaje (rola RX)" + limit_txt, curses.A_DIM
+                elif own:
+                    value = min(own, limit or TX_POWER_CAP)
+                    power_txt = f"moc: {power_meter(value, limit)} {value}/{TX_POWER_CAP} wlasna" + limit_txt
+                    power_attr = color_for("ok")
+                elif planned:  # wspolna ponad limit - karta dostaje swoj limit osobno
+                    power_txt = (f"moc: {power_meter(planned, limit)} {planned}/{TX_POWER_CAP}"
+                                 f" wspolna {live_tx}, scieta limitem")
+                    power_attr = color_for("ok")
+                else:
+                    power_txt = (f"moc: {power_meter(shared, limit)} {live_tx or '?'}/{TX_POWER_CAP} wspolna"
+                                 + limit_txt)
+                    power_attr = 0
+                    if limit and shared and shared > limit:
+                        power_txt += " - limit NIE dziala bez sterownika z latka (P)"
+                        power_attr = color_for("warn")
+                live = slow["live_power"].get(nic)
+                if planned and nic not in slow["muted"] and live is not None and live != planned:
+                    power_txt += f"   <- sterownik ma {live}! (-/+ ustawi ponownie)"
+                    power_attr = color_for("warn") | curses.A_BOLD
+                if chosen and in_wfb:
+                    if slow["card_state"] == "on":
+                        power_txt += "   -/+ = moc, [ ] = limit, 0 = wspolna"
+                    else:
+                        power_txt += ("   osobna moc i limit: P = "
+                                      + ("przeladuj" if slow["card_state"] == "reload" else "przebuduj")
+                                      + " sterownik")
+                safe_addstr(stdscr, row + 2, 4, power_txt, power_attr)
 
+                # wiersz 4: gdzie siedzi i co przez nia leci
+                speed = usb_speed_txt(card["speed"])
+                safe_addstr(stdscr, row + 3, 4,
+                            f"gniazdo {port}" + (f" ({speed})" if speed else "")
+                            + f"   USB {card['vid']}:{card['pid']}   sterownik {card['driver'] or 'BRAK'}"
+                            + (f"   mac={nic_mac(nic) or '?'}   rx={rx_pps:.0f}/s tx={tx_pps:.0f}/s"
+                               if nic else ""),
+                            0 if chosen else curses.A_DIM)
+
+                # wiersz 5: czemu karta nie moze pracowac w wfb
+                if card["driver"] != TARGET_USB_DRIVER:
+                    if chip != "nieznany" and not re.match(r"RTL88(11|12|14|21)AU", chip):
+                        why = f"{chip} to nie rodzina 8812AU - {TARGET_USB_DRIVER} jej nie obsluzy"
+                    else:
+                        why = ((f"sterownik {card['driver']}" if card["driver"] else "karta bez sterownika")
+                               + f" zamiast {TARGET_USB_DRIVER} - w = przepnij (Wykryj karty ponownie)")
+                    safe_addstr(stdscr, row + 4, 4, why, color_for("fail"))
+                row += block
+
+            y = h - foot
             if gone:
-                safe_addstr(stdscr, row, 2, "Brakuje (przydzial czeka na te karte):",
-                            color_for("fail") | curses.A_BOLD)
-                row += 1
-                for entry in gone:
-                    safe_addstr(stdscr, row, 4, card_txt(entry), color_for("fail"))
-                    row += 1
-
-            h, _ = stdscr.getmaxyx()
-            hint = "strzalki = wybor, Enter = zmien role, r = odswiez, q = powrot"
-            safe_addstr(stdscr, h - 1, 2, hint, curses.A_DIM)
+                safe_addstr(stdscr, y, 2, "Brakuje (znane z ewidencji):", color_for("fail") | curses.A_BOLD)
+                for i, entry in enumerate(gone[:3]):
+                    safe_addstr(stdscr, y + 1 + i, 4, card_txt(entry), color_for("fail"))
+                y += min(len(gone), 3) + 1
+            if events:
+                safe_addstr(stdscr, y, 2, "Zdarzenia:", curses.A_BOLD)
+                for i, (stamp, text, status) in enumerate(events):
+                    safe_addstr(stdscr, y + 1 + i, 4, f"{stamp}  {text}", color_for(status))
+            safe_addstr(stdscr, h - 2, 2,
+                        "gora/dol = karta   lewo/prawo + Enter albo 1/2/3 = RX/TX/RXTX"
+                        "   -/+ = moc karty   [ ] = limit karty   0 = moc wspolna", curses.A_DIM)
+            safe_addstr(stdscr, h - 1, 2,
+                        "P = sterownik z moca per karta   w = przepnij pod sterownik wfb   "
+                        + ("z = zapomnij brakujace   " if gone else "")
+                        + "q = powrot   (TX i RXTX dzialaja w wfb-ng tak samo)", curses.A_DIM)
             stdscr.refresh()
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q"), 27):
                 break
-            if key in (curses.KEY_UP, ord("k")) and nics:
-                idx = (idx - 1) % len(nics)
-            elif key in (curses.KEY_DOWN, ord("j")) and nics:
-                idx = (idx + 1) % len(nics)
-            elif key in (10, 13, curses.KEY_ENTER) and nics:
-                stdscr.timeout(-1)
-                nic = nics[idx]
-                if not role_split_used():
-                    popup(stdscr, "Nie ma czego rozdzielac",
-                          [f"{ROLE} pracuje na jednej karcie i ta sama karta",
-                           "odbiera i nadaje. Przydzial rol ma sens tam, gdzie",
-                           "kart sa dwie."], status="warn")
+            card = cards.get(sel)
+            nic = card_nic(card) if card else ""
+            current = next((i for i, (r, _) in enumerate(ROLE_SWITCH) if r == role_of_name(nic)), None)
+            if key in (curses.KEY_UP, ord("k")) and ports:
+                sel, cursor = ports[(idx - 1) % len(ports)], None
+            elif key in (curses.KEY_DOWN, ord("j")) and ports:
+                sel, cursor = ports[(idx + 1) % len(ports)], None
+            elif key in (curses.KEY_LEFT, ord("h")) and card:
+                start = cursor if cursor is not None else current
+                cursor = 0 if start is None else max(0, start - 1)
+            elif key in (curses.KEY_RIGHT, ord("l")) and card:
+                start = cursor if cursor is not None else current
+                cursor = 0 if start is None else min(len(ROLE_SWITCH) - 1, start + 1)
+            elif key in (10, 13, curses.KEY_ENTER) and card:
+                if cursor is None:
+                    flash = ("wybierz role strzalkami lewo/prawo albo klawiszem 1/2/3", "warn", now + 4)
                 else:
-                    choices = [n for n in NIC_NAMES]
-                    buttons = tuple(role_txt(role_of_name(n), short=True) for n in choices) + ("Anuluj",)
-                    holder = {n: n for n in nics}
-                    lines = [f"Karta {nic}   mac={nic_mac(nic) or '?'}",
-                             f"gniazdo USB {nic_usb_txt(nic)}",
-                             "",
-                             "Nowa rola tej karty:"]
-                    lines += [f"  {role_txt(role_of_name(n), short=True):<14} = {n}"
-                              + ("   (teraz zajete)" if n in holder and n != nic else "")
-                              for n in choices]
-                    lines += ["",
-                              "Karta, ktora trzyma wybrana nazwe, dostanie w zamian",
-                              "nazwe tej karty - inaczej zostalaby bez przydzialu.",
-                              "Na czas zmiany usluga jest zatrzymana."]
-                    pick = popup(stdscr, "Przypisanie roli", lines, buttons,
-                                 status="warn", default=len(buttons) - 1)
-                    if pick < len(choices) and choices[pick] != nic:
-                        role_apply_screen(stdscr, nic, choices[pick])
-                stdscr.timeout(1000)
-            elif key in (ord("r"), ord("R")):
-                _nic_status_cache["val"] = None
+                    msg, st = set_role(nic, ROLE_SWITCH[cursor][0])
+                    flash, cursor = (msg, st, time.monotonic() + 8), None
+            elif key in (ord("1"), ord("2"), ord("3")) and card:
+                msg, st = set_role(nic, ROLE_SWITCH[key - ord("1")][0])
+                flash, cursor = (msg, st, time.monotonic() + 8), None
+            elif key in (ord("+"), ord("="), ord("-"), ord("_"), ord("0"), ord("["), ord("]")) and card:
+                if slow["card_state"] != "on":
+                    flash = ("osobna moc i limit karty wymagaja sterownika z latka - P = "
+                             + ("przeladuj" if slow["card_state"] == "reload" else "przebuduj") + " sterownik",
+                             "warn", now + 6)
+                else:
+                    limit = slow["limits"].get(nic, TX_POWER_CAP)
+                    step = POWER_STEP if key in (ord("+"), ord("="), ord("]")) else -POWER_STEP
+                    if key in (ord("["), ord("]")):
+                        ok, msg = set_card_limit(nic, max(1, min(TX_POWER_CAP, limit + step)))
+                    elif key == ord("0"):
+                        ok, msg = set_card_power(nic, 0)
+                    else:
+                        shared = int(live_tx) if live_tx and live_tx.isdigit() else TX_POWER_CAP
+                        current = min(slow["powers"].get(nic) or shared, limit)
+                        ok, msg = set_card_power(nic, max(1, min(limit, current + step)))
+                    flash = (msg, "ok" if ok else "fail", time.monotonic() + 6)
+                    if not ok:
+                        note("BLAD MOCY: " + msg, "fail")
+                    slow["sig"] = None
+            elif key in (ord("P"), ord("p")):
+                stdscr.timeout(-1)
+                card_txpower_driver_screen(stdscr)
+                stdscr.timeout(500)
+                slow["sig"] = None
+            elif key in (ord("w"), ord("W")):
+                stdscr.timeout(-1)
+                redetect_screen(stdscr)
+                stdscr.timeout(500)
+                slow["sig"] = None
+            elif key in (ord("z"), ord("Z")) and slow["gone"]:
+                for entry in slow["gone"]:
+                    forget_card(entry["key"])
+                note("zapomniano brakujace karty (i ich role)", "warn")
+                slow["sig"] = None
     finally:
         stdscr.timeout(-1)
 
@@ -7058,7 +7963,7 @@ def main_menu(stdscr):
         "Pokaz biezaca konfiguracje",
         "Wykryj karty ponownie (naprawa)",
         "Identyfikacja kart (wypnij dongla)",
-        "Przypisanie rol kart (TX / RX)",
+        "Karty na zywo: chip, urzadzenie, rola RX/TX",
         "Klucze i parowanie",
         "Test polaczenia (sygnal, straty, ping)",
         "Test obciazeniowy (ruch jak wideo)",
@@ -7126,7 +8031,7 @@ def main_menu(stdscr):
             elif idx == 2:
                 nic_identify_screen(stdscr)
             elif idx == 3:
-                nic_roles_screen(stdscr)
+                cards_live_screen(stdscr)
             elif idx == 4:
                 keys_screen(stdscr)
             elif idx == 5:

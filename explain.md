@@ -44,7 +44,7 @@ Opisuje **co robi każda funkcja** i **jak funkcje współpracują ze sobą**.
 | `drone.py` | Raspberry Pi w powietrzu | to samo, rola `drone` |
 | `podglad_testu.py` | Windows / dowolny pulpit | rysuje wykresy z logów testu (tkinter) |
 
-**`gs.py` i `drone.py` to ten sam program.** Różnią się wyłącznie ~117 liniami
+**`gs.py` i `drone.py` to ten sam program.** Różnią się wyłącznie ~100 liniami
 konfiguracji roli — resztę trzymaj identyczną. Wszystkie opisy poniżej dotyczą
 obu plików tak samo.
 
@@ -56,9 +56,7 @@ Co je różni:
 | `PEER_IP` | `10.5.0.2` | `10.5.0.1` |
 | `PEER_NAME` | `"drone"` | `"gs"` |
 | `EXPECTED_NICS` | `1` | `2` |
-| `NIC_NAMES` | `["gs_wfb"]` | `["drone_RX", "drone_TX"]` |
-| `NIC_ROLES` | `{"gs_wfb": "txrx"}` | `{"drone_RX": "rx", "drone_TX": "tx"}` |
-| `RX_ONLY_NICS` | `[]` | `["drone_RX"]` |
+| `DEFAULT_NIC_ROLES` | `["txrx"]` | `["rx", "tx"]` |
 | `ROLE_SECTION` | `connect://` (odbiera) | `listen://` (nadaje) |
 
 > **Jak wprowadzać zmiany:** zmień `gs.py`, potem przenieś różnicę do `drone.py`:
@@ -136,7 +134,7 @@ uratowane             =  przed − po                        ← zasługa FEC
 | `ROLE` | `"gs"` / `"drone"` — wchodzi w nazwy sekcji configu i usługi |
 | `PEER_IP`, `PEER_NAME` | druga strona w tunelu (`10.5.0.1` ↔ `10.5.0.2`) |
 | `SSH_PORT` | port sprawdzany przy teście dostępności drugiej strony |
-| `EXPECTED_NICS` | ile kart RTL ma być — inaczej weryfikacja krzyczy |
+| `EXPECTED_NICS` | **minimum** kart RTL — mniej = weryfikacja krzyczy; więcej wolno, role ustawia się w menu (§19) |
 
 ### Radio
 | Stała | Znaczenie |
@@ -225,6 +223,11 @@ kanał.
 | `usb_speed_txt(speed)` | `480` → `USB 2.0, 480 Mb/s`. Dongiel w porcie 2.0 przy pełnym wideo gubi pakiety, a po gnieździe tego nie widać |
 | `usb_port_txt(port)` | gniazdo po ludzku: `1-1.4  (magistrala 1, gniazdo 1.4, USB 2.0, 480 Mb/s)` |
 | `nic_usb_txt(nic, short=False)` | to samo, ale od razu dla interfejsu |
+| `usb_wifi_dongles()` | dongle Wi-Fi na USB **wprost z sysfs**: `{gniazdo: vid, pid, producent, produkt, prędkość, sterownik, interfejsy}`. Bez `lsusb` i `wfb-nics` — widzi kartę od razu po wpięciu, zanim dostanie nazwę, i także pod cudzym sterownikiem albo bez żadnego |
+| `usb_intf_driver_nics(port)` | `(sterownik, [interfejsy])` z interfejsów USB `<gniazdo>:<konf>.<nr>` |
+| `usb_ids_names(vid, pid)` | `(producent, produkt)` z bazy `usb.ids` — tej samej, z której korzysta `lsusb` (`USB_IDS_PATHS`); wynik trzymany w pamięci |
+| `usb_chip_txt(info)` | `(chip, skąd wiadomo)`: napis z karty → `usb.ids` → ID referencyjne Realteka (`REALTEK_PID_CHIPS`) → sterownik (`rtw88_8812au` → `RTL8812AU`, `DRIVER_CHIPS`; sterownik mówi tylko o rodzinie) |
+| `usb_device_txt(info)` | nazwa urządzenia albo **`generic`**. VID Realteka (`0bda`) to ID referencyjne, które wstawia każdy klon — pod `0bda:8812` siedzi i markowa karta, i klon o zupełnie innej mocy, więc bez własnego napisu producenta w EEPROM nazwy nie da się ustalić. Nazwa z `usb.ids` liczy się tylko dla VID-u innego niż Realteka |
 | `nic_mac(nic)` | MAC małymi literami — **na nim wieszamy nazwy**, bo jedzie razem z donglem |
 | `nic_details(nic)` | komplet: sterownik, MAC, gniazdo, tryb (monitor?), kanał |
 | `nic_counters(nic)` | `(rx_packets, tx_packets)` z `/sys/class/net/<nic>/statistics` |
@@ -283,9 +286,10 @@ Wyższy poziom:
 | `build_config(channel, region)` | treść świeżego configu |
 | `save_common_config(channel, region)` | zapis kanału i regionu **bez deptania reszty** |
 | `ensure_video_service_type(nics)` | `udp_direct_tx` nie obsłuży kilku kart — przy >1 karcie podmienia `service_type` na `udp_proxy`, inaczej usługa restartuje się w kółko |
-| `rx_only_nics(nics)` | karty, które mają milczeć: `RX_ONLY_NICS` **plus te bez przydziału** (`wlanX`) — patrz §19 |
-| `txpower_cfg_value(nics)` | treść `wifi_txpower` dla `[common]` |
-| `ensure_tx_split(nics)` | wymusza, że nadaje **tylko karta z rolą TX** |
+| `rx_only_nics(nics)` | karty, które mają milczeć: z rolą `rx` **plus te bez przydziału** (`wlanX`) — patrz §19 |
+| `muted_nics(nics)` | karty, które config **naprawdę** wycisza: `rx_only_nics()` minus bezpiecznik (jedna karta albo same RX = nikt nie milczy) |
+| `txpower_cfg_value(nics)` | treść `wifi_txpower` dla `[common]`: `'off'` dla wyciszonych, `-indeks*100` dla kart z własną mocą (tylko przy sterowniku z łatką, §8), `None` dla reszty; całość `None`, gdy nie ma w nim nic do powiedzenia |
+| `ensure_tx_split(nics)` | wymusza, że karty z rolą RX (i bez przydziału) **nie nadają** |
 | `apply_tx_split(nics, say)` | rozdział ról + restart **z wycofaniem**, gdy usługa nie wstanie |
 
 ---
@@ -298,12 +302,69 @@ Wyższy poziom:
 | `write_modprobe_wfb(tx_power)` | blacklisty konkurencyjnych sterowników + `rtw_tx_pwr_idx_override` |
 | `apply_tx_power_live(tx_power)` | 0–63 **natychmiast**, bez przeładowania modułu (przez sysfs) |
 | `read_tx_power_live()` | aktualna wartość z sysfs |
+| `driver_card_txpower(max_age)` | czy sterownik umie **moc per karta**: `"on"` (załadowany moduł z łatką albo niezaładowany, ale zbudowany z nią), `"reload"` (zbudowany z łatką, w pamięci stary), `""` (bez łatki). Poznaje po parametrze modułu `rtw_wfb_card_txpower`, a nie po wersji |
+| `card_powers(nics)` | `{karta: własny indeks mocy}` z ewidencji — moc wisi na MAC-u, więc jedzie z kartą tak jak rola |
+| `card_power_live(nic)` | indeks mocy karty według sterownika (`iw dev X info`; łatka zwraca tam `-indeks`) — do wykrycia rozjazdu z zapisem |
+| `set_card_power(nic, power)` | własna moc karty `1..limit karty` albo `0` = wspólna: ewidencja + config + **od razu** przez `iw`, bez restartu usługi |
+| `card_limits(nics)` | `{karta: limit mocy}` z ewidencji — sufit tej karty |
+| `set_card_limit(nic, limit)` | limit mocy karty; `TX_POWER_CAP` (albo `0`) = bez limitu. Własna moc ponad nowy limit od razu schodzi do niego |
+| `shared_power_index(live)` | moc wspólna jako liczba (zapisana albo z sysfs); `None` dla `0`, bo to nie moc, tylko kalibracja EEPROM |
+| `card_power_plan(nics, live)` | `{karta: indeks ustawiany jej osobno}`: własna moc ścięta limitem, a karta bez własnej mocy dostaje swój limit, **gdy wspólna go przekracza**. Z planu biorą się i config, i ustawienie na żywo, i weryfikacja |
+| `apply_card_power_live(nic, nics)` | ustawia sterownikowi moc karty według planu: `-indeks*100` albo `1800` (powrót do wspólnej) |
+| `power_meter(value, limit)` | pasek mocy z kreską `\|` w miejscu limitu karty |
 | `channel_freq(channel)` | numer kanału → MHz (2.4 GHz i 5 GHz) |
 | `channel_span(freq)` | zakres zajmowany przez HT20 — to **on**, a nie sama częstotliwość, musi się zmieścić w domenie |
 | `reg_domain_ranges()` | `(kraj, [(od, do), …])` z `iw reg get` |
 | `channel_allowed(freq, ranges)` | czy **cały** kanał HT20 mieści się w dozwolonym paśmie |
 | `set_nic_channel(nic, channel)` | przestawia jedną kartę (niektóre sterowniki przyjmują tylko część składni — funkcja próbuje wariantów) |
 | `set_channel_live(channel)` | przestawia **wszystkie** karty przez `iw`, bez restartu usługi |
+
+### Moc per karta — łatka sterownika
+
+Różne dongle przy tym samym indeksie dają zupełnie inną moc (inny wzmacniacz,
+inna kalibracja w EEPROM), więc trzeba móc ustawić ją każdej karcie osobno.
+Sterownik svpcom/rtl8812au (`DRIVER_TAG`) tego **nie umie** — sprawdzone w jego
+źródłach:
+
+- `iw dev X set txpower fixed -N00` wpisuje `N` do **jednej zmiennej całego
+  modułu** (`rtw_tx_pwr_idx_override`), czyli zmienia moc **wszystkim** kartom
+  i wygrywa ostatnio ustawiona. wfb-ng ze słownikiem mocy w `wifi_txpower`
+  wpada dokładnie w to.
+- Dodatnia wartość trafia do `CurrentTxPwrIdx` karty, ale ten czyta tylko kod
+  RTL8814AU; na 8812AU zeruje jedynie wspólną moc.
+- `/proc/.../tx_power_offset` jest w kodzie, ale nic go nie rejestruje ani nie używa.
+
+`CARD_TXPOWER_PATCH` dodaje do danych HAL karty pole `TxPwrIdxCard`: niezerowe
+wygrywa ze wspólnym parametrem we **wszystkich 6 miejscach**, w których sterownik
+podmienia moc (`get_card_tx_power_index`), a `iw set txpower fixed -N00` pisze już
+tylko do tej karty (`fixed 1800` zdejmuje własną moc). Parametr modułu
+`rtw_wfb_card_txpower` jest znakiem, że łatka siedzi w module.
+
+| Funkcja | Co robi |
+|---|---|
+| `card_txpower_patched(texts)` | łatka na tekstach źródeł; każdy wzorzec musi pasować **dokładnie raz**, inaczej zero zmian — pół łatki jest gorsze niż żadna. Źródła już załatane zostawia w spokoju |
+| `patch_driver_card_txpower(src_dir)` | to samo na plikach sklonowanych źródeł |
+| `clone_driver_source(src_dir)` | `git clone` + poprawka `dkms.conf` pod nagłówki Raspberry Pi OS |
+| `dkms_driver_versions()` | wersje sterownika w `dkms status` (format różni się między wersjami dkms) |
+| `rebuild_driver_card_txpower(say)` | dla Pi zainstalowanych wcześniej: buduje **obok** starego (wersja dkms `DRIVER_DKMS_VERSION_CARD`), podmienia dopiero po udanej kompilacji, a nieudana instalacja przywraca stary moduł |
+| `reload_wfb_driver(say)` | `modprobe -r` + `modprobe` — nowy kod działa dopiero po przeładowaniu; usługa stoi kilkanaście sekund. Moduł zajęty → prośba o reboot |
+| `card_txpower_driver_screen(stdscr)` | klawisz `P` na ekranie kart: pyta, przebudowuje i/lub przeładowuje |
+
+W configu liczby per karta (`-indeks*100`) lądują **wyłącznie przy sterowniku
+`"on"`** — bez łatki karty nadpisywałyby sobie moc. Karta RX dostaje `'off'`
+niezależnie od własnej mocy, a karta bez własnej mocy — `None`, czyli moc wspólną
+(chyba że jej limit jest niższy od wspólnej).
+
+**Limit mocy karty** to sufit, którego karta nie przekroczy ani własną mocą, ani
+wspólną — np. mocny dongiel, który na pełnej mocy grzeje się albo ciągnie za dużo
+prądu z USB. Działa przez tę samą łatkę: karta bez własnej mocy, której limit jest
+niższy od wspólnej, dostaje limit jako własny indeks (`card_power_plan`). Przy
+wspólnej `0` (kalibracja EEPROM) nie wiadomo, ile to jest, więc limit ścina wtedy
+tylko własną moc. `TX_POWER_CAP` zostaje górną granicą dla wszystkich kart.
+
+> Łatka nie jest sprawdzona kompilacją na każdym jądrze — dlatego świeża
+> instalacja w razie błędu buduje sterownik drugi raz bez niej, a przebudowa
+> idzie obok starego modułu.
 
 ---
 
@@ -610,7 +671,7 @@ zrobiony. Można ją puszczać wielokrotnie.
 | `is_fully_installed()` | czy wszystko na miejscu: sterownik **załadowany i skojarzony z kartą**, wfb-ng, oba klucze, config |
 | `step_packages()` | [1/7] `git`, `build-essential`, nagłówki jądra, `iw`, `rfkill`… |
 | `step_rfkill()` | [2/7] `rfkill unblock all` |
-| `step_driver()` | [3/7] sterownik RTL8812AU — klonuje i buduje, jeśli trzeba |
+| `step_driver()` | [3/7] sterownik RTL8812AU — klonuje, nakłada łatkę mocy per karta (§8) i buduje, jeśli trzeba; gdy z łatką się nie skompiluje, buduje drugi raz bez niej |
 | `step_tun()` | [4/7] moduł `tun` + wpis w `/etc/modules` |
 | `step_wfb_ng_package()` | [5/7] klucz GPG, repo apt, instalacja `wfb-ng` |
 | `step_keys()` | [6/7] klucze — wbudowane, jeśli mają poprawny format |
@@ -672,13 +733,13 @@ przełożeniu do innego portu USB.
 |---|---|
 | `parse_name_rules()` | `{kotwica: nazwa}` z naszego pliku reguł |
 | `nic_anchors(nics)` | `{interfejs: kotwica}` — domyślnie MAC, zapasowo gniazdo USB (dla kart bez czytelnego lub z powtórzonym MAC-iem) |
-| `plan_nic_names(nics)` | przydziela nazwy. **Raz ustalone przypisanie zostaje** — inaczej po każdym boocie karty zamieniałyby się rolami |
+| `plan_nic_names(nics)` | przydziela nazwy, czyli role. **Raz ustalone przypisanie zostaje** — także dla karty chwilowo wypiętej. Nowa karta dostaje pierwszą nieobsadzoną rolę z `DEFAULT_NIC_ROLES`, a gdy układ startowy jest już obsadzony — `SPARE_NIC_ROLE` |
 | `write_name_rules(by_anchor)` | zapis pliku udev + `udevadm control --reload-rules`. Zwraca `False`, gdy treść się nie zmieniła |
 | `rename_nic(old, new)` | zmiana nazwy — jądro pozwala **tylko interfejsowi w stanie DOWN** |
 | `update_wfb_defaults(renames)` | podmiana nazw w `WFB_NICS`, jeśli plik wymienia karty wprost |
-| `ensure_nic_names()` | całość: zaplanuj, zapisz reguły, przemianuj, popraw `/etc/default`, odśwież ewidencję |
+| `ensure_nic_names()` | całość: zaplanuj, zapisz reguły, przemianuj (przez `apply_nic_renames`, więc także zamiany nazw), popraw `/etc/default`, odśwież ewidencję |
 
-### Role: TX czy RX
+### Role: TX, RX albo oba — dla dowolnej liczby kart
 
 **Rola siedzi w nazwie karty**, a nazwa jest przypięta do MAC-a — dlatego
 przypisanie karty do roli sprowadza się do nadania jej właściwej nazwy i dlatego
@@ -686,57 +747,75 @@ przypisanie karty do roli sprowadza się do nadania jej właściwej nazwy i dlat
 przykręcony jest jednokierunkowy wzmacniacz, nadawać ma **ta** karta, a nie ta,
 która akurat wstała pierwsza po boocie.
 
-| Funkcja | Co robi |
+Nazwa = `<ROLE>_<TX|RX|TXRX>[numer]`. Pierwsza karta danej roli jest bez numeru,
+kolejne od 2. Kart może być **dowolnie dużo**, każda z dowolną rolą, także kilka
+z tą samą (np. dwie nadające do porównania anten). `EXPECTED_NICS` to już tylko
+minimum.
+
+| Nazwa | Rola | W wfb-ng |
+|---|---|---|
+| `drone_TX`, `drone_TX2`… | `tx` — nadaje | zwykła karta (odbiera też) |
+| `drone_RX`, `drone_RX2`… | `rx` — tylko słucha | `wifi_txpower = 'off'` |
+| `drone_TXRX`, `gs_TXRX2`… | `txrx` — oba kierunki | zwykła karta |
+| `gs_wfb` | `txrx` — nazwa ze starszych wersji (`LEGACY_NIC_NAMES`) | zwykła karta |
+
+> **TX i TX+RX konfigurują wfb-ng tak samo.** wfb-ng nie ma trybu „tylko
+> nadawanie": każda karta trafia do `wfb_rx`, a z `wfb_tx` da się wyłączyć
+> jedynie kartę rx-only. `tx` to oznaczenie karty, która **ma** nadawać
+> (np. ze wzmacniaczem) — i tak jest opisane na ekranie przypisania.
+
+| Funkcja / stała | Co robi |
 |---|---|
-| `NIC_ROLES` | `{nazwa: rola}` — `"tx"` nadaje, `"rx"` tylko słucha, `"txrx"` oba kierunki |
-| `role_of_name(name)` | rola przypisana do nazwy; pusta dla `wlanX`, czyli „bez przydziału" |
-| `role_txt(role, short)` | `"tx"` → `NADAJE` / `nadaje (i odbiera)` |
-| `role_tag(name, fallback)` | etykieta `[NADAJE]` doklejana po nazwie. **Pusta na gs** — jedna karta robi oba kierunki, więc przydział niczego nie rozróżnia. Jedno miejsce na tę decyzję, bo etykieta wychodzi w nagłówku menu, na trzech ekranach i w weryfikacji |
-| `role_split_used()` | czy na tej roli jest co rozdzielać (`len(NIC_NAMES) > 1`) |
-| `names_for_role(role)` | nazwy pełniące daną rolę |
-| `rx_only_nics(nics)` | karty, które mają **nie** nadawać: z przydziałem `rx` **oraz bez żadnego przydziału** |
-| `free_ifname(taken)` | wolna nazwa `wlanN` dla karty, która straciła przydział |
-| `apply_nic_renames(wanted, say)` | wykonuje `{bieżąca: docelowa}`. Zamiana TX↔RX idzie **przez nazwę tymczasową** (`wfbswapN`), bo jądro ani na moment nie pozwoli na dwa interfejsy o tej samej nazwie |
-| `assign_nic_role(nic, target_name, say)` | całość zmiany przydziału — patrz niżej |
+| `DEFAULT_NIC_ROLES` | układ na start — role pierwszych wpiętych kart (wg gniazda USB): dron `["rx", "tx"]`, gs `["txrx"]`. **Jedyna** rolowa stała od kart |
+| `SPARE_NIC_ROLE` | `"rx"` — rola każdej karty ponad układ startowy. Dołożenie dongla nie zmienia tego, która karta nadaje |
+| `ROLE_TAGS`, `ROLE_LABELS` | rola → znacznik w nazwie; rola → etykieta krótka i długa |
+| `parse_nic_name(name)` | `(rola urządzenia, rola karty, numer)` albo `None` dla `wlanX`. Rozpoznaje też nazwy **drugiej** roli |
+| `role_of_name(name)` | rola karty **tej** maszyny; pusta dla `wlanX` i nazw drugiej roli, czyli „bez przydziału" |
+| `free_role_name(role, taken)` | pierwsza wolna nazwa roli: `drone_TX`, `drone_TX2`… Zajęte są też nazwy kart wypiętych — ich reguła dalej je trzyma |
+| `role_txt(role, short)` | `"tx"` → `NADAJE` / `nadaje (odbiera tez - …)` |
+| `role_tag(name, fallback)` | etykieta `[NADAJE]` doklejana po nazwie. Jedno miejsce na jej wygląd, bo wychodzi w nagłówku menu, na trzech ekranach i w weryfikacji |
+| `count_txt(n)` | `"1/2"`, gdy brakuje do minimum, samo `"3"`, gdy kart jest tyle albo więcej |
+| `rx_only_nics(nics)` | karty, które mają **nie** nadawać: z rolą `rx` **oraz bez żadnego przydziału** |
+| `apply_nic_renames(wanted, say)` | wykonuje `{bieżąca: docelowa}`. Zamiana nazw idzie **przez nazwę tymczasową** (`wfbswapN`), bo jądro ani na moment nie pozwoli na dwa interfejsy o tej samej nazwie |
+| `assign_nic_role(nic, role, say)` | całość zmiany roli jednej karty — patrz niżej |
 
-`assign_nic_role()` po kolei: zatrzymuje usługę → przepisuje reguły udev →
-przemianowuje interfejsy → poprawia `/etc/default` → przelicza `wifi_txpower`
-(`ensure_tx_split`, czyli `'off'` musi trafić na **nową** kartę rx-only) →
-startuje usługę. Trzy rzeczy, które załatwia po drodze:
+`assign_nic_role()` po kolei: bierze pierwszą wolną nazwę roli → zatrzymuje
+usługę → przepisuje reguły udev → przemianowuje **tę jedną** kartę → poprawia
+`/etc/default` → przelicza `wifi_txpower` (`ensure_tx_split`, czyli `'off'`
+musi trafić na karty rx według **nowych** nazw) → startuje usługę.
 
-- **Zamiana, nie nadpisanie.** Karta, która trzymała wybraną nazwę, dostaje
-  w zamian nazwę tej pierwszej — inaczej zostałaby bez przydziału.
-- **Nazwę może trzymać karta wypięta.** Zostawiona w regułach robiłaby duplikat
-  (dwie kotwice na jedną nazwę) i po wpięciu udev nie nazwałby **żadnej**.
-  Dostaje więc pierwszą wolną nazwę, a jak wolnej nie ma — wypada z reguł.
-- **Wycofanie.** Jeśli po zmianie `wfb-nics` nie widzi już żadnej karty,
-  wszystko wraca na swoje (nazwy i reguły) i funkcja zwraca `False`. Działające
-  łącze jest ważniejsze niż ładny przydział — ta sama zasada co w
-  `ensure_nic_names()`.
+- **Pozostałe karty zostają bez zmian.** Każda ma własną nazwę, więc nic się
+  nie zamienia i nikt nie traci przydziału. Chcesz zamienić TX z RX — zmień
+  rolę obu kart, po kolei.
+- **Nazwę może trzymać karta wypięta.** Jej reguła dalej ją trzyma, więc
+  `free_role_name()` liczy ją jako zajętą — dwie reguły na jedną nazwę to po
+  wpięciu karta, której udev nie nazwie **wcale**.
+- **Wycofanie.** Jeśli zmiana nazwy się nie uda albo `wfb-nics` nie widzi już
+  żadnej karty, wszystko wraca na swoje (nazwa i reguły) i funkcja zwraca
+  `False`. Działające łącze jest ważniejsze niż ładny przydział — ta sama
+  zasada co w `ensure_nic_names()`.
 
-### Więcej kart niż ról (np. trzy dongle na dwie role)
+### Nowe, zapasowe i wypięte karty
 
-Nadmiarowe karty zostają przy `wlanX` — `plan_nic_names()` rozdaje tylko nazwy
-z `NIC_NAMES` (pierwszeństwo wg gniazda USB), a resztę zostawia w spokoju.
-Którą dwójkę obsadzić w rolach, wskazuje się w menu; są tu dwie pułapki, które
-kod musi obsłużyć, bo inaczej „trzecia karta" cicho psuje link:
-
-1. **Karta bez przydziału też nie może nadawać.** `wfb_tx` rozkłada pakiety
-   między wszystkie karty z włączonym nadawaniem, więc dongiel wpięty „na zapas"
-   zabrałby część wideo torowi ze wzmacniaczem — dokładnie to, czemu rozdział
-   ról ma zapobiegać. Stąd `rx_only_nics()` wycisza (`'off'`) także `wlanX`,
-   a nie tylko `RX_ONLY_NICS`. Bezpiecznik zostaje: gdyby wyszło, że **wszystkie**
-   karty miałyby milczeć, wpis nie powstaje — lepiej nadawać torem bez
-   wzmacniacza niż nie nadawać wcale.
-2. **Wywłaszczona karta musi oddać nazwę.** Gdy trzecia karta przejmuje
-   `drone_TX`, dla poprzedniej nie ma już wolnego przydziału — a dopóki trzyma
-   nazwę `drone_TX`, jądro odmówi (`File exists`) i cała zmiana stanęłaby
-   w połowie: reguły przepisane, interfejsy nie. Dlatego trafia do `wanted`
-   z nazwą z `free_ifname()` i wraca do `wlanX` (`apply_nic_renames()` sam
-   ustawia kolejność).
-
-> Przy dwóch kartach na dwie role żadna nie zostaje bez przydziału — karty
-> po prostu zamieniają się nazwami.
+1. **Karta bez roli nadawczej nie może nadawać.** `wfb_tx` rozkłada pakiety
+   między wszystkie karty z włączonym nadawaniem, więc dongiel wpięty „na
+   próbę" zabrałby część wideo torowi ze wzmacniaczem. Dlatego nowa karta
+   ponad układ startowy dostaje `SPARE_NIC_ROLE` (`rx`), a `rx_only_nics()`
+   wycisza też karty, które nazwy nie dostały (`wlanX`).
+2. **Bezpiecznik.** Gdyby wyszło, że **wszystkie** karty mają milczeć (np.
+   każdej ustawiono RX), wpis `wifi_txpower` nie powstaje — lepiej nadawać
+   torem bez wzmacniacza niż nie nadawać wcale. Ekran ról i weryfikacja mówią
+   o tym wprost.
+3. **Wypięta karta zachowuje nazwę.** Nazw nie brakuje, więc `plan_nic_names()`
+   nie oddaje nazwy nieobecnej karty nowej — karta ze wzmacniaczem po złym
+   kablu wraca jako nadająca, a nie jako „ta, która została". Regułę zmiata
+   dopiero `z` („zapomnij") na ekranie identyfikacji.
+4. **Karta z naszą nazwą, ale bez reguły** (np. skasowany plik reguł) zostaje
+   przy swojej nazwie, zamiast po cichu zmienić rolę.
+5. **Karta wpięta na żywo** pojawia się na ekranie „Karty na zywo" od razu,
+   **bez roli** (`wlanX`) — nie nadaje, dopóki nie wybierzesz jej roli
+   przełącznikiem. `SPARE_NIC_ROLE` dostałaby dopiero przy „Wykryj karty
+   ponownie" albo po reboocie.
 
 ### Ewidencja kart — „którą kartę wyjąłem?"
 
@@ -751,7 +830,7 @@ reboocie z wypiętym donglem.
 | `anchor_key(anchor)` | kotwica jako jeden ciąg (`mac:aa:bb:…`) — **ta sama** co w regułach udev, więc nazwy i ewidencja mówią o tej samej karcie |
 | `load_cards()` / `save_cards(cards)` | odczyt i zapis. Uszkodzony plik = pusty; brak roota = jedziemy dalej. To tylko pamięć pomocnicza |
 | `remember_cards(nics)` | dopisuje karty widoczne **teraz**. Wpisów nieobecnych **nie kasuje** — to one są całą wartością pliku |
-| `forget_card(key)` | usuwa wpis (klawisz `z` na ekranie identyfikacji) — dla karty wymienionej na inną, żeby nie wisiała wiecznie jako „brakująca" |
+| `forget_card(key)` | usuwa wpis **razem z regułą nazwy** (klawisz `z` na ekranie identyfikacji) — dla karty wymienionej na inną albo wpiętej na próbę, żeby nie wisiała wiecznie jako „brakująca" i nie trzymała nazwy. Jeśli wróci, dostanie rolę jak nowa karta |
 | `missing_cards(nics)` | wpisy, których teraz nie ma — czyli dokładnie te wypięte |
 | `card_txt(entry)` | `drone_TX [NADAJE]   mac=…   gniazdo USB 1-1.4   ostatnio: …` |
 | `missing_cards_txt(nics)` | krótka wersja do nagłówka menu i do `collect_checks()` |
@@ -980,13 +1059,13 @@ dobrym sygnale znaczy coś zupełnie innego niż „słaby link":
 | `main_menu(stdscr)` | menu główne. Przy zapisie w tle odświeża się **samo co sekundę**, żeby licznik próbek szedł do przodu; `erase()` zamiast `clear()`, bo pełne czyszczenie migałoby |
 | `show_config_screen(stdscr)` | bieżąca konfiguracja (pager) |
 | `redetect_screen(stdscr)` | ta sama naprawa co przy starcie, ale z menu — po wpięciu dongla |
-| `nic_identify_screen(stdscr)` | **żywy podgląd kart**: wypnij dongla, a ekran powie, **która nazwa, rola i gniazdo** właśnie zniknęły. Dwa identyczne dongle 8812AU wyglądają tak samo i inaczej nie da się ich rozróżnić. Na dole karty znane z ewidencji, których nie ma; `z` = zapomnij je |
-| **`nic_roles_screen(stdscr)`** | **przypisanie kart do ról TX / RX**: lista kart z rolą, MAC-iem, gniazdem USB i stanem w usłudze, Enter = zmiana roli. Na gs mówi tylko, że nie ma czego rozdzielać |
-| **`role_apply_screen(stdscr, nic, target)`** | wykonanie zmiany z widocznym przebiegiem — usługa na te kilka sekund stoi, więc ekran nie może zamarznąć bez słowa |
+| `nic_identify_screen(stdscr)` | **żywy podgląd kart**: wypnij dongla, a ekran powie, **która nazwa, rola i gniazdo** właśnie zniknęły. Dwa identyczne dongle 8812AU wyglądają tak samo i inaczej nie da się ich rozróżnić. Na dole karty znane z ewidencji, których nie ma; `z` = zapomnij je (razem z ich regułami nazw) |
+| **`cards_live_screen(stdscr)`** | **karty na żywo**: każdy dongiel Wi-Fi na USB (z sysfs, więc widać go **od razu po wpięciu**, także bez interfejsu i pod cudzym sterownikiem) z **chipem**, **nazwą urządzenia albo `generic`**, gniazdem i prędkością USB, ID USB, sterownikiem, MAC-iem, ruchem rx/tx i **przełącznikiem roli `RX / TX / RXTX`**. Świeżo wpięta karta pojawia się bez roli i sama wskakuje pod kursor. Góra/dół = karta, lewo/prawo = wybór roli, Enter = ustaw, `1`/`2`/`3` = ustaw od razu, `w` = przepięcie pod sterownik wfb (`redetect_screen`), `z` = zapomnij brakujące. Wolne rzeczy (`wfb-nics`, `service_nics`, ewidencja) liczy tylko przy zmianie w sysfs albo co 3 s; zmiana roli idzie przez `assign_nic_role` z przebiegiem w linijce komunikatu. **Moc:** wiersz z paskiem i `wlasna`/`wspolna` (i ostrzeżeniem, gdy sterownik ma co innego niż zapis), `-`/`+` = moc karty co `POWER_STEP`, `[`/`]` = limit mocy karty (do `TX_POWER_CAP` = bez limitu; na pasku kreska `\|`), `0` = wspólna, `P` = sterownik z mocą per karta (`card_txpower_driver_screen`) |
 | `nic_role_txt(nic)` / `nic_snapshot()` | pomocnicze do powyższych (lekko, bez wołania `iw`) |
 | `keys_screen(stdscr)` | klucze i parowanie: stan, odcisk, wpisanie kodu, wygenerowanie własnych |
 | `show_pairing_code_screen(stdscr, code)` | kod w ramce do przepisania |
-| `radio_settings_screen(stdscr)` | region i moc nadawania (kanału **tu się nie ustawia**) |
+| `region_screen(stdscr)` | sam region (CRDA); otwiera się klawiszem `r` z listy kanałów (kanału **tu się nie ustawia**) |
+| `tx_power_screen(stdscr)` | moc **wspólna** (menu „Moc nadawania (TX)"), na żywo przez sysfs, bez restartu usługi; potem `reapply_card_powers()` ustawia od nowa własną moc i limity kart względem nowej wspólnej — inaczej limit byłby łamany do restartu usługi |
 | `link_test_screen(stdscr)` | żywy test łącza + start/stop zapisu w tle, `z` zeruje liczniki, **`m` stawia znacznik w logu** |
 | `channel_screen(stdscr)` | wybór kanału z podpowiedzią, który wolny |
 | `channel_rows(...)` | wiersze listy kanałów: numer, MHz, pasmo, legalność, zajętość ze skanu |
@@ -1009,15 +1088,16 @@ dobrym sygnale znaczy coś zupełnie innego niż „słaby link":
  0 Pokaz biezaca konfiguracje          → show_config_screen
  1 Wykryj karty ponownie (naprawa)     → redetect_screen
  2 Identyfikacja kart (wypnij dongla)  → nic_identify_screen
- 3 Przypisanie rol kart (TX / RX)      → nic_roles_screen    ← nowe
+ 3 Karty na zywo: chip, urzadzenie, rola → cards_live_screen
  4 Klucze i parowanie                  → keys_screen
  5 Test polaczenia                     → link_test_screen
  6 Test obciazeniowy                   → load_test_screen
  7 Kanal i czestotliwosc               → channel_screen
- 8 Wybor modulacji (MCS)               → modulation_screen
- 9 Naprawa utraconych pakietow (FEC)   → repair_screen
-10 Uruchom weryfikacje                 → verification_screen
-11 Wyjdz                               → confirm_exit
+ 8 Moc nadawania (TX)                  → tx_power_screen
+ 9 Wybor modulacji (MCS)               → modulation_screen
+10 Naprawa utraconych pakietow (FEC)   → repair_screen
+11 Uruchom weryfikacje                 → verification_screen
+12 Wyjdz                               → confirm_exit
 ```
 
 > Dodając pozycję, pamiętaj o **obu** listach: `items` i drabince `elif idx == …`.
@@ -1189,8 +1269,15 @@ bo przy porównaniu kreski z kilku testów zlałyby się w płot.
 | dodać ją do odczytu pod kursorem | `ChartArea.READOUT` |
 | dodać ją do panelu bocznego | `App.STAT_ROWS` lub `App._repair_lines()` |
 | dodać pozycję menu | `main_menu()` — **`items` i drabinka `elif`** |
-| dodać / zmienić rolę karty (TX, RX) | `NIC_NAMES` **i** `NIC_ROLES` (każda nazwa musi mieć rolę), a rx-only także `RX_ONLY_NICS` |
-| zmienić, którą kartę fizycznie obsadzić w roli | nic w kodzie — menu „Przypisanie rol kart" (`assign_nic_role`) |
+| zmienić role, z jakimi startują pierwsze karty | `DEFAULT_NIC_ROLES` (osobno w `gs.py` i `drone.py`) |
+| zmienić rolę dokładanych kart | `SPARE_NIC_ROLE` |
+| dodać nowy rodzaj roli | `ROLE_TAGS` **i** `ROLE_LABELS`, a jej skutek w wfb-ng — `rx_only_nics()` |
+| wpiąć więcej kart / zmienić rolę konkretnej karty | nic w kodzie — menu „Karty na zywo" (`cards_live_screen` → `assign_nic_role`) |
+| ustawić moc jednej karty | menu „Karty na zywo" → `-`/`+`/`0` (`set_card_power`); wymaga sterownika z łatką — tam `P` |
+| ograniczyć moc jednej karty (limit) | menu „Karty na zywo" → `[`/`]` (`set_card_limit`); działa ze sterownikiem z łatką |
+| zmienić krok mocy i limitu na ekranie kart | `POWER_STEP` |
+| łatka mocy nie pasuje do nowej wersji sterownika | `CARD_TXPOWER_PATCH` — każdy wzorzec musi pasować dokładnie raz, test w `card_txpower_patched` |
+| nauczyć ekran nowego chipu / sterownika | `REALTEK_PID_CHIPS` (ID referencyjne) albo `DRIVER_CHIPS`; nazwy urządzeń idą z systemowego `usb.ids` |
 | dopisać pole do ewidencji kart | `remember_cards()` (zapis) **i** `card_txt()` (wyświetlanie) |
 | zmienić progi oceny | `rssi_grade` / `loss_grade` / `snr_grade` **oraz** `RSSI_BANDS` / `LOSS_BANDS` w podglądzie |
 
