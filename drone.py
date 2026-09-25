@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""WFB-NG - instalator + pseudo-graficzny (curses) TUI, rola: DRONE.
+"""WFB-NG - instalator + pseudo-graficzny (curses) TUI dla drona i gs.
 
-Pierwsze uruchomienie (na swiezym Raspberry Pi OS, z podlaczonymi kartami
+drone.py i gs.py to TEN SAM kod - rozni je tylko linia ROLE = "..." ponizej,
+a wszystko, co zalezy od strony (adres drugiej strony, porty wideo, sekcja
+configu, nazwy kart), liczy sie z niej. Poprawka w jednym pliku = skopiowac
+plik i podmienic ROLE, zeby obie strony zawsze zachowywaly sie identycznie.
+
+Pierwsze uruchomienie (na swiezym Raspberry Pi OS, z podlaczona karta
 RTL8812AU) robi caly setup: pakiety systemowe, sterownik karty, klucze
 szyfrujace, /etc/wifibroadcast.cfg, usluge systemd. Kolejne uruchomienia
 (setup juz gotowy) od razu otwieraja konfigurator/weryfikator.
 
-Dron ma zwykle DWA dongle USB, gs jeden (EXPECTED_NICS to minimum - wpiac
-mozna dowolnie wiecej). Wfb-ng odbiera ze wszystkich kart zwroconych przez
-wfb-nics (dywersyfikacja - wygrywa ta z lepszym sygnalem), a nadaje przez te
-z rola nadawcza. Kazdy start sprawdza, czy karty faktycznie sa widoczne,
+Obie strony maja domyslnie JEDNA karte, ktora nadaje i odbiera (<rola>_TXRX)
+- EXPECTED_NICS to minimum, wpiac mozna dowolnie wiecej. Wfb-ng odbiera ze
+wszystkich kart zwroconych przez wfb-nics (dywersyfikacja - wygrywa ta
+z lepszym sygnalem), a nadaje przez te z rola nadawcza. Kazdy start sprawdza, czy karty faktycznie sa widoczne,
 przepiete pod nasz sterownik i przepuszczaja ruch.
 
 Karty dostaja stale nazwy zamiast wlanX - przypiete regula udev do MAC-a
 karty, wiec ta sama karta ma zawsze te sama nazwe, niezaleznie od portu USB.
-Nazwa niesie role: drone_TX nadaje, drone_RX tylko slucha (wpis wifi_txpower =
-'off' w configu), drone_TXRX robi oba; kolejne karty tej samej roli dostaja
-numer (drone_RX2...). Role KAZDEJ karty ustawia sie przelacznikiem na ekranie
+Nazwa niesie role: <rola>_TXRX robi oba kierunki (tak startuje jedyna karta),
+<rola>_TX nadaje, <rola>_RX tylko slucha (wpis wifi_txpower = 'off' w configu);
+kolejne karty tej samej roli dostaja numer (drone_RX2, gs_RX2...). Role KAZDEJ karty ustawia sie przelacznikiem na ekranie
 "Karty na zywo" (tam tez chip i urzadzenie kazdej karty), bo przy
 jednokierunkowym wzmacniaczu nadawac ma konkretna karta.
 
@@ -29,12 +34,12 @@ od razu, bez przenoszenia plikow. W menu jest parowanie: jedna strona pokazuje
 8-znakowy kod, na drugiej sie go wpisuje i obie licza z niego te sama, prywatna
 pare kluczy.
 
-Pierwsze uruchomienie wpisuje skrypt do autostartu (wfb-drone-autostart.service),
+Pierwsze uruchomienie wpisuje skrypt do autostartu (wfb-<rola>-autostart.service),
 wiec po kazdym reboocie powtarza sie to samo wykrywanie i te same naprawy kart -
 bez wchodzenia na Pi. Weryfikacja pokazuje, czy ten autostart jest wlaczony.
 
 Uzycie:
-    sudo python3 drone.py              # setup + konfigurator/weryfikator
+    sudo python3 drone.py              # (albo gs.py) setup + konfigurator/weryfikator
     sudo python3 drone.py --autostart  # tryb dla systemd: same naprawy, bez menu
 """
 
@@ -56,12 +61,16 @@ import threading
 import time
 from pathlib import Path
 
-ROLE = "drone"
-PEER_IP = "10.5.0.1"  # adres drugiej strony (gs) w tunelu
-PEER_NAME = "gs"
+ROLE = "drone"  # JEDYNA roznica miedzy drone.py i gs.py - reszta liczy sie z niej
+
+if ROLE not in ("drone", "gs"):
+    raise SystemExit(f"nieznana rola {ROLE!r} - dozwolone: drone, gs")
+IS_DRONE = ROLE == "drone"
+PEER_NAME = "gs" if IS_DRONE else "drone"
+PEER_IP = "10.5.0.1" if IS_DRONE else "10.5.0.2"  # adres drugiej strony w tunelu
 SSH_PORT = 22
 
-EXPECTED_NICS = 2  # MINIMUM kart na dronie (RX + TX); wiecej wolno - role w menu
+EXPECTED_NICS = 1  # MINIMUM kart po KAZDEJ stronie (jedna TX+RX); wiecej wolno - role w menu
 
 DRIVER_TAG = "v5.2.20"
 APT_RELEASE = "master"
@@ -108,7 +117,7 @@ GS_KEY = Path("/etc/gs.key")
 # z testu. Katalog skryptu, a nie biezacy, bo sudo bywa wolane z innego miejsca.
 SCRIPT_PATH = Path(__file__).resolve()
 TEST_LOG_DIR = SCRIPT_PATH.parent
-REBOOT_MARKER = Path("/etc/.wfb-drone-reboot-attempted")
+REBOOT_MARKER = Path(f"/etc/.wfb-{ROLE}-reboot-attempted")
 
 # Autostart: skrypt wpisuje sam siebie do systemd, zeby po KAZDYM restarcie Pi
 # powtorzylo sie to, co robi uruchomienie z reki - przepiecie kart pod nasz
@@ -119,40 +128,42 @@ AUTOSTART_UNIT_NAME = f"wfb-{ROLE}-autostart.service"
 AUTOSTART_UNIT = Path("/etc/systemd/system") / AUTOSTART_UNIT_NAME
 AUTOSTART_FLAG = "--autostart"
 
-# Karty dostaja stale, czytelne nazwy zamiast wlan1/wlan2 (numer zalezy od
-# kolejnosci wykrycia i potrafi sie zamienic miedzy bootami). Nazwa jest
-# przypieta regula udev do MAC-a karty, wiec jedzie razem z donglem - takze po
-# przelozeniu do innego portu USB - i niesie ROLE karty: drone_TX nadaje,
-# drone_RX tylko odbiera, drone_TXRX robi oba; kolejne karty tej samej roli
-# dostaja numer (drone_RX2...). Kart moze byc dowolnie duzo, a role kazdej
+# Karty dostaja stale, czytelne nazwy zamiast wlanX (numer zalezy od kolejnosci
+# wykrycia i potrafi sie zmienic miedzy bootami). Nazwa jest przypieta regula
+# udev do MAC-a karty, wiec jedzie razem z donglem - takze po przelozeniu do
+# innego portu USB - i niesie ROLE karty: <rola>_TX nadaje, <rola>_RX tylko
+# odbiera, <rola>_TXRX robi oba; kolejne karty tej samej roli dostaja numer
+# (drone_RX2...). Kart moze byc dowolnie duzo, a role kazdej
 # zmienia sie w menu ("Karty na zywo", assign_nic_role) - patrz ROLE_TAGS
 # i plan_nic_names. Sama nazwa nie wylacza nadawania - robi to dopiero wpis
 # wifi_txpower = 'off' w configu (rx_only_nics, ensure_tx_split).
 #
 # Tu tylko uklad NA START: jakie role dostaja pierwsze wpiete karty (po kolei
-# wg gniazda USB). Na dronie do drone_TX idzie jednokierunkowy wzmacniacz, wiec
-# po pierwszym uruchomieniu trzeba w menu sprawdzic, czy to ta karta. Kazda
-# karta ponad ten uklad dostaje SPARE_NIC_ROLE (tylko odbior), zeby dongiel
-# wpiety na probe nie zabral wideo torowi ze wzmacniaczem.
-DEFAULT_NIC_ROLES = ["rx", "tx"]
+# wg gniazda USB). Po obu stronach tak samo: jedna karta, ktora nadaje
+# i odbiera. Kazda karta ponad ten uklad dostaje SPARE_NIC_ROLE (tylko
+# odbior), zeby dongiel wpiety na probe nie zabral czesci nadawania. Starsze
+# instalacje maja jeszcze nazwe gs_wfb - rozpoznajemy ja jako txrx
+# (LEGACY_NIC_NAMES), a jedyna karte z rola rx po starym ukladzie drona
+# ("rx", "tx") plan_nic_names sam przestawia na txrx.
+DEFAULT_NIC_ROLES = ["txrx"]
 
 # Strumien wideo idzie w JEDNA strone: dron -> gs. Dron wpycha go do wfb-ng na
 # UDP 5602 ([drone_video] peer = 'listen://'), a gs oddaje odebrany strumien na
 # UDP 5600 ([gs_video] peer = 'connect://'). Test obciazeniowy uzywa dokladnie
 # tej samej drogi, wiec mierzy ten port radiowy, ten FEC i te modulacje, ktorymi
 # naprawde poleci obraz - a nie tunel, ktory ma wlasne, inne ustawienia.
-VIDEO_UDP_PORT = 5602
-VIDEO_SENDS = True  # dron nadaje obraz; gs odbiera
+VIDEO_SENDS = IS_DRONE  # dron nadaje obraz; gs odbiera
+VIDEO_UDP_PORT = 5602 if IS_DRONE else 5600
 
 UDEV_NAMES = Path("/etc/udev/rules.d/70-wfb-names.rules")
 WFB_DEFAULTS = Path("/etc/default/wifibroadcast")
 
-# WFB_NICS w /etc/default/wifibroadcast wymienia obie karty na sztywno
-# ("drone_RX drone_TX"). wfb-server odpala sie TYLKO gdy WSZYSTKIE wymienione
-# tam karty istnieja - jak jednej zabraknie (wypiety dongiel), caly proces
-# odmawia startu bledem "Device not found" i milknie TAKZE ta karta, ktora
-# nadal jest podpieta. Efekt: wypiecie drone_RX zabija rowniez nadawanie z
-# drone_TX, mimo ze fizycznie caly czas tkwi w porcie. Regula udev ponizej
+# WFB_NICS w /etc/default/wifibroadcast wymienia karty na sztywno (np.
+# "drone_RX drone_TX" ze starego ukladu albo "gs_wfb"). wfb-server odpala sie
+# TYLKO gdy WSZYSTKIE wymienione tam karty istnieja - jak ktorejs zabraknie
+# (wypiety dongiel, zmiana nazwy), caly proces odmawia startu bledem "Device
+# not found" i milknie TAKZE karta, ktora nadal jest podpieta. Dotyczy to
+# tak samo drona, jak i gs. Regula udev ponizej
 # (patrz ensure_hotplug_rule, sync_wfb_nics) na kazde dodanie/usuniecie karty
 # przepisuje WFB_NICS na to, co NAPRAWDE jest podpiete, i restartuje usluge -
 # ocalala karta wraca do nadawania w kilka sekund zamiast milczec w nieskonczonosc.
@@ -181,6 +192,11 @@ ROLE_SECTION = (
     "# peer = 'listen://0.0.0.0:14550'\n\n"
     "[drone_video]\n"
     "peer = 'listen://0.0.0.0:5602'\n"
+) if IS_DRONE else (
+    "[gs_mavlink]\n"
+    "peer = 'connect://127.0.0.1:14550'\n\n"
+    "[gs_video]\n"
+    "peer = 'connect://127.0.0.1:5600'\n"
 )
 
 
@@ -556,7 +572,7 @@ def nic_status_summary(max_age=2.0):
         if dongles > len(nics):
             txt += ", dongiel wisi na innym sterowniku"
     elif not service_active(props):
-        # Karty moga byc idealne, a i tak 0/2 - bo usluga w ogole nie wstala.
+        # Karty moga byc idealne, a i tak 0/1 - bo usluga w ogole nie wstala.
         # Radzenie "zrestartuj usluge" byloby wtedy myleniem tropu.
         status = "fail"
         txt += f"   <- USLUGA NIE DZIALA ({service_state_txt(props)})"
@@ -3810,6 +3826,19 @@ def plan_nic_names(nics):
                 and nic not in by_anchor.values()):
             by_anchor[anchor] = nic
 
+    # Stary uklad drona ("rx", "tx") dawal JEDYNEJ karcie nazwe <rola>_RX, ktora
+    # w menu i w logach wyglada na glucha, chociaz jako jedyna i tak nadaje
+    # (muted_nics nie wycisza ostatniej karty). Po obu stronach jedyna karta
+    # ma byc <rola>_TXRX - przestawiamy ja, ale tylko gdy regul naszej roli jest
+    # dokladnie jedna (druga karta chwilowo wypieta zostawia uklad w spokoju)
+    # i tylko z rx: swiadomie ustawione tx zostaje.
+    own = [(a, n) for a, n in by_anchor.items() if role_of_name(n)]
+    if len(own) == 1 and role_of_name(own[0][1]) == "rx" and own[0][0] in anchors.values():
+        anchor, old = own[0]
+        new = free_role_name("txrx", (set(by_anchor.values()) | set(nics)) - {old})
+        if new:
+            by_anchor[anchor] = new
+
     # Nieobecnej karcie NIE zabieramy nazwy: nazw jest bez liku, wiec nowa karta
     # jej nie potrzebuje, a karta ze wzmacniaczem po zlym kablu ma wrocic jako
     # nadajaca. Regule zmiata dopiero "zapomnij" (forget_card).
@@ -3856,11 +3885,11 @@ def hotplug_rules_text():
     zeby nie trzymac kolejki zdarzen na czas trwania restartu uslugi."""
     return (
         "# generowane przez skrypt wfb - nie edytuj recznie\n"
-        "# po kazdym dodaniu/usunieciu karty drone_RX albo drone_TX odswieza\n"
-        "# WFB_NICS i restartuje usluge - patrz sync_wfb_nics() w drone.py\n"
-        'SUBSYSTEM=="net", KERNEL=="drone_*", ACTION=="add", '
+        f"# po kazdym dodaniu/usunieciu karty {ROLE}_* odswieza\n"
+        f"# WFB_NICS i restartuje usluge - patrz sync_wfb_nics() w {SCRIPT_PATH.name}\n"
+        f'SUBSYSTEM=="net", KERNEL=="{ROLE}_*", ACTION=="add", '
         f'RUN+="/usr/bin/systemd-run --no-block --quiet {sys.executable} {SCRIPT_PATH} {HOTPLUG_FLAG}"\n'
-        'SUBSYSTEM=="net", KERNEL=="drone_*", ACTION=="remove", '
+        f'SUBSYSTEM=="net", KERNEL=="{ROLE}_*", ACTION=="remove", '
         f'RUN+="/usr/bin/systemd-run --no-block --quiet {sys.executable} {SCRIPT_PATH} {HOTPLUG_FLAG}"\n'
     )
 
@@ -3901,7 +3930,7 @@ def write_wfb_nics(nics):
 
 def sync_wfb_nics():
     """Wolane z reguly udev (ensure_hotplug_rule) po kazdym dodaniu/usunieciu
-    karty drone_RX/drone_TX. Patrz komentarz przy HOTPLUG_RULES: bez tego
+    karty <rola>_*. Patrz komentarz przy HOTPLUG_RULES: bez tego
     zniknieciecie jednej karty zabijaloby rowniez te, ktora zostala podpieta."""
     nics = wfb_nics()
     current = wfb_nics_defaults()
@@ -3920,7 +3949,7 @@ def sync_wfb_nics():
 def hotplug_run():
     """Tryb bez TUI wolany przez regule udev (HOTPLUG_FLAG). Tylko WFB_NICS +
     restart - zadnego innego sprzatania, zeby zdazyc, zanim ktos zauwazy
-    przerwe w odbiorze na gs."""
+    przerwe w odbiorze po drugiej stronie."""
     log(f"==> Hotplug {ROLE} ({HOTPLUG_FLAG})")
     sync_wfb_nics()
     return 0
@@ -4404,9 +4433,9 @@ def detect_nics_startup():
 
     nics = ensure_nic_names()
 
-    # WFB_NICS moze byc za waskie (np. z instalacji na jednej karcie, zanim
-    # dolozono druga) - sam restart nizej tego nie naprawi, bo znowu przeczyta
-    # ten sam plik. sync_wfb_nics() dopisuje brakujace karty PRZED restartem.
+    # WFB_NICS moze nie zgadzac sie z tym, co podpiete (stary uklad dwoch kart,
+    # stara nazwa karty) - sam restart nizej tego nie naprawi, bo znowu przeczyta
+    # ten sam plik. sync_wfb_nics() poprawia liste kart PRZED restartem.
     sync_wfb_nics()
 
     for nic in nics:
@@ -4449,7 +4478,7 @@ def detect_nics_startup():
 
     if len(nics) < EXPECTED_NICS:
         log(f"    UWAGA: dziala {len(nics)} z {EXPECTED_NICS} kart. Sprawdz port USB, kabel")
-        log("    i zasilanie - dwa dongle 8812AU potrafia przeciazyc porty RPi.")
+        log("    i zasilanie - 8812AU przy nadawaniu potrafi przeciazyc porty RPi.")
 
     if ensure_video_service_type(nics):
         log(f"    {CFG_PATH}: wideo przestawione na udp_proxy - domyslny tryb")
@@ -4492,7 +4521,7 @@ def collect_checks():
         checks.append(("Dongle USB RTL88xx", "ok", f"{len(dongles)} szt. w lsusb (minimum {EXPECTED_NICS})"))
     elif dongles:
         checks.append(("Dongle USB RTL88xx", "fail",
-                       f"tylko {len(dongles)} z {EXPECTED_NICS} - sprawdz drugi port USB, kabel i zasilanie"))
+                       f"tylko {len(dongles)} z {EXPECTED_NICS} - sprawdz port USB, kabel i zasilanie"))
     else:
         checks.append(("Dongle USB RTL88xx", "fail", "nie widac zadnej karty 88xx w lsusb"))
 
@@ -5261,7 +5290,7 @@ def redetect_screen(stdscr):
     status, txt = nic_status_summary()
     say(txt, status)
     if status == "fail" and len(nics) < EXPECTED_NICS:
-        say("Sprawdz port USB, kabel i zasilanie - dwa dongle 8812AU obciazaja porty RPi.")
+        say("Sprawdz port USB, kabel i zasilanie - 8812AU mocno obciaza porty RPi.")
 
     pause(stdscr)
 
@@ -5287,7 +5316,7 @@ def nic_snapshot():
 def nic_identify_screen(stdscr):
     """Zywy podglad kart: wypnij dongla, a ekran powie, ktora nazwa wlasnie
     zniknela. To najprostszy sposob dopasowania nazwy do konkretnej anteny,
-    bo dwa dongle 8812AU wygladaja identycznie i nie widac po nich, ktory
+    bo dongle 8812AU wygladaja identycznie i nie widac po nich, ktory
     siedzi w ktorym gniezdzie. Przy okazji licza sie liczniki rx/tx na zywo,
     wiec w tym samym miejscu widac, przez ktora karte leci nadawanie."""
     stdscr.timeout(500)  # getch wraca po 0.5 s, wiec petla sama sie odswieza
@@ -8381,8 +8410,8 @@ def main():
         require_root()
         sys.exit(autostart_run())
 
-    # Tryb wolany z reguly udev przy kazdym dodaniu/usunieciu karty drone_RX
-    # albo drone_TX (patrz HOTPLUG_RULES) - ma byc szybki, wiec zadnego setupu
+    # Tryb wolany z reguly udev przy kazdym dodaniu/usunieciu karty <rola>_*
+    # (patrz HOTPLUG_RULES) - ma byc szybki, wiec zadnego setupu
     # ani wykrywania sterownika, tylko WFB_NICS + restart.
     if len(sys.argv) >= 2 and sys.argv[1] == HOTPLUG_FLAG:
         require_root()

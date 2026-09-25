@@ -44,26 +44,27 @@ Opisuje **co robi każda funkcja** i **jak funkcje współpracują ze sobą**.
 | `drone.py` | Raspberry Pi w powietrzu | to samo, rola `drone` |
 | `podglad_testu.py` | Windows / dowolny pulpit | rysuje wykresy z logów testu (tkinter) |
 
-**`gs.py` i `drone.py` to ten sam program.** Różnią się wyłącznie ~100 liniami
-konfiguracji roli — resztę trzymaj identyczną. Wszystkie opisy poniżej dotyczą
-obu plików tak samo.
+**`gs.py` i `drone.py` to ten sam program — różnią się dokładnie jedną linią:**
+`ROLE = "gs"` / `ROLE = "drone"`. Wszystko, co zależy od strony, liczy się z niej:
 
-Co je różni:
-
-| Stała | `gs.py` | `drone.py` |
+| Stała | gs | drone |
 |---|---|---|
 | `ROLE` | `"gs"` | `"drone"` |
 | `PEER_IP` | `10.5.0.2` | `10.5.0.1` |
 | `PEER_NAME` | `"drone"` | `"gs"` |
-| `EXPECTED_NICS` | `1` | `2` |
-| `DEFAULT_NIC_ROLES` | `["txrx"]` | `["rx", "tx"]` |
+| `EXPECTED_NICS` | `1` | `1` |
+| `DEFAULT_NIC_ROLES` | `["txrx"]` | `["txrx"]` |
+| `VIDEO_SENDS` / `VIDEO_UDP_PORT` | `False` / `5600` | `True` / `5602` |
 | `ROLE_SECTION` | `connect://` (odbiera) | `listen://` (nadaje) |
 
-> **Jak wprowadzać zmiany:** zmień `gs.py`, potem przenieś różnicę do `drone.py`:
+Obie strony pracują identycznie: jedna karta `<rola>_TXRX`, która nadaje i odbiera,
+ta sama reguła hotplug (`71-wfb-hotplug.rules`) i ta sama synchronizacja `WFB_NICS`.
+
+> **Jak wprowadzać zmiany:** zmień `drone.py`, potem wygeneruj `gs.py`:
 > ```bash
-> git diff -- gs.py | sed 's|/gs\.py|/drone.py|g' | git apply
+> sed 's/^ROLE = "drone"  # JEDYNA/ROLE = "gs"  # JEDYNA/' drone.py > gs.py
+> diff drone.py gs.py   # ma wyjsc dokladnie jedna linia
 > ```
-> i sprawdź, że różnica między plikami nadal jest wyłącznie rolowa.
 
 ---
 
@@ -766,7 +767,7 @@ minimum.
 
 | Funkcja / stała | Co robi |
 |---|---|
-| `DEFAULT_NIC_ROLES` | układ na start — role pierwszych wpiętych kart (wg gniazda USB): dron `["rx", "tx"]`, gs `["txrx"]`. **Jedyna** rolowa stała od kart |
+| `DEFAULT_NIC_ROLES` | układ na start — role pierwszych wpiętych kart (wg gniazda USB): po obu stronach `["txrx"]`. **Jedyna** rolowa stała od kart |
 | `SPARE_NIC_ROLE` | `"rx"` — rola każdej karty ponad układ startowy. Dołożenie dongla nie zmienia tego, która karta nadaje |
 | `ROLE_TAGS`, `ROLE_LABELS` | rola → znacznik w nazwie; rola → etykieta krótka i długa |
 | `parse_nic_name(name)` | `(rola urządzenia, rola karty, numer)` albo `None` dla `wlanX`. Rozpoznaje też nazwy **drugiej** roli |
@@ -1269,7 +1270,7 @@ bo przy porównaniu kreski z kilku testów zlałyby się w płot.
 | dodać ją do odczytu pod kursorem | `ChartArea.READOUT` |
 | dodać ją do panelu bocznego | `App.STAT_ROWS` lub `App._repair_lines()` |
 | dodać pozycję menu | `main_menu()` — **`items` i drabinka `elif`** |
-| zmienić role, z jakimi startują pierwsze karty | `DEFAULT_NIC_ROLES` (osobno w `gs.py` i `drone.py`) |
+| zmienić role, z jakimi startują pierwsze karty | `DEFAULT_NIC_ROLES` (wspólne dla obu ról) |
 | zmienić rolę dokładanych kart | `SPARE_NIC_ROLE` |
 | dodać nowy rodzaj roli | `ROLE_TAGS` **i** `ROLE_LABELS`, a jej skutek w wfb-ng — `rx_only_nics()` |
 | wpiąć więcej kart / zmienić rolę konkretnej karty | nic w kodzie — menu „Karty na zywo" (`cards_live_screen` → `assign_nic_role`) |
