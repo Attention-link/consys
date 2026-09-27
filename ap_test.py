@@ -1,39 +1,37 @@
 #!/usr/bin/env python3
-"""Testowy Access Point na karcie wfb - realny test zasiegu telefonem.
+"""Temporary access point on a WFB adapter for a real phone range test.
 
-Zamiast czytac RSSI z API wfb-ng (patrz web_rssi.py), ten skrypt na chwile
-zamienia karte w zwykly, otwarty punkt dostepu WiFi. Laczysz sie z nim
-telefonem tak jak z kazda inna siecia i sprawdzasz zasieg paskami sygnalu
-w telefonie, chodzac po terenie - bez posrednictwa wfb-ng.
+Instead of reading RSSI from the wfb-ng API (see web_rssi.py), this script
+temporarily turns the adapter into a standard open Wi-Fi access point. Connect
+to it with a phone as to any other network and check signal bars while walking
+the area, without involving wfb-ng.
 
-W trakcie testu dziala pseudograficzny (curses) ekran statusu - SSID, kanal,
-karta i biezaca moc TX - z mozliwoscia zmiany mocy na zywo strzalkami
-Gora/Dol (albo +/-) bez przerywania testu, w tej samej skali sterownika co
-ekran "Moc nadawania (TX)" w drone.py/gs.py.
+During the test, a curses status screen shows the SSID, channel, adapter, and
+current TX power. Up/Down (or +/-) changes the power live without interrupting
+the test, using the same driver scale as the "Transmit power (TX)" screen in
+drone.py/gs.py.
 
-Dziala zarowno na gs (karta gs_wfb), jak i na dronie (karta drone_TX - to ona
-normalnie nadaje wideo do ziemi, wiec jej zasieg jest tym, co realnie
-interesuje). Rola wykrywana jest automatycznie po tym, ktora karta fizycznie
-istnieje w systemie.
+It works on both the GS (the gs_wfb adapter) and the drone (the drone_TX
+adapter, which normally transmits video to the ground, so its range is the one
+that matters). The role is detected automatically from the adapter physically
+present in the system.
 
-Karta jest jedna i ta sama, ktora normalnie obsluguje link - na czas testu
-odpowiednia usluga wifibroadcast@... jest zatrzymana (link stoi). Po Ctrl+C
-skrypt sam sprzata (hostapd, dnsmasq, adres IP) i z powrotem odpala usluge,
-wiec karta wraca do normalnej roli bez recznej naprawy. Sprzatanie odpala sie
-rowniez wtedy, gdy skrypt padnie w trakcie (np. blad ip/hostapd) - nie tylko
-po Ctrl+C - zeby usluga nigdy nie zostala trwale zatrzymana.
+The tested adapter is normally used by the link. The corresponding
+wifibroadcast@... service is stopped for the test, so the link is down. After
+Ctrl+C the script cleans up hostapd, dnsmasq, and the IP address, then starts
+the service again. Cleanup also runs after an in-test failure (for example an
+ip or hostapd error), ensuring the service is not left permanently stopped.
 
-Wymaga roota (hostapd, ip, dnsmasq, systemctl).
+Root is required (hostapd, ip, dnsmasq, systemctl).
 
-Uzycie:
-    sudo python3 ap_test.py [ssid] [kanal] [moc_tx]
-    # domyslnie: SSID "RTL_test", kanal 13 - ten sam, na ktorym normalnie
-    # chodzi link do drona, wiec wynik testu jest z nim porownywalny.
-    # moc_tx: opcjonalnie wymusza moc nadawania PRZED startem AP, np. do
-    # porownania zasiegu przy roznej mocy - liczba 0-TX_POWER_CAP w skali
-    # sterownika (patrz mod.apply_tx_power_live nizej), NIE dBm. Po Ctrl+C
-    # wraca do wartosci sprzed testu. Bez tego argumentu karta zostaje na
-    # mocy, jaka akurat ma ustawiona.
+Usage:
+    sudo python3 ap_test.py [ssid] [channel] [tx_power]
+    # Default: SSID "RTL_test", channel 13—the channel normally used by the
+    # drone link, so the test result is comparable with that link.
+    # tx_power: optionally forces transmit power BEFORE starting the AP, for
+    # comparing range at different levels. It is 0-TX_POWER_CAP on the driver
+    # scale (see mod.apply_tx_power_live below), NOT dBm. Ctrl+C restores the
+    # previous value. Without this argument the adapter keeps its current power.
 """
 
 import curses
@@ -48,9 +46,9 @@ import time
 AP_CIDR = "192.168.50.1/24"
 DHCP_RANGE = "192.168.50.10,192.168.50.100,12h"
 
-# (nazwa karty, usluga wifibroadcast do zatrzymania na czas testu) - w kolejnosci
-# sprawdzania. gs ma jedna karte txrx; na dronie testujemy drone_TX, bo to ona
-# normalnie nadaje wideo do ziemi i jej zasieg jest tym, co ma znaczenie.
+# (adapter name, wifibroadcast service to stop for the test), in detection
+# order. The GS has one txrx adapter; the drone uses drone_TX because it
+# normally transmits video to the ground and its range is what matters.
 ROLE_CANDIDATES = [
     ("gs", "gs_wfb", "wifibroadcast@gs.service"),
     ("drone", "drone_TX", "wifibroadcast@drone.service"),
@@ -72,12 +70,12 @@ def sh(*cmd, check=True):
     print("+", " ".join(cmd))
     r = subprocess.run(cmd)
     if check and r.returncode != 0:
-        raise RuntimeError(f"polecenie nie powiodlo sie: {' '.join(cmd)}")
+        raise RuntimeError(f"command failed: {' '.join(cmd)}")
 
 
 def require_root():
     if os.geteuid() != 0:
-        print(f"Uruchom jako root: sudo python3 {os.path.basename(sys.argv[0])}")
+        print(f"Run as root: sudo python3 {os.path.basename(sys.argv[0])}")
         sys.exit(1)
 
 
@@ -90,16 +88,15 @@ def iface_exists(name):
 
 
 def detect_role():
-    """Zwraca tez zaimportowany modul (gs albo drone) - to on ma prawdziwa,
-    dzialajaca logike mocy TX dla karty 88XXau_wfb (patrz main: apply_tx_power_live).
-    'iw ... set txpower' dla tego sterownika NIC nie zmienia w sprzecie - cfg80211
-    tylko zapamietuje wartosc i zglasza sukces, wiec liczylby sie tu tylko pozornie."""
+    """Return the imported role module, which owns working 88XXau_wfb TX-power
+    logic (see main: apply_tx_power_live). For this driver, `iw ... set txpower`
+    does not change hardware: cfg80211 only stores the value and reports success."""
     for role, iface, service in ROLE_CANDIDATES:
         if iface_exists(iface):
             return role, iface, service, importlib.import_module(role)
     known = ", ".join(iface for _, iface, _ in ROLE_CANDIDATES)
-    print(f"Nie znaleziono zadnej znanej karty wfb ({known}) - "
-          "podlaczona/nazwana karta wfb jest wymagana do testu AP.")
+    print(f"No known WFB adapter found ({known}); a connected and named WFB "
+          "adapter is required for the AP test.")
     sys.exit(1)
 
 
@@ -112,8 +109,8 @@ def main():
     tx_power = sys.argv[3] if len(sys.argv) > 3 else None
 
     if tx_power is not None and not (tx_power.isdigit() and 0 <= int(tx_power) <= mod.TX_POWER_CAP):
-        print(f"moc_tx musi byc liczba 0-{mod.TX_POWER_CAP} (skala sterownika 88XXau_wfb, "
-              f"0 = kalibracja EEPROM, {mod.TX_POWER_CAP} = pulap 90% z {mod.TX_POWER_MAX}).")
+        print(f"tx_power must be 0-{mod.TX_POWER_CAP} (88XXau_wfb driver scale; "
+              f"0 = EEPROM calibration, {mod.TX_POWER_CAP} = 90% cap of {mod.TX_POWER_MAX}).")
         sys.exit(1)
 
     state = {"dnsmasq": None, "hostapd": None, "service_stopped": False,
@@ -123,7 +120,7 @@ def main():
         if state["done"]:
             return
         state["done"] = True
-        print("\nSprzatanie...")
+        print("\nCleaning up...")
         for key in ("hostapd", "dnsmasq"):
             p = state[key]
             if p and p.poll() is None:
@@ -134,24 +131,23 @@ def main():
                     p.kill()
         sh("ip", "addr", "flush", "dev", iface, check=False)
         if state["orig_tx_power"] is not None:
-            print(f"Przywracam moc TX na {state['orig_tx_power']}...")
+            print(f"Restoring TX power to {state['orig_tx_power']}...")
             mod.apply_tx_power_live(state["orig_tx_power"])
         if state["service_stopped"]:
-            print(f"Przywracam {service}...")
+            print(f"Restoring {service}...")
             sh("systemctl", "start", service, check=False)
 
     def signal_stop(*_):
-        # Tylko flaga - do_cleanup() drukuje i odpala procesy, co w trakcie
-        # dzialania curses (ekran statusu) rozjechaloby ekran. Petla curses
-        # sama sprawdza state["stop"] i konczy sie, zanim leci sprzatanie.
+        # Only set a flag: do_cleanup() prints and starts processes, which would
+        # corrupt the curses status screen. The loop exits before cleanup runs.
         state["stop"] = True
 
     signal.signal(signal.SIGINT, signal_stop)
     signal.signal(signal.SIGTERM, signal_stop)
 
     try:
-        print(f"Wykryto role: {role} (karta {iface}).")
-        print(f"Zatrzymuje {service} (karta {iface} potrzebna dla AP, link stanie)...")
+        print(f"Detected role: {role} (adapter {iface}).")
+        print(f"Stopping {service} (adapter {iface} is needed by the AP; the link will be down)...")
         sh("systemctl", "stop", service)
         state["service_stopped"] = True
         time.sleep(1)
@@ -161,22 +157,22 @@ def main():
         sh("ip", "addr", "add", AP_CIDR, "dev", iface)
         sh("ip", "link", "set", iface, "up")
 
-        # Zapamietaj moc SPRZED testu niezaleznie od tx_power - +/- na ekranie
-        # statusu tez ma sie dac cofnac, nie tylko wymuszona wartosc startowa.
+        # Save pre-test power regardless of tx_power so status-screen +/- can
+        # also be restored, not only a forced initial value.
         state["orig_tx_power"] = mod.read_tx_power_live()
         if tx_power is not None:
-            print(f"Ustawiam moc TX na {tx_power}/{mod.TX_POWER_CAP} "
-                  f"(live przez {mod.TX_POWER_SYSFS})...")
+            print(f"Setting TX power to {tx_power}/{mod.TX_POWER_CAP} "
+                  f"(live through {mod.TX_POWER_SYSFS})...")
             if not mod.apply_tx_power_live(tx_power):
                 raise RuntimeError(
-                    f"nie udalo sie ustawic mocy TX - brak {mod.TX_POWER_SYSFS} "
-                    "(modul 88XXau_wfb niezaladowany?)")
+                    f"could not set TX power: {mod.TX_POWER_SYSFS} is missing "
+                    "(88XXau_wfb module not loaded?)")
 
         conf_path = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False).name
         with open(conf_path, "w") as f:
             f.write(HOSTAPD_CONF.format(iface=iface, ssid=ssid, channel=channel))
 
-        print(f"Startuje dnsmasq (DHCP {DHCP_RANGE})...")
+        print(f"Starting dnsmasq (DHCP {DHCP_RANGE})...")
         state["dnsmasq"] = subprocess.Popen([
             "dnsmasq", "--no-daemon", "--port=0",
             f"--interface={iface}", "--bind-interfaces",
@@ -184,15 +180,14 @@ def main():
         ])
 
         state["hostapd"] = subprocess.Popen(["hostapd", conf_path])
-        time.sleep(0.3)  # czas na ewentualny natychmiastowy krach (zly kanal/config)
+        time.sleep(0.3)  # allow an immediate failure (bad channel/configuration)
         if state["hostapd"].poll() is not None:
-            raise RuntimeError("hostapd nie wystartowal (zly kanal albo karta go nie obsluguje)")
+            raise RuntimeError("hostapd did not start (bad channel or unsupported adapter)")
 
         def status_screen(stdscr):
-            """Pseudograficzny status testu + zywa zmiana mocy TX (Gora/Dol, +/-).
-            Petla, nie jednorazowy ekran - odswieza sie co 300 ms, zeby moc
-            pokazywana na ekranie zawsze zgadzala sie z tym, co faktycznie
-            siedzi w sysfs (a nie tylko z tym, co skrypt tam ostatnio wpisal)."""
+            """Curses test status with live TX-power changes (Up/Down, +/-).
+            It refreshes every 300 ms so displayed power reflects sysfs, rather
+            than merely the last value written by this script."""
             curses.curs_set(0)
             if curses.has_colors():
                 mod.init_colors()
@@ -203,20 +198,20 @@ def main():
                 stdscr.erase()
                 mod.draw_header(stdscr, f"Test AP [{role}] - {iface}")
                 mod.safe_addstr(stdscr, 2, 2,
-                                 f"SSID: {ssid}   kanal: {channel}   karta: {iface} ({role})")
+                                 f"SSID: {ssid}   channel: {channel}   adapter: {iface} ({role})")
                 if live is not None:
                     mod.safe_addstr(stdscr, 4, 2,
-                                     f"Moc TX: {live}/{mod.TX_POWER_CAP}   "
-                                     "(Gora/Dol albo +/- zmienia na zywo)")
+                                     f"TX power: {live}/{mod.TX_POWER_CAP}   "
+                                     "(Up/Down or +/- changes it live)")
                 else:
                     mod.safe_addstr(stdscr, 4, 2,
-                                     "Moc TX: niedostepna (brak sysfs sterownika)",
+                                     "TX power: unavailable (driver sysfs missing)",
                                      mod.color_for("warn"))
                 mod.safe_addstr(stdscr, 6, 2,
-                                 "Polacz sie telefonem z ta siecia (otwarta) i sprawdz "
-                                 "zasieg chodzac po terenie.")
+                                 "Connect a phone to this open network and check range "
+                                 "while walking the area.")
                 mod.safe_addstr(stdscr, 8, 2,
-                                 "q / Ctrl+C = zakoncz test i przywroc link", curses.A_DIM)
+                                 "q / Ctrl+C = end test and restore the link", curses.A_DIM)
                 stdscr.refresh()
 
                 c = stdscr.getch()
@@ -237,7 +232,7 @@ def main():
         curses.wrapper(status_screen)
 
         if state["hostapd"].poll() is not None and not state["stop"]:
-            print("hostapd padl w trakcie testu - sprawdz konfiguracje/logi (journalctl).")
+            print("hostapd failed during the test; check configuration/logs (journalctl).")
     finally:
         do_cleanup()
 

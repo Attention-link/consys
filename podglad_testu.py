@@ -1,35 +1,20 @@
 #!/usr/bin/env python3
-"""Podglad logow z ekranu "Test polaczenia" (gs.py / drone.py) - Windows, tkinter.
+"""Windows Tkinter viewer for the gs.py/drone.py link-test log.
 
-Log z testu to zwykly plik tekstowy rozdzielony srednikami, wiec otworzy sie
-i w notatniku, i w arkuszu - ale z samych liczb nie widac, jak zachowywal sie
-link w czasie. Ten program rysuje to na wykresach na wspolnej osi czasu: RSSI
-kazdej anteny osobno, SNR, modulacje, straty (chwilowe i PER narastajacy od
-poczatku testu) oraz ping. Naglowek testu (kanal, region, moc, modulacja
-nadawania, karty) i podsumowanie ida do panelu obok.
+The semicolon-separated log opens in a text editor or spreadsheet, but this
+viewer plots its behavior over time: per-antenna RSSI, SNR, modulation,
+instantaneous and cumulative loss, and ping. The test header and summary are
+shown beside the charts.
 
-Straty sa na wykresie DWIE: przed naprawa FEC i po niej. Pole miedzy krzywymi
-to pakiety, ktore zgubilo radio, a wfb-ng odtworzyl z nadmiarowosci - osobny
-panel pokazuje ich tempo, a panel obok laczna liczbe. Bez tej pary z samego
-wykresu strat nie widac, czy link jest czysty, czy tylko dobrze latany.
+It distinguishes loss before and after FEC, shows recovered-packet rate, and
+renders test markers as red vertical lines. Time can be zoomed at the pointer,
+panned by dragging or Shift+wheel, reset with Home/double-clicked, and scrolled
+vertically with Ctrl+wheel. Only the Python standard library is required.
 
-Znaczniki postawione w trakcie testu klawiszem 'm' (gs.py / drone.py) sa na
-wykresie CZERWONYMI pionowymi liniami z numerem - po to, zeby nie trzeba bylo
-pamietac, w ktorej minucie obrocilo sie antene albo dron schowal sie za
-budynkiem. Reszta komentarzy z logu to szare linie kreskowane.
-
-Os czasu przybliza sie kolkiem myszy (wokol kursora), przesuwa przeciaganiem
-albo Shift+kolko, a podwojny klik / Home wraca do calego testu. Ctrl+kolko
-przewija panele w pionie. Bez tego przy dluzszym locie jedna sekunda zajmuje
-mniej niz piksel i nie da sie obejrzec pojedynczego zalamania sygnalu.
-
-Potrzebny jest tylko Python - zadnych bibliotek do doinstalowania.
-
-Uzycie na Windowsie:
-    - przeciagnij plik test-gs-....log na podglad_testu.py, albo
-    - kliknij dwa razy w podglad_testu.py - otworzy najnowszy log z katalogu,
-      w ktorym lezy ten plik, albo
-    - python podglad_testu.py <plik.log>
+Windows usage:
+    - drag a test-gs-....log file onto podglad_testu.py;
+    - double-click podglad_testu.py to open the newest local log; or
+    - run: python podglad_testu.py <log-file>
 """
 
 import math
